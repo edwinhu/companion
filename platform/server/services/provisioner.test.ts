@@ -105,7 +105,7 @@ function setupProvisionFetchMock(overrides: {
 
 function baseInput(overrides: Partial<Parameters<Provisioner["provision"]>[0]> = {}) {
   return {
-    customerId: "cust-1",
+    organizationId: "org-1",
     plan: "starter" as Plan,
     region: "iad",
     hostname: "acme",

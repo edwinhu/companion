@@ -27,8 +27,11 @@ async function request<T>(
 export const api = {
   // Instances
   listInstances: () => request<{ instances: unknown[] }>("GET", "/instances"),
-  createInstance: (data: { plan: string; region: string }) =>
-    request("POST", "/instances", data),
+  createInstance: (data: {
+    plan: string;
+    region: string;
+    ownerType?: "shared" | "personal";
+  }) => request("POST", "/instances", data),
   getInstance: (id: string) => request("GET", `/instances/${id}`),
   deleteInstance: (id: string) => request("DELETE", `/instances/${id}`),
   startInstance: (id: string) => request("POST", `/instances/${id}/start`),

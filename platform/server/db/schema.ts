@@ -7,13 +7,14 @@ import {
   jsonb,
 } from "drizzle-orm/pg-core";
 
-// ─── Customers ───────────────────────────────────────────────────────────────
+// ─── Organization Billing ────────────────────────────────────────────────────
+// Links Stripe billing to a Better Auth organization.
+// Better Auth manages the organization/member/team tables; this table adds the
+// billing fields that Better Auth doesn't provide.
 
-export const customers = pgTable("customers", {
+export const organizationBilling = pgTable("organization_billing", {
   id: uuid("id").defaultRandom().primaryKey(),
-  authUserId: text("auth_user_id").unique().notNull(),
-  email: text("email").notNull(),
-  name: text("name"),
+  organizationId: text("organization_id").unique().notNull(),
   stripeCustomerId: text("stripe_customer_id").unique(),
   plan: text("plan").notNull().default("starter"),
   status: text("status").notNull().default("active"),
@@ -22,12 +23,17 @@ export const customers = pgTable("customers", {
 });
 
 // ─── Instances ───────────────────────────────────────────────────────────────
+// Each instance belongs to an organization. It can be shared (all org members
+// can access) or personal (only the owner can access).
+//
+// organizationId and ownerId reference Better Auth-managed tables by text ID.
+// No Drizzle FK constraints on those — they are separate table systems.
 
 export const instances = pgTable("instances", {
   id: uuid("id").defaultRandom().primaryKey(),
-  customerId: uuid("customer_id")
-    .references(() => customers.id, { onDelete: "cascade" })
-    .notNull(),
+  organizationId: text("organization_id").notNull(),
+  ownerId: text("owner_id"), // null = shared instance
+  ownerType: text("owner_type").notNull().default("shared"), // "shared" | "personal"
   flyMachineId: text("fly_machine_id").unique(),
   flyVolumeId: text("fly_volume_id"),
   region: text("region").notNull().default("iad"),
@@ -56,12 +62,11 @@ export const instanceEvents = pgTable("instance_events", {
 });
 
 // ─── Subscriptions ───────────────────────────────────────────────────────────
+// Subscriptions are scoped to organizations, not individual users.
 
 export const subscriptions = pgTable("subscriptions", {
   id: uuid("id").defaultRandom().primaryKey(),
-  customerId: uuid("customer_id")
-    .references(() => customers.id, { onDelete: "cascade" })
-    .notNull(),
+  organizationId: text("organization_id").notNull(),
   stripeSubscriptionId: text("stripe_subscription_id").unique().notNull(),
   plan: text("plan").notNull(),
   status: text("status").notNull(),

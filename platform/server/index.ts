@@ -2,6 +2,10 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { instances } from "./routes/instances.js";
+import { billing, stripeWebhook } from "./routes/billing.js";
+import { dashboard } from "./routes/dashboard.js";
+import { tailscale } from "./routes/tailscale.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const port = Number(process.env.PORT) || 3457;
@@ -9,17 +13,35 @@ const port = Number(process.env.PORT) || 3457;
 const app = new Hono();
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
-app.use("/api/*", cors());
+// credentials: true allows Better Auth session cookies to be sent cross-origin.
+// origin must be set explicitly when credentials is true.
+app.use(
+  "/api/*",
+  cors({
+    origin: (origin) => origin,
+    credentials: true,
+  }),
+);
 
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (c) => c.json({ ok: true }));
 
+// ── Better Auth ──────────────────────────────────────────────────────────────
+// Mount the Better Auth handler for all auth routes. This is a catch-all that
+// delegates to Better Auth's built-in endpoints (sign-up, sign-in, session,
+// organization CRUD, team CRUD, invitations, etc.).
+// Uses lazy import to avoid crashing when env vars aren't set (e.g. in tests
+// that don't exercise auth routes).
+app.all("/api/auth/*", async (c) => {
+  const { getAuth } = await import("./auth.js");
+  return getAuth().handler(c.req.raw);
+});
+
 // ── API Routes ───────────────────────────────────────────────────────────────
-// TODO: Mount Better Auth routes at /api/auth/*
-// TODO: Mount instance routes at /api/instances/*
-// TODO: Mount billing routes at /api/billing/*
-// TODO: Mount Tailscale routes at /api/instances/:id/tailscale/*
-// TODO: Mount dashboard routes at /api/dashboard/*
+app.route("/api/instances", instances);
+app.route("/api/billing", billing);
+app.route("/api/webhooks", stripeWebhook);
+app.route("/api/dashboard", dashboard);
 
 app.get("/api/status", (c) => {
   return c.json({

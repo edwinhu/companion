@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { getTableConfig } from "drizzle-orm/pg-core";
-import { customers, instances, instanceEvents, subscriptions } from "./schema";
+import {
+  organizationBilling,
+  instances,
+  instanceEvents,
+  subscriptions,
+} from "./schema";
 
 // ─── Schema export tests ─────────────────────────────────────────────────────
 // Validates that all Drizzle pgTable definitions are properly exported and
@@ -8,28 +13,24 @@ import { customers, instances, instanceEvents, subscriptions } from "./schema";
 
 describe("schema exports", () => {
   it("exports all four table definitions", () => {
-    // Every table should be a truthy, defined object (not null/undefined)
-    expect(customers).toBeDefined();
+    expect(organizationBilling).toBeDefined();
     expect(instances).toBeDefined();
     expect(instanceEvents).toBeDefined();
     expect(subscriptions).toBeDefined();
   });
 });
 
-describe("customers table", () => {
-  it('uses "customers" as the underlying SQL table name', () => {
-    const config = getTableConfig(customers);
-    expect(config.name).toBe("customers");
+describe("organizationBilling table", () => {
+  it('uses "organization_billing" as the underlying SQL table name', () => {
+    const config = getTableConfig(organizationBilling);
+    expect(config.name).toBe("organization_billing");
   });
 
   it("contains all expected column names", () => {
-    const config = getTableConfig(customers);
+    const config = getTableConfig(organizationBilling);
     const columnNames = config.columns.map((c) => c.name);
-    // Verify every column declared in the schema is present
     expect(columnNames).toContain("id");
-    expect(columnNames).toContain("auth_user_id");
-    expect(columnNames).toContain("email");
-    expect(columnNames).toContain("name");
+    expect(columnNames).toContain("organization_id");
     expect(columnNames).toContain("stripe_customer_id");
     expect(columnNames).toContain("plan");
     expect(columnNames).toContain("status");
@@ -37,9 +38,10 @@ describe("customers table", () => {
     expect(columnNames).toContain("updated_at");
   });
 
-  it("has no foreign keys (root table)", () => {
-    const config = getTableConfig(customers);
-    // customers is a root-level table with no references to other tables
+  it("has no foreign keys (references Better Auth tables by convention)", () => {
+    const config = getTableConfig(organizationBilling);
+    // organizationId references Better Auth's organization.id but we don't
+    // create a Drizzle FK constraint since they're separate table systems.
     expect(config.foreignKeys).toHaveLength(0);
   });
 });
@@ -50,11 +52,20 @@ describe("instances table", () => {
     expect(config.name).toBe("instances");
   });
 
-  it("contains all expected column names", () => {
+  it("contains the organization/owner columns for team-based ownership", () => {
+    const config = getTableConfig(instances);
+    const columnNames = config.columns.map((c) => c.name);
+    // Organization-scoped ownership model: organizationId (required) +
+    // ownerId (nullable, for personal instances) + ownerType flag.
+    expect(columnNames).toContain("organization_id");
+    expect(columnNames).toContain("owner_id");
+    expect(columnNames).toContain("owner_type");
+  });
+
+  it("contains all infrastructure column names", () => {
     const config = getTableConfig(instances);
     const columnNames = config.columns.map((c) => c.name);
     expect(columnNames).toContain("id");
-    expect(columnNames).toContain("customer_id");
     expect(columnNames).toContain("fly_machine_id");
     expect(columnNames).toContain("fly_volume_id");
     expect(columnNames).toContain("region");
@@ -70,18 +81,17 @@ describe("instances table", () => {
     expect(columnNames).toContain("updated_at");
   });
 
-  it("has a foreign key referencing the customers table", () => {
+  it("does not have a customer_id column (replaced by organization_id)", () => {
     const config = getTableConfig(instances);
-    // instances.customer_id references customers.id
-    expect(config.foreignKeys.length).toBeGreaterThanOrEqual(1);
-    // Resolve the FK and check the referenced table name
-    const fkConfigs = config.foreignKeys.map((fk) => fk.getName());
-    const referencesCustomers = config.foreignKeys.some((fk) => {
-      const name = fk.getName();
-      // Drizzle auto-generates FK names containing both table names
-      return name.includes("customers") && name.includes("instances");
-    });
-    expect(referencesCustomers).toBe(true);
+    const columnNames = config.columns.map((c) => c.name);
+    expect(columnNames).not.toContain("customer_id");
+  });
+
+  it("has no Drizzle FK constraints (organization/owner reference Better Auth tables)", () => {
+    const config = getTableConfig(instances);
+    // No FK constraints — organizationId and ownerId reference Better Auth
+    // tables which are managed separately.
+    expect(config.foreignKeys).toHaveLength(0);
   });
 });
 
@@ -118,11 +128,19 @@ describe("subscriptions table", () => {
     expect(config.name).toBe("subscriptions");
   });
 
+  it("contains organization_id instead of customer_id", () => {
+    const config = getTableConfig(subscriptions);
+    const columnNames = config.columns.map((c) => c.name);
+    // Subscriptions are scoped to organizations, not individual users.
+    expect(columnNames).toContain("organization_id");
+    expect(columnNames).not.toContain("customer_id");
+  });
+
   it("contains all expected column names", () => {
     const config = getTableConfig(subscriptions);
     const columnNames = config.columns.map((c) => c.name);
     expect(columnNames).toContain("id");
-    expect(columnNames).toContain("customer_id");
+    expect(columnNames).toContain("organization_id");
     expect(columnNames).toContain("stripe_subscription_id");
     expect(columnNames).toContain("plan");
     expect(columnNames).toContain("status");
@@ -130,13 +148,10 @@ describe("subscriptions table", () => {
     expect(columnNames).toContain("created_at");
   });
 
-  it("has a foreign key referencing the customers table", () => {
+  it("has no Drizzle FK constraints (organization_id references Better Auth)", () => {
     const config = getTableConfig(subscriptions);
-    expect(config.foreignKeys.length).toBeGreaterThanOrEqual(1);
-    const referencesCustomers = config.foreignKeys.some((fk) => {
-      const name = fk.getName();
-      return name.includes("customers") && name.includes("subscriptions");
-    });
-    expect(referencesCustomers).toBe(true);
+    // No FK constraints — organizationId references Better Auth's
+    // organization.id, managed separately.
+    expect(config.foreignKeys).toHaveLength(0);
   });
 });

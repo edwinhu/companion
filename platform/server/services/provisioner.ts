@@ -14,7 +14,7 @@ const PLAN_CONFIGS = {
 export type Plan = keyof typeof PLAN_CONFIGS;
 
 interface ProvisionInput {
-  customerId: string;
+  organizationId: string;
   plan: Plan;
   region: string;
   hostname: string;

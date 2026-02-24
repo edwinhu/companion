@@ -28,6 +28,7 @@ import { RecorderManager } from "./recorder.js";
 import { CronScheduler } from "./cron-scheduler.js";
 import { AgentExecutor } from "./agent-executor.js";
 import { migrateCronJobsToAgents } from "./agent-cron-migrator.js";
+import { authenticateManagedWebSocket } from "./ws-auth.js";
 
 import { startPeriodicCheck, setServiceMode } from "./update-checker.js";
 import { imagePullManager } from "./image-pull-manager.js";
@@ -178,6 +179,12 @@ const server = Bun.serve<SocketData>({
     // ── Browser WebSocket — connects to a specific session ─────────────
     const browserMatch = url.pathname.match(/^\/ws\/browser\/([a-f0-9-]+)$/);
     if (browserMatch) {
+      if (managedAuthEnabled) {
+        const auth = await authenticateManagedWebSocket(req);
+        if (!auth.ok) {
+          return new Response(auth.body || "Unauthorized", { status: auth.status });
+        }
+      }
       const sessionId = browserMatch[1];
       const upgraded = server.upgrade(req, {
         data: { kind: "browser" as const, sessionId },
@@ -189,6 +196,12 @@ const server = Bun.serve<SocketData>({
     // ── Terminal WebSocket — embedded terminal PTY connection ─────────
     const termMatch = url.pathname.match(/^\/ws\/terminal\/([a-f0-9-]+)$/);
     if (termMatch) {
+      if (managedAuthEnabled) {
+        const auth = await authenticateManagedWebSocket(req);
+        if (!auth.ok) {
+          return new Response(auth.body || "Unauthorized", { status: auth.status });
+        }
+      }
       const terminalId = termMatch[1];
       const upgraded = server.upgrade(req, {
         data: { kind: "terminal" as const, terminalId },

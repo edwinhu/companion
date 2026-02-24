@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { parseHash, sessionHash, navigateToSession, navigateHome } from "./routing.js";
+import {
+  parseHash,
+  sessionHash,
+  navigateToSession,
+  navigateHome,
+  installClipboardWriteFallback,
+  resetClipboardFallbackForTests,
+} from "./routing.js";
 
 describe("parseHash", () => {
   it("returns home for empty string", () => {
@@ -120,5 +127,47 @@ describe("navigateHome", () => {
     expect(dispatchSpy).toHaveBeenCalledWith(expect.any(HashChangeEvent));
     spy.mockRestore();
     dispatchSpy.mockRestore();
+  });
+});
+
+describe("installClipboardWriteFallback", () => {
+  beforeEach(() => {
+    resetClipboardFallbackForTests();
+  });
+
+  it("falls back to execCommand when clipboard.writeText rejects", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("denied"));
+    Object.defineProperty(window.navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const execCommandMock = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommandMock,
+    });
+
+    installClipboardWriteFallback();
+    await window.navigator.clipboard.writeText("hello");
+
+    expect(writeText).toHaveBeenCalledWith("hello");
+    expect(execCommandMock).toHaveBeenCalledWith("copy");
+  });
+
+  it("defines clipboard.writeText when clipboard is missing", async () => {
+    Object.defineProperty(window.navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    const execCommandMock = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommandMock,
+    });
+
+    installClipboardWriteFallback();
+    await window.navigator.clipboard.writeText("fallback");
+
+    expect(execCommandMock).toHaveBeenCalledWith("copy");
   });
 });

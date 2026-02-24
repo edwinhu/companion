@@ -14,6 +14,76 @@ export type Route =
 
 const SESSION_PREFIX = "#/session/";
 const AGENT_PREFIX = "#/agents/";
+let clipboardFallbackInstalled = false;
+
+function copyTextWithExecCommand(text: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (typeof document === "undefined" || typeof document.execCommand !== "function") {
+      reject(new Error("Clipboard fallback is unavailable"));
+      return;
+    }
+
+    try {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.left = "-9999px";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      if (!copied) {
+        reject(new Error("Copy command was rejected"));
+        return;
+      }
+      resolve();
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error("Clipboard copy failed"));
+    }
+  });
+}
+
+export function installClipboardWriteFallback(): void {
+  if (clipboardFallbackInstalled || typeof window === "undefined") return;
+  clipboardFallbackInstalled = true;
+
+  const nav = window.navigator as Navigator & {
+    clipboard?: { writeText?: (text: string) => Promise<void> };
+  };
+  const clipboard = nav.clipboard;
+
+  if (clipboard?.writeText) {
+    const originalWriteText = clipboard.writeText.bind(clipboard);
+    try {
+      clipboard.writeText = async (text: string) => {
+        try {
+          await originalWriteText(text);
+        } catch {
+          await copyTextWithExecCommand(text);
+        }
+      };
+    } catch {
+      // Clipboard object is read-only in this environment.
+    }
+    return;
+  }
+
+  try {
+    Object.defineProperty(nav, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: copyTextWithExecCommand,
+      },
+    });
+  } catch {
+    // Navigator.clipboard cannot be reassigned in this environment.
+  }
+}
+
+export function resetClipboardFallbackForTests(): void {
+  clipboardFallbackInstalled = false;
+}
 
 /**
  * Parse a window.location.hash string into a typed Route.
@@ -76,3 +146,5 @@ export function navigateHome(replace = false): void {
     window.location.hash = "";
   }
 }
+
+installClipboardWriteFallback();

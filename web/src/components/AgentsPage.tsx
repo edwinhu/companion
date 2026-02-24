@@ -122,32 +122,6 @@ function getWebhookUrl(agent: AgentInfo): string {
   return `${base}/api/agents/${encodeURIComponent(agent.id)}/webhook/${agent.triggers?.webhook?.secret || ""}`;
 }
 
-async function copyToClipboard(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // Fall through to DOM-based copy fallback.
-  }
-
-  try {
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.setAttribute("readonly", "");
-    textarea.style.position = "fixed";
-    textarea.style.left = "-9999px";
-    document.body.appendChild(textarea);
-    textarea.select();
-    const copied = document.execCommand("copy");
-    document.body.removeChild(textarea);
-    return copied;
-  } catch {
-    return false;
-  }
-}
-
 /** Count how many advanced features are configured */
 function countAdvancedFeatures(form: AgentFormData): number {
   let count = 0;
@@ -374,12 +348,7 @@ export function AgentsPage({ route }: Props) {
 
   function copyWebhookUrl(agent: AgentInfo) {
     const url = getWebhookUrl(agent);
-    void copyToClipboard(url).then((copied) => {
-      if (!copied) {
-        setError("Unable to copy webhook URL automatically. Please copy it manually.");
-        return;
-      }
-      setError("");
+    navigator.clipboard.writeText(url).then(() => {
       setCopiedWebhook(agent.id);
       setTimeout(() => setCopiedWebhook(null), 2000);
     });

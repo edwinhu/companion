@@ -1,6 +1,5 @@
 import { DEFAULT_OPENROUTER_MODEL, getSettings } from "./settings-manager.js";
 
-/** OpenRouter completions endpoint used for session title generation. */
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 function sanitizeTitle(raw: string): string | null {

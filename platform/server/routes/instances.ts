@@ -4,6 +4,9 @@ import { Hono } from "hono";
  * Instance management routes.
  *
  * All routes require authentication (Better Auth session).
+ * TODO: Add Better Auth middleware to verify session and extract customer ID.
+ * TODO: Add ownership check — verify the customer owns the instance before
+ *       allowing operations (start/stop/delete/token/embed).
  *
  * GET    /instances          — List customer's instances
  * POST   /instances          — Provision new instance

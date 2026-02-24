@@ -107,6 +107,10 @@ export class Provisioner {
     // Step 3: Wait for machine to be running
     await this.machines.waitForState(machine.id, "started", 90_000);
 
+    // TODO: Persist authSecret to the instances table in the database so the
+    // control plane can reissue tokens later (e.g. for the /token endpoint).
+    // Currently only returned to the caller.
+
     return {
       flyMachineId: machine.id,
       flyVolumeId: volume.id,

@@ -6,7 +6,29 @@
 
 import Stripe from "stripe";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+// ─── Env validation ─────────────────────────────────────────────────────────
+
+function getStripeKey(): string {
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) {
+    throw new Error(
+      "STRIPE_SECRET_KEY is not set. Configure it before starting the server.",
+    );
+  }
+  return key;
+}
+
+function getWebhookSecret(): string {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) {
+    throw new Error(
+      "STRIPE_WEBHOOK_SECRET is not set. Configure it to verify webhook signatures.",
+    );
+  }
+  return secret;
+}
+
+const stripe = new Stripe(getStripeKey(), {
   apiVersion: "2025-01-27.acacia",
 });
 
@@ -72,8 +94,11 @@ export function constructWebhookEvent(
   payload: string,
   signature: string,
 ): Stripe.Event {
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
-  return stripe.webhooks.constructEvent(payload, signature, webhookSecret);
+  return stripe.webhooks.constructEvent(
+    payload,
+    signature,
+    getWebhookSecret(),
+  );
 }
 
 export { stripe };

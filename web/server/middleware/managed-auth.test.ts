@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createToken, verifyToken } from "./managed-auth.js";
+import { Hono } from "hono";
+import { createToken, verifyToken, managedAuth } from "./managed-auth.js";
 
 const TEST_SECRET = "test-secret-key-for-hmac-256-signing";
 
@@ -36,13 +37,20 @@ describe("managed-auth token utilities", () => {
     it("rejects tokens with tampered payload", async () => {
       const token = await createToken(TEST_SECRET, 60);
       const [, sig] = token.split(".");
-      // Replace payload with different data
+      // Replace payload with different data — signature won't match
       const tamperedPayload = btoa(JSON.stringify({ exp: 9999999999 }))
         .replace(/\+/g, "-")
         .replace(/\//g, "_")
         .replace(/=+$/, "");
       const valid = await verifyToken(`${tamperedPayload}.${sig}`, TEST_SECRET);
       expect(valid).toBe(false);
+    });
+
+    it("uses custom TTL for token expiration", async () => {
+      // Create a token with a very long TTL
+      const token = await createToken(TEST_SECRET, 3600);
+      const valid = await verifyToken(token, TEST_SECRET);
+      expect(valid).toBe(true);
     });
   });
 });
@@ -63,58 +71,147 @@ describe("managed-auth middleware", () => {
     }
   });
 
+  /**
+   * Helper: creates a test Hono app with managedAuth middleware
+   * and a catch-all route that returns 200 if reached.
+   */
+  function createTestApp() {
+    const app = new Hono();
+    app.use("/*", managedAuth);
+    app.all("/*", (c) => c.json({ ok: true }));
+    return app;
+  }
+
   it("passes through when COMPANION_AUTH_ENABLED is not set", async () => {
     delete process.env.COMPANION_AUTH_ENABLED;
-    const { managedAuth } = await import("./managed-auth.js");
+    const app = createTestApp();
 
-    // Simulate a minimal Hono context
-    let nextCalled = false;
-    const mockContext = {
-      req: { path: "/api/sessions", header: () => undefined, query: () => undefined },
-    } as Parameters<typeof managedAuth>[0];
-
-    // The middleware should call next() immediately
-    await managedAuth(mockContext, async () => {
-      nextCalled = true;
-    });
-    expect(nextCalled).toBe(true);
+    const res = await app.request("/api/sessions");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
   });
 
   it("bypasses auth for /health endpoint", async () => {
     process.env.COMPANION_AUTH_ENABLED = "1";
     process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    const app = createTestApp();
 
-    const { managedAuth } = await import("./managed-auth.js");
-
-    let nextCalled = false;
-    const mockContext = {
-      req: { path: "/health", header: () => undefined, query: () => undefined },
-    } as Parameters<typeof managedAuth>[0];
-
-    await managedAuth(mockContext, async () => {
-      nextCalled = true;
-    });
-    expect(nextCalled).toBe(true);
+    const res = await app.request("/health");
+    expect(res.status).toBe(200);
   });
 
   it("bypasses auth for /ws/cli/ paths", async () => {
     process.env.COMPANION_AUTH_ENABLED = "1";
     process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    const app = createTestApp();
 
-    const { managedAuth } = await import("./managed-auth.js");
+    const res = await app.request("/ws/cli/abc-123");
+    expect(res.status).toBe(200);
+  });
 
-    let nextCalled = false;
-    const mockContext = {
-      req: {
-        path: "/ws/cli/abc-123",
-        header: () => undefined,
-        query: () => undefined,
-      },
-    } as Parameters<typeof managedAuth>[0];
+  it("returns 401 when no token is provided and no login URL is set", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    delete process.env.COMPANION_LOGIN_URL;
+    const app = createTestApp();
 
-    await managedAuth(mockContext, async () => {
-      nextCalled = true;
+    const res = await app.request("/api/sessions");
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body.error).toBe("Unauthorized");
+  });
+
+  it("redirects when no token is provided and login URL is set", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    process.env.COMPANION_LOGIN_URL = "https://login.example.com";
+    const app = createTestApp();
+
+    const res = await app.request("/api/sessions", { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://login.example.com");
+  });
+
+  it("returns 500 when COMPANION_AUTH_SECRET is missing", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    delete process.env.COMPANION_AUTH_SECRET;
+    const app = createTestApp();
+
+    // Provide a token so it gets past the "no token" check
+    const res = await app.request("/api/sessions?token=fake.token");
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.error).toBe("Server misconfigured");
+  });
+
+  it("allows access with a valid token in query param", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    const app = createTestApp();
+
+    const token = await createToken(TEST_SECRET, 60);
+    const res = await app.request(`/api/sessions?token=${token}`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+  });
+
+  it("allows access with a valid token in cookie", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    const app = createTestApp();
+
+    const token = await createToken(TEST_SECRET, 60);
+    const res = await app.request("/api/sessions", {
+      headers: { cookie: `companion_token=${token}` },
     });
-    expect(nextCalled).toBe(true);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+  });
+
+  it("rejects an invalid token", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    delete process.env.COMPANION_LOGIN_URL;
+    const app = createTestApp();
+
+    const res = await app.request("/api/sessions?token=bad.token");
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects an expired token", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    delete process.env.COMPANION_LOGIN_URL;
+    const app = createTestApp();
+
+    const token = await createToken(TEST_SECRET, -1);
+    const res = await app.request(`/api/sessions?token=${token}`);
+    expect(res.status).toBe(401);
+  });
+
+  it("redirects with invalid token when login URL is set", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    process.env.COMPANION_LOGIN_URL = "https://login.example.com";
+    const app = createTestApp();
+
+    const res = await app.request("/api/sessions?token=bad.token", {
+      redirect: "manual",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://login.example.com");
+  });
+
+  it("prefers cookie over query param when both are present", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    const app = createTestApp();
+
+    const validToken = await createToken(TEST_SECRET, 60);
+    // Cookie has valid token, query has bad token — cookie wins
+    const res = await app.request("/api/sessions?token=bad.token", {
+      headers: { cookie: `companion_token=${validToken}` },
+    });
+    expect(res.status).toBe(200);
   });
 });

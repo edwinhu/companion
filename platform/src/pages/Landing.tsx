@@ -11,6 +11,9 @@ export function Landing() {
         &amp; Codex. No setup, no servers, just code.
       </p>
 
+      {/* Pricing tiers — agent and instance limits are soft limits for now.
+          TODO: Enforce limits in provisioner and instance routes when
+          Better Auth + DB integration is complete. */}
       <h2>Pricing</h2>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 20, marginTop: 20 }}>
         <PricingCard

@@ -4,7 +4,10 @@
  * The control plane issues short-lived tokens that the instance's managed-auth
  * middleware verifies using the shared COMPANION_AUTH_SECRET.
  *
- * Reuses the same token format as web/server/middleware/managed-auth.ts.
+ * NOTE: This duplicates the token logic from web/server/middleware/managed-auth.ts.
+ * TODO: Extract shared token utilities into a common package (e.g. @companion/auth)
+ * to maintain a single source of truth. Both the control plane and the managed
+ * instance middleware need compatible token formats.
  */
 
 export async function createInstanceToken(

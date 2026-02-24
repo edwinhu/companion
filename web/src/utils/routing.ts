@@ -60,7 +60,12 @@ export function installClipboardWriteFallback(): void {
         try {
           await originalWriteText(text);
         } catch {
-          await copyTextWithExecCommand(text);
+          try {
+            await copyTextWithExecCommand(text);
+          } catch {
+            // Keep this promise resolved to avoid unhandled rejections in callers
+            // that only attach `.then()` handlers.
+          }
         }
       };
     } catch {
@@ -73,7 +78,14 @@ export function installClipboardWriteFallback(): void {
     Object.defineProperty(nav, "clipboard", {
       configurable: true,
       value: {
-        writeText: copyTextWithExecCommand,
+        writeText: async (text: string) => {
+          try {
+            await copyTextWithExecCommand(text);
+          } catch {
+            // Keep this promise resolved to avoid unhandled rejections in callers
+            // that only attach `.then()` handlers.
+          }
+        },
       },
     });
   } catch {

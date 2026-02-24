@@ -16,69 +16,87 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Install dependencies
+      - name: Install web dependencies
         working-directory: web
         run: bun install
 
-      - name: Run tests with coverage
+      - name: Run web tests with coverage
         working-directory: web
+        run: bun run test -- --coverage || true
+
+      - name: Install platform dependencies
+        working-directory: platform
+        run: bun install
+
+      - name: Run platform tests with coverage
+        working-directory: platform
         run: bun run test -- --coverage || true
 
       - name: Enforce 80% coverage on new / changed files
         run: |
-          SUMMARY="web/coverage/coverage-summary.json"
-          if [ ! -f "$SUMMARY" ]; then
-            echo "::error::coverage-summary.json not found — tests may have crashed."
-            exit 1
-          fi
-
-          # Absolute path prefix used by Istanbul in the JSON keys
-          ABS_PREFIX="$(pwd)/web/"
-
-          # Source files added or modified in this PR (relative to repo root, under web/)
-          CHANGED=$(git diff --name-only --diff-filter=ACM origin/main...HEAD -- web/server/ web/src/ \
-            | grep -E '\.(ts|tsx)$' \
-            | grep -v '\.test\.\|\.spec\.\|__mocks__\|test-setup' || true)
-
-          if [ -z "$CHANGED" ]; then
-            echo "No new/changed source files in this PR — nothing to gate."
-            exit 0
-          fi
-
-          echo "=== Changed source files ==="
-          echo "$CHANGED"
-          echo ""
-
           FAIL=0
           THRESHOLD=80
 
-          for file in $CHANGED; do
-            # Build the absolute path key that Istanbul uses in json-summary
-            # $file is like "web/server/foo.ts", key is "/abs/path/web/server/foo.ts"
-            ABS_KEY="$(pwd)/${file}"
+          # ── Helper function ────────────────────────────────────────────
+          check_coverage() {
+            local PROJECT="$1"   # "web" or "platform"
+            local SUMMARY="$PROJECT/coverage/coverage-summary.json"
 
-            # jq: look up by absolute path
-            LINES_PCT=$(jq -r --arg f "$ABS_KEY" '.[$f].lines.pct // empty' "$SUMMARY")
-
-            # Strip "web/" prefix for display
-            DISPLAY="${file#web/}"
-
-            if [ -z "$LINES_PCT" ]; then
-              echo "⚠️  $DISPLAY — no coverage data (not imported by any test)"
-              echo "❌ $DISPLAY — treated as 0% (below ${THRESHOLD}%)"
-              FAIL=1
-              continue
+            if [ ! -f "$SUMMARY" ]; then
+              echo "::warning::$PROJECT coverage-summary.json not found — tests may have crashed."
+              return
             fi
 
-            # Compare as float
-            BELOW=$(awk "BEGIN { print ($LINES_PCT < $THRESHOLD) ? 1 : 0 }")
-            if [ "$BELOW" = "1" ]; then
-              echo "❌ $DISPLAY — ${LINES_PCT}% lines covered (threshold: ${THRESHOLD}%)"
-              FAIL=1
-            else
-              echo "✅ $DISPLAY — ${LINES_PCT}% lines covered"
+            # Source files added or modified in this PR (relative to repo root)
+            local CHANGED
+            CHANGED=$(git diff --name-only --diff-filter=ACM origin/main...HEAD -- "$PROJECT/server/" "$PROJECT/src/" \
+              | grep -E '\.(ts|tsx)$' \
+              | grep -v '\.test\.\|\.spec\.\|__mocks__\|test-setup' || true)
+
+            if [ -z "$CHANGED" ]; then
+              echo "No new/changed source files in $PROJECT — nothing to gate."
+              return
             fi
-          done
+
+            echo "=== Changed source files in $PROJECT ==="
+            echo "$CHANGED"
+            echo ""
+
+            for file in $CHANGED; do
+              # Build the absolute path key that Istanbul uses in json-summary
+              local ABS_KEY
+              ABS_KEY="$(pwd)/${file}"
+
+              # jq: look up by absolute path
+              local LINES_PCT
+              LINES_PCT=$(jq -r --arg f "$ABS_KEY" '.[$f].lines.pct // empty' "$SUMMARY")
+
+              # Strip project prefix for display
+              local DISPLAY="${file#$PROJECT/}"
+
+              if [ -z "$LINES_PCT" ]; then
+                echo "⚠️  $DISPLAY — no coverage data (not imported by any test)"
+                echo "❌ $DISPLAY — treated as 0% (below ${THRESHOLD}%)"
+                FAIL=1
+                continue
+              fi
+
+              # Compare as float
+              local BELOW
+              BELOW=$(awk "BEGIN { print ($LINES_PCT < $THRESHOLD) ? 1 : 0 }")
+              if [ "$BELOW" = "1" ]; then
+                echo "❌ $DISPLAY — ${LINES_PCT}% lines covered (threshold: ${THRESHOLD}%)"
+                FAIL=1
+              else
+                echo "✅ $DISPLAY — ${LINES_PCT}% lines covered"
+              fi
+            done
+          }
+
+          # ── Run for both projects ──────────────────────────────────────
+          check_coverage "web"
+          echo ""
+          check_coverage "platform"
 
           echo ""
           if [ "$FAIL" = "1" ]; then

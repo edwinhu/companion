@@ -2,6 +2,8 @@
  * Stripe integration for billing and subscriptions.
  *
  * Handles checkout sessions, customer portal, and webhook events.
+ * Stripe client is lazily initialized to avoid crashing at import time
+ * when env vars are not set (e.g. during tests or local dev).
  */
 
 import Stripe from "stripe";
@@ -28,9 +30,16 @@ function getWebhookSecret(): string {
   return secret;
 }
 
-const stripe = new Stripe(getStripeKey(), {
-  apiVersion: "2025-01-27.acacia",
-});
+// Lazy singleton — initialized on first use, not at import time.
+let _stripe: Stripe | null = null;
+function getStripe(): Stripe {
+  if (!_stripe) {
+    _stripe = new Stripe(getStripeKey(), {
+      apiVersion: "2025-02-24.acacia",
+    });
+  }
+  return _stripe;
+}
 
 // ─── Price IDs (configure in Stripe Dashboard) ──────────────────────────────
 
@@ -52,7 +61,7 @@ export async function createCheckoutSession(opts: {
   const priceId = PRICE_IDS[opts.plan];
   if (!priceId) throw new Error(`Unknown plan: ${opts.plan}`);
 
-  const session = await stripe.checkout.sessions.create({
+  const session = await getStripe().checkout.sessions.create({
     mode: "subscription",
     customer: opts.customerId || undefined,
     customer_email: opts.customerId ? undefined : opts.customerEmail,
@@ -71,7 +80,7 @@ export async function createPortalSession(
   stripeCustomerId: string,
   returnUrl: string,
 ): Promise<string> {
-  const session = await stripe.billingPortal.sessions.create({
+  const session = await getStripe().billingPortal.sessions.create({
     customer: stripeCustomerId,
     return_url: returnUrl,
   });
@@ -84,7 +93,7 @@ export async function createCustomer(
   email: string,
   name?: string,
 ): Promise<string> {
-  const customer = await stripe.customers.create({ email, name });
+  const customer = await getStripe().customers.create({ email, name });
   return customer.id;
 }
 
@@ -94,11 +103,11 @@ export function constructWebhookEvent(
   payload: string,
   signature: string,
 ): Stripe.Event {
-  return stripe.webhooks.constructEvent(
+  return getStripe().webhooks.constructEvent(
     payload,
     signature,
     getWebhookSecret(),
   );
 }
 
-export { stripe };
+export { getStripe as stripe };

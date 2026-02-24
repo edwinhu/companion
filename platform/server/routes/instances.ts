@@ -1,9 +1,15 @@
+import { and, eq, isNull, or } from "drizzle-orm";
 import { Hono } from "hono";
 import {
   requireAuth,
   requireOrganization,
   type AuthEnv,
 } from "../middleware/auth.js";
+import { getDb } from "../db/index.js";
+import { instances as instancesTable } from "../db/schema.js";
+import { createInstanceToken } from "../lib/token.js";
+import { FlyAppsClient } from "../services/fly-apps.js";
+import { Provisioner, type Plan } from "../services/provisioner.js";
 
 /**
  * Instance management routes.
@@ -12,8 +18,9 @@ import {
  * (requireOrganization). Instances are scoped to the active organization.
  *
  * Instance ownership model:
- * - "shared" instances (ownerType = "shared", ownerId = null): accessible by
- *   all organization members.
+ * - "shared" instances (ownerType = "shared"): accessible by all organization
+ *   members for read access, but still tracked with an ownerId for
+ *   destructive/admin actions.
  * - "personal" instances (ownerType = "personal", ownerId = userId): only
  *   accessible by the owning user.
  *
@@ -29,6 +36,129 @@ import {
  */
 
 const instances = new Hono<AuthEnv>();
+const VALID_PLANS: Plan[] = ["starter", "pro", "enterprise"];
+
+function getProvisioner(flyAppNameOverride?: string): Provisioner {
+  const flyToken = process.env.FLY_API_TOKEN;
+  const flyAppName = flyAppNameOverride || process.env.FLY_APP_NAME;
+  const companionImage = process.env.COMPANION_IMAGE;
+
+  const missing = [
+    !flyToken && "FLY_API_TOKEN",
+    !flyAppName && "FLY_APP_NAME (or request.flyAppName)",
+    !companionImage && "COMPANION_IMAGE",
+  ].filter(Boolean);
+
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+  }
+
+  return new Provisioner(flyToken!, flyAppName!, companionImage!);
+}
+
+function getAppsClient(): FlyAppsClient {
+  const flyToken = process.env.FLY_API_TOKEN;
+  if (!flyToken) {
+    throw new Error("Missing required environment variables: FLY_API_TOKEN");
+  }
+  const orgSlug = process.env.FLY_ORG_SLUG || "personal";
+  return new FlyAppsClient(flyToken, orgSlug);
+}
+
+function normalizeHostname(input: string): string {
+  return input
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "")
+    .replace(/\/.*$/, "");
+}
+
+function makeHostname(flyAppName: string, requested?: string): string {
+  if (requested?.trim()) return normalizeHostname(requested);
+  return `${flyAppName}.fly.dev`;
+}
+
+function isLocalHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized.startsWith("localhost:") ||
+    normalized.startsWith("127.0.0.1:") ||
+    normalized.startsWith("[::1]:")
+  );
+}
+
+function resolveLoginUrl(c: any): string {
+  const explicit = process.env.COMPANION_LOGIN_URL?.trim();
+  if (explicit) return explicit;
+
+  const forwardedHost = c.req.header("x-forwarded-host");
+  const forwardedProto = c.req.header("x-forwarded-proto");
+  const reqUrl = new URL(c.req.url);
+  const host = (forwardedHost || reqUrl.host || "").trim();
+  const proto = (forwardedProto || reqUrl.protocol.replace(/:$/, "") || "https").trim();
+
+  // Avoid producing broken redirects like http://localhost:3458/login in local dev.
+  if (!host || isLocalHost(host)) return "";
+  return `${proto}://${host}/login`;
+}
+
+function slugPart(input: string, max = 12): string {
+  const normalized = input
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return (normalized || "x").slice(0, max);
+}
+
+function makeFlyAppName(userId: string, orgId: string): string {
+  // Keep stable per (user, org) so mapping is deterministic and stored in DB.
+  const name = `comp-${slugPart(userId)}-${slugPart(orgId)}`;
+  return name.slice(0, 30);
+}
+
+function getFlyAppNameFromConfig(config: unknown): string | undefined {
+  if (!config || typeof config !== "object") return undefined;
+  const flyAppName = (config as Record<string, unknown>).flyAppName;
+  return typeof flyAppName === "string" && flyAppName.trim() ? flyAppName : undefined;
+}
+
+function isFlyNotFoundError(error: unknown): boolean {
+  const message = String((error as { message?: string })?.message || "");
+  return message.includes("failed (404)");
+}
+
+async function getAuthorizedInstance(instanceId: string, orgId: string, userId: string) {
+  const db = getDb();
+  const row = await db.query.instances.findFirst({
+    where: and(
+      eq(instancesTable.id, instanceId),
+      eq(instancesTable.organizationId, orgId),
+      or(eq(instancesTable.ownerType, "shared"), eq(instancesTable.ownerId, userId)),
+    ),
+  });
+
+  return row ?? null;
+}
+
+async function getOwnedInstance(instanceId: string, orgId: string, userId: string) {
+  const db = getDb();
+  const row = await db.query.instances.findFirst({
+    where: and(
+      eq(instancesTable.id, instanceId),
+      eq(instancesTable.organizationId, orgId),
+      or(
+        eq(instancesTable.ownerId, userId),
+        and(eq(instancesTable.ownerType, "shared"), isNull(instancesTable.ownerId)),
+      ),
+    ),
+  });
+
+  return row ?? null;
+}
 
 // All instance routes require auth + active organization.
 instances.use("/*", requireAuth, requireOrganization);
@@ -36,9 +166,16 @@ instances.use("/*", requireAuth, requireOrganization);
 instances.get("/", async (c) => {
   const orgId = c.get("organizationId");
   const userId = c.get("auth").userId;
-  // TODO: Query instances WHERE organizationId = orgId
-  //   AND (ownerType = 'shared' OR ownerId = userId)
-  return c.json({ instances: [], organizationId: orgId, userId });
+  const db = getDb();
+
+  const rows = await db.query.instances.findMany({
+    where: and(
+      eq(instancesTable.organizationId, orgId),
+      or(eq(instancesTable.ownerType, "shared"), eq(instancesTable.ownerId, userId)),
+    ),
+  });
+
+  return c.json({ instances: rows, organizationId: orgId, userId });
 });
 
 instances.post("/", async (c) => {
@@ -49,69 +186,209 @@ instances.post("/", async (c) => {
     region?: string;
     hostname?: string;
     ownerType?: "shared" | "personal";
+    flyAppName?: string;
   }>();
+
   const ownerType = body.ownerType || "shared";
-  const ownerId = ownerType === "personal" ? userId : null;
-  // TODO: Validate plan limits, provision via Provisioner, save to DB with
-  //       organizationId, ownerId, and ownerType
-  return c.json(
-    {
-      message: "Instance provisioning started",
+  // Shared instances are readable by org members, but ownership is still tied
+  // to the creator for destructive operations.
+  const ownerId = userId;
+  const plan = (body.plan || "starter") as Plan;
+  const region = body.region || "iad";
+  const flyAppName = body.flyAppName?.trim() || makeFlyAppName(userId, orgId);
+
+  if (!VALID_PLANS.includes(plan)) {
+    return c.json({ error: `Invalid plan: ${body.plan}` }, 400);
+  }
+
+  let provisioner: Provisioner;
+  try {
+    provisioner = getProvisioner(flyAppName);
+  } catch (error: any) {
+    return c.json({ error: error.message }, 500);
+  }
+
+  try {
+    const apps = getAppsClient();
+    await apps.ensureAppExists(flyAppName);
+    await apps.ensurePublicIps(flyAppName);
+  } catch (error: any) {
+    return c.json({ error: error.message || "Failed to ensure Fly app exists" }, 502);
+  }
+
+  const hostname = makeHostname(flyAppName, body.hostname);
+  const loginUrl = resolveLoginUrl(c);
+
+  const provisioned = await provisioner.provision({
+    organizationId: orgId,
+    plan,
+    region,
+    hostname,
+    loginUrl,
+  });
+
+  const db = getDb();
+  const [created] = await db
+    .insert(instancesTable)
+    .values({
       organizationId: orgId,
       ownerId,
       ownerType,
-    },
-    202,
-  );
+      flyMachineId: provisioned.flyMachineId,
+      flyVolumeId: provisioned.flyVolumeId,
+      region,
+      hostname: provisioned.hostname,
+      machineStatus: "started",
+      authSecret: provisioned.authSecret,
+      config: { plan, flyAppName },
+    })
+    .returning();
+
+  return c.json({
+    message: "Instance provisioned",
+    instance: created,
+  });
 });
 
 instances.get("/:id", async (c) => {
   const id = c.req.param("id");
-  // TODO: Fetch instance from DB, verify org membership + ownership
-  return c.json({ id, status: "not_implemented" });
+  const orgId = c.get("organizationId");
+  const userId = c.get("auth").userId;
+
+  const row = await getAuthorizedInstance(id, orgId, userId);
+  if (!row) return c.json({ error: "Instance not found" }, 404);
+
+  return c.json(row);
 });
 
 instances.delete("/:id", async (c) => {
   const id = c.req.param("id");
-  // TODO: Verify ownership, deprovision via Fly API, remove from DB
-  return c.json({ id, message: "Instance destruction started" });
+  const orgId = c.get("organizationId");
+  const userId = c.get("auth").userId;
+
+  const row = await getOwnedInstance(id, orgId, userId);
+  if (!row) return c.json({ error: "Instance not found or not owned by user" }, 404);
+
+  if (row.flyMachineId && row.flyVolumeId) {
+    const appNameFromConfig = getFlyAppNameFromConfig(row.config);
+    const provisioner = getProvisioner(appNameFromConfig);
+    try {
+      await provisioner.deprovision(row.flyMachineId, row.flyVolumeId);
+    } catch (error) {
+      // If Fly resources are already gone, still clean up stale DB rows.
+      if (!isFlyNotFoundError(error)) throw error;
+    }
+  }
+
+  const appNameFromConfig = getFlyAppNameFromConfig(row.config);
+  if (appNameFromConfig) {
+    const apps = getAppsClient();
+    await apps.destroyAppIfExists(appNameFromConfig);
+  }
+
+  const db = getDb();
+  await db.delete(instancesTable).where(eq(instancesTable.id, id));
+  return c.json({ id, message: "Instance destroyed" });
 });
 
 instances.post("/:id/start", async (c) => {
   const id = c.req.param("id");
-  // TODO: Verify ownership, start Fly Machine
-  return c.json({ id, message: "Starting" });
+  const orgId = c.get("organizationId");
+  const userId = c.get("auth").userId;
+
+  const row = await getAuthorizedInstance(id, orgId, userId);
+  if (!row) return c.json({ error: "Instance not found" }, 404);
+  if (!row.flyMachineId) return c.json({ error: "Instance has no Fly machine" }, 409);
+
+  const appNameFromConfig = getFlyAppNameFromConfig(row.config);
+  const provisioner = getProvisioner(appNameFromConfig);
+  await provisioner.start(row.flyMachineId);
+
+  const db = getDb();
+  await db
+    .update(instancesTable)
+    .set({ machineStatus: "started" })
+    .where(eq(instancesTable.id, id));
+
+  return c.json({ id, message: "Started" });
 });
 
 instances.post("/:id/stop", async (c) => {
   const id = c.req.param("id");
-  // TODO: Verify ownership, stop Fly Machine
-  return c.json({ id, message: "Stopping" });
+  const orgId = c.get("organizationId");
+  const userId = c.get("auth").userId;
+
+  const row = await getAuthorizedInstance(id, orgId, userId);
+  if (!row) return c.json({ error: "Instance not found" }, 404);
+  if (!row.flyMachineId) return c.json({ error: "Instance has no Fly machine" }, 409);
+
+  const appNameFromConfig = getFlyAppNameFromConfig(row.config);
+  const provisioner = getProvisioner(appNameFromConfig);
+  await provisioner.stop(row.flyMachineId);
+
+  const db = getDb();
+  await db
+    .update(instancesTable)
+    .set({ machineStatus: "stopped" })
+    .where(eq(instancesTable.id, id));
+
+  return c.json({ id, message: "Stopped" });
 });
 
 instances.post("/:id/restart", async (c) => {
   const id = c.req.param("id");
-  // TODO: Verify ownership, stop then start Fly Machine
-  return c.json({ id, message: "Restarting" });
+  const orgId = c.get("organizationId");
+  const userId = c.get("auth").userId;
+
+  const row = await getAuthorizedInstance(id, orgId, userId);
+  if (!row) return c.json({ error: "Instance not found" }, 404);
+  if (!row.flyMachineId) return c.json({ error: "Instance has no Fly machine" }, 409);
+
+  const appNameFromConfig = getFlyAppNameFromConfig(row.config);
+  const provisioner = getProvisioner(appNameFromConfig);
+  await provisioner.stop(row.flyMachineId);
+  await provisioner.start(row.flyMachineId);
+
+  const db = getDb();
+  await db
+    .update(instancesTable)
+    .set({ machineStatus: "started" })
+    .where(eq(instancesTable.id, id));
+
+  return c.json({ id, message: "Restarted" });
 });
 
 instances.post("/:id/token", async (c) => {
   const id = c.req.param("id");
-  // TODO: Verify ownership, fetch instance auth_secret from DB, issue JWT
-  return c.json({ id, token: "not_implemented" });
+  const orgId = c.get("organizationId");
+  const userId = c.get("auth").userId;
+
+  const row = await getAuthorizedInstance(id, orgId, userId);
+  if (!row) return c.json({ error: "Instance not found" }, 404);
+
+  const token = await createInstanceToken(row.authSecret);
+  return c.json({ id, token });
 });
 
 instances.get("/:id/embed", async (c) => {
   const id = c.req.param("id");
+
   // Validate id is a UUID to prevent open redirect attacks.
   const uuidPattern =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!uuidPattern.test(id)) {
     return c.json({ error: "Invalid instance ID" }, 400);
   }
-  // TODO: Verify ownership, issue token, redirect with token cookie.
-  // In production, look up hostname from DB instead of constructing from id.
-  return c.redirect(`https://${id}.companion.run`);
+
+  const orgId = c.get("organizationId");
+  const userId = c.get("auth").userId;
+  const row = await getAuthorizedInstance(id, orgId, userId);
+  if (!row) return c.json({ error: "Instance not found" }, 404);
+
+  const token = await createInstanceToken(row.authSecret);
+  const url = new URL(`https://${row.hostname}`);
+  url.searchParams.set("token", token);
+  return c.redirect(url.toString());
 });
 
 export { instances };

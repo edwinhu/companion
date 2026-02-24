@@ -153,6 +153,27 @@ describe("managed-auth middleware", () => {
     const res = await app.request(`/api/sessions?token=${token}`);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
+    expect(res.headers.get("set-cookie")).toContain("companion_token=");
+  });
+
+  it("persists query-token auth as cookie for follow-up requests", async () => {
+    process.env.COMPANION_AUTH_ENABLED = "1";
+    process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
+    const app = createTestApp();
+
+    const token = await createToken(TEST_SECRET, 60);
+    const first = await app.request(`/api/sessions?token=${token}`);
+    expect(first.status).toBe(200);
+
+    const setCookie = first.headers.get("set-cookie");
+    expect(setCookie).toBeTruthy();
+
+    const cookiePair = setCookie!.split(";")[0];
+    const second = await app.request("/api/sessions", {
+      headers: { cookie: cookiePair },
+    });
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual({ ok: true });
   });
 
   it("allows access with a valid token in cookie", async () => {
@@ -202,15 +223,15 @@ describe("managed-auth middleware", () => {
     expect(res.headers.get("location")).toBe("https://login.example.com");
   });
 
-  it("prefers cookie over query param when both are present", async () => {
+  it("prefers query param over cookie when both are present", async () => {
     process.env.COMPANION_AUTH_ENABLED = "1";
     process.env.COMPANION_AUTH_SECRET = TEST_SECRET;
     const app = createTestApp();
 
     const validToken = await createToken(TEST_SECRET, 60);
-    // Cookie has valid token, query has bad token — cookie wins
-    const res = await app.request("/api/sessions?token=bad.token", {
-      headers: { cookie: `companion_token=${validToken}` },
+    // Query has valid token, cookie has bad token — query wins.
+    const res = await app.request(`/api/sessions?token=${validToken}`, {
+      headers: { cookie: "companion_token=bad.token" },
     });
     expect(res.status).toBe(200);
   });

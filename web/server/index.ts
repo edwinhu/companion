@@ -42,6 +42,7 @@ import { DEFAULT_PORT_DEV, DEFAULT_PORT_PROD } from "./constants.js";
 
 const defaultPort = process.env.NODE_ENV === "production" ? DEFAULT_PORT_PROD : DEFAULT_PORT_DEV;
 const port = Number(process.env.PORT) || defaultPort;
+const host = process.env.HOST || "0.0.0.0";
 const idleTimeoutSeconds = Number(process.env.COMPANION_IDLE_TIMEOUT_SECONDS || "120");
 const sessionStore = new SessionStore(process.env.COMPANION_SESSION_DIR);
 const wsBridge = new WsBridge();
@@ -133,9 +134,17 @@ app.get("/health", (c) => {
 });
 
 // ── Managed auth middleware — only active when COMPANION_AUTH_ENABLED=1 ────
-if (process.env.COMPANION_AUTH_ENABLED === "1") {
+const hasManagedAuthSecret = Boolean(process.env.COMPANION_AUTH_SECRET?.trim());
+const managedAuthEnabled =
+  process.env.COMPANION_AUTH_ENABLED === "1" ||
+  (hasManagedAuthSecret && process.env.COMPANION_AUTH_ENABLED !== "0");
+
+if (managedAuthEnabled) {
   const { managedAuth } = await import("./middleware/managed-auth.js");
   app.use("/*", managedAuth);
+  console.log("[server] Managed auth enabled");
+} else {
+  console.log("[server] Managed auth disabled");
 }
 
 app.use("/api/*", cors());
@@ -149,6 +158,7 @@ if (process.env.NODE_ENV === "production") {
 }
 
 const server = Bun.serve<SocketData>({
+  hostname: host,
   port,
   idleTimeout: idleTimeoutSeconds,
   async fetch(req, server) {
@@ -225,7 +235,7 @@ const server = Bun.serve<SocketData>({
   },
 });
 
-console.log(`Server running on http://localhost:${server.port}`);
+console.log(`Server running on http://${host}:${server.port}`);
 console.log(`  CLI WebSocket:     ws://localhost:${server.port}/ws/cli/:sessionId`);
 console.log(`  Browser WebSocket: ws://localhost:${server.port}/ws/browser/:sessionId`);
 

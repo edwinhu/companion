@@ -29,6 +29,28 @@ interface ProvisionResult {
   hostname: string;
 }
 
+function makeVolumeName(hostname: string): string {
+  // Fly volume names allow lowercase alphanumeric and underscores, max 30 chars.
+  const safe = hostname
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const suffix = (safe || "instance").slice(0, 20);
+  return `companion_${suffix}`;
+}
+
+function makeMachineName(hostname: string): string {
+  // Fly machine names are best kept to lowercase alphanumeric + dashes.
+  const safe = hostname
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const suffix = (safe || "instance").slice(0, 40);
+  return `companion-${suffix}`;
+}
+
 /**
  * Orchestrates end-to-end instance provisioning:
  * 1. Create Fly Volume for persistent storage
@@ -53,7 +75,7 @@ export class Provisioner {
 
     // Step 1: Create volume
     const volume = await this.volumes.createVolume({
-      name: `companion-${input.hostname}`,
+      name: makeVolumeName(input.hostname),
       region: input.region,
       size_gb: config.storage_gb,
     });
@@ -61,6 +83,7 @@ export class Provisioner {
     // Step 2: Create machine
     const env: Record<string, string> = {
       NODE_ENV: "production",
+      HOST: "::",
       COMPANION_HOME: "/data/companion",
       COMPANION_SESSION_DIR: "/data/sessions",
       COMPANION_AUTH_ENABLED: "1",
@@ -73,7 +96,7 @@ export class Provisioner {
     }
 
     const machine = await this.machines.createMachine({
-      name: `companion-${input.hostname}`,
+      name: makeMachineName(input.hostname),
       region: input.region,
       config: {
         image: this.companionImage,
@@ -91,6 +114,7 @@ export class Provisioner {
             ],
             internal_port: 3456,
             protocol: "tcp",
+            min_machines_running: 1,
           },
         ],
         mounts: [
@@ -99,7 +123,7 @@ export class Provisioner {
             path: "/data",
           },
         ],
-        auto_stop: "stop",
+        auto_stop: "off",
         auto_start: true,
       },
     });

@@ -20,8 +20,11 @@ export const managedAuth = createMiddleware(async (c: Context, next) => {
   // Internal paths that bypass auth
   if (path.startsWith("/ws/cli/") || path === "/health") return next();
 
-  const token =
-    getCookie(c, "companion_token") || c.req.query("token");
+  const cookieToken = getCookie(c, "companion_token");
+  const queryToken = c.req.query("token");
+  // Give explicit URL token precedence so reconnect links can always override
+  // stale/expired cookies in the browser.
+  const token = queryToken || cookieToken;
 
   if (!token) {
     return redirectOrUnauthorized(c);
@@ -38,6 +41,12 @@ export const managedAuth = createMiddleware(async (c: Context, next) => {
     return redirectOrUnauthorized(c);
   }
 
+  // When auth arrives via URL query once, persist it to a cookie so static
+  // assets and subsequent API calls are authenticated without ?token=...
+  if (!cookieToken && queryToken) {
+    setAuthCookie(c, queryToken);
+  }
+
   return next();
 });
 
@@ -48,6 +57,14 @@ function getCookie(c: Context, name: string): string | undefined {
   if (!header) return undefined;
   const match = header.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
   return match?.[1];
+}
+
+function setAuthCookie(c: Context, token: string): void {
+  const encoded = encodeURIComponent(token);
+  c.header(
+    "Set-Cookie",
+    `companion_token=${encoded}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=900`,
+  );
 }
 
 function redirectOrUnauthorized(c: Context): Response {

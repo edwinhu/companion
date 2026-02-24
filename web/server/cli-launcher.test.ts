@@ -205,6 +205,31 @@ describe("launch", () => {
     expect(bashCmd).not.toContain("bypassPermissions");
   });
 
+  it("downgrades bypassPermissions to acceptEdits when host launcher runs as root", () => {
+    const originalGetuid = process.getuid;
+    Object.defineProperty(process, "getuid", {
+      value: () => 0,
+      configurable: true,
+    });
+
+    try {
+      launcher.launch({
+        cwd: "/tmp/project",
+        permissionMode: "bypassPermissions",
+      });
+
+      const [cmdAndArgs] = mockSpawn.mock.calls[0];
+      const modeIdx = cmdAndArgs.indexOf("--permission-mode");
+      expect(modeIdx).toBeGreaterThan(-1);
+      expect(cmdAndArgs[modeIdx + 1]).toBe("acceptEdits");
+    } finally {
+      Object.defineProperty(process, "getuid", {
+        value: originalGetuid,
+        configurable: true,
+      });
+    }
+  });
+
   it("uses COMPANION_CONTAINER_SDK_HOST for containerized sdk-url when set", () => {
     process.env.COMPANION_CONTAINER_SDK_HOST = "172.17.0.1";
     launcher.launch({

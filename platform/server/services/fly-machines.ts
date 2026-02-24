@@ -19,6 +19,7 @@ interface FlyMachineConfig {
     ports: Array<{ port: number; handlers: string[] }>;
     internal_port: number;
     protocol: string;
+    min_machines_running?: number;
   }>;
   mounts?: Array<{
     volume: string;

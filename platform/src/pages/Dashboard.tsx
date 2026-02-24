@@ -232,7 +232,7 @@ function InstanceCard({ instance }: { instance: any }) {
         {isRunning && (
           <>
             <a
-              href={instance.hostname ? `https://${instance.hostname}` : "#"}
+              href={instance.id ? `/api/instances/${instance.id}/embed` : "#"}
               target="_blank"
               rel="noopener noreferrer"
               className="flex-1 py-1.5 text-xs font-medium bg-cc-primary text-white rounded-lg hover:bg-cc-primary-hover transition-colors text-center"
@@ -249,14 +249,27 @@ function InstanceCard({ instance }: { instance: any }) {
           </>
         )}
         {isStopped && (
-          <button
-            onClick={() => handleAction(() => api.startInstance(instance.id))}
-            disabled={actionLoading}
-            className="flex-1 py-1.5 text-xs font-medium border border-cc-border rounded-lg hover:bg-cc-hover transition-colors disabled:opacity-50"
-          >
-            {actionLoading ? <Loader2 size={12} className="animate-spin mx-auto" /> : "Start"}
-          </button>
+          <>
+            <button
+              onClick={() => handleAction(() => api.startInstance(instance.id))}
+              disabled={actionLoading}
+              className="flex-1 py-1.5 text-xs font-medium border border-cc-border rounded-lg hover:bg-cc-hover transition-colors disabled:opacity-50"
+            >
+              {actionLoading ? <Loader2 size={12} className="animate-spin mx-auto" /> : "Start"}
+            </button>
+          </>
         )}
+        <button
+          onClick={() => {
+            const confirmed = window.confirm("Delete this instance permanently?");
+            if (!confirmed) return;
+            void handleAction(() => api.deleteInstance(instance.id));
+          }}
+          disabled={actionLoading}
+          className="px-3 py-1.5 text-xs border border-cc-error/40 text-cc-error rounded-lg hover:bg-cc-error/10 transition-colors disabled:opacity-50"
+        >
+          {actionLoading ? <Loader2 size={12} className="animate-spin" /> : "Delete"}
+        </button>
       </div>
     </div>
   );

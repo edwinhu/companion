@@ -143,7 +143,7 @@ describe("Provisioner", () => {
       expect(calls[0][0]).toBe(`${FLY_BASE}/volumes`);
       expect(calls[0][1].method).toBe("POST");
       const volumeBody = JSON.parse(calls[0][1].body);
-      expect(volumeBody.name).toBe("companion-acme");
+      expect(volumeBody.name).toBe("companion_acme");
       expect(volumeBody.region).toBe("iad");
       expect(volumeBody.size_gb).toBe(10);
 
@@ -159,6 +159,17 @@ describe("Provisioner", () => {
       // 3rd call: waitForState → GET /machines/:id
       expect(calls[2][0]).toBe(`${FLY_BASE}/machines/mach-456`);
       expect(calls[2][1].method).toBe("GET");
+    });
+
+    it("sanitizes and truncates volume names to Fly constraints", async () => {
+      await provisioner.provision(
+        baseInput({ hostname: "ACME-VERY-LONG-HOSTNAME-WITH-SYMBOLS!!!and-more" }),
+      );
+
+      const volumeBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(volumeBody.name).toBe("companion_acme_very_long_hostn");
+      expect(volumeBody.name.length).toBeLessThanOrEqual(30);
+      expect(volumeBody.name).toMatch(/^[a-z0-9_]+$/);
     });
 
     it.each([

@@ -27,7 +27,6 @@ interface AgentFormData {
   model: string;
   permissionMode: string;
   cwd: string;
-  useTempDir: boolean;
   prompt: string;
   envSlug: string;
   // Environment variables (key-value pairs)
@@ -42,11 +41,6 @@ interface AgentFormData {
   mcpServers: Record<string, McpServerConfigAgent>;
   // Skills
   skills: string[];
-  // Docker/Container
-  containerImage: string;
-  containerPorts: string;
-  containerVolumes: string;
-  containerInitScript: string;
   // Allowed tools
   allowedTools: string[];
   // Triggers
@@ -64,7 +58,6 @@ const EMPTY_FORM: AgentFormData = {
   model: getDefaultModel("claude"),
   permissionMode: getDefaultMode("claude"),
   cwd: "",
-  useTempDir: false,
   prompt: "",
   envSlug: "",
   env: [],
@@ -74,10 +67,6 @@ const EMPTY_FORM: AgentFormData = {
   useWorktree: false,
   mcpServers: {},
   skills: [],
-  containerImage: "",
-  containerPorts: "",
-  containerVolumes: "",
-  containerInitScript: "",
   allowedTools: [],
   webhookEnabled: false,
   scheduleEnabled: false,
@@ -138,8 +127,8 @@ function countAdvancedFeatures(form: AgentFormData): number {
   let count = 0;
   if (Object.keys(form.mcpServers).length > 0) count++;
   if (form.skills.length > 0) count++;
-  if (form.containerImage) count++;
   if (form.allowedTools.length > 0) count++;
+  if (form.env.length > 0) count++;
   return count;
 }
 
@@ -203,7 +192,6 @@ export function AgentsPage({ route }: Props) {
       model: agent.model,
       permissionMode: agent.permissionMode,
       cwd: agent.cwd === "temp" ? "" : agent.cwd,
-      useTempDir: agent.cwd === "temp" || !agent.cwd,
       prompt: agent.prompt,
       envSlug: agent.envSlug || "",
       env: agent.env
@@ -215,10 +203,6 @@ export function AgentsPage({ route }: Props) {
       useWorktree: agent.useWorktree ?? false,
       mcpServers: agent.mcpServers || {},
       skills: agent.skills || [],
-      containerImage: agent.container?.image || "",
-      containerPorts: (agent.container?.ports || []).join(", "),
-      containerVolumes: (agent.container?.volumes || []).join("\n"),
-      containerInitScript: agent.container?.initScript || "",
       allowedTools: agent.allowedTools || [],
       webhookEnabled: agent.triggers?.webhook?.enabled ?? false,
       scheduleEnabled: agent.triggers?.schedule?.enabled ?? false,
@@ -246,20 +230,6 @@ export function AgentsPage({ route }: Props) {
         if (key.trim()) envRecord[key.trim()] = value;
       }
 
-      // Build container config, only include if image is set
-      const container = form.containerImage
-        ? {
-            image: form.containerImage,
-            ports: form.containerPorts
-              ? form.containerPorts.split(",").map((p) => parseInt(p.trim(), 10)).filter((n) => !isNaN(n))
-              : undefined,
-            volumes: form.containerVolumes
-              ? form.containerVolumes.split("\n").map((v) => v.trim()).filter(Boolean)
-              : undefined,
-            initScript: form.containerInitScript || undefined,
-          }
-        : undefined;
-
       const data: Partial<AgentInfo> = {
         version: 1,
         name: form.name,
@@ -268,7 +238,7 @@ export function AgentsPage({ route }: Props) {
         backendType: form.backendType,
         model: form.model,
         permissionMode: form.permissionMode,
-        cwd: form.useTempDir ? "temp" : form.cwd,
+        cwd: form.cwd || "temp",
         prompt: form.prompt,
         envSlug: form.envSlug || undefined,
         env: Object.keys(envRecord).length > 0 ? envRecord : undefined,
@@ -278,7 +248,6 @@ export function AgentsPage({ route }: Props) {
         useWorktree: form.branch ? form.useWorktree : undefined,
         mcpServers: Object.keys(form.mcpServers).length > 0 ? form.mcpServers : undefined,
         skills: form.skills.length > 0 ? form.skills : undefined,
-        container,
         allowedTools: form.allowedTools.length > 0 ? form.allowedTools : undefined,
         enabled: true,
         triggers: {
@@ -683,6 +652,13 @@ function AgentEditor({
   const [availableSkills, setAvailableSkills] = useState<{ slug: string; name: string; description: string }[]>([]);
   const [envProfiles, setEnvProfiles] = useState<CompanionEnv[]>([]);
   const [allowedToolInput, setAllowedToolInput] = useState("");
+  const [showModelDropdown, setShowModelDropdown] = useState(false);
+  const [showModeDropdown, setShowModeDropdown] = useState(false);
+  const [showEnvDropdown, setShowEnvDropdown] = useState(false);
+  const [showBranchInput, setShowBranchInput] = useState(!!form.branch);
+  const modelDropdownRef = useRef<HTMLDivElement>(null);
+  const modeDropdownRef = useRef<HTMLDivElement>(null);
+  const envDropdownRef = useRef<HTMLDivElement>(null);
 
   // Fetch skills and env profiles on mount
   useEffect(() => {
@@ -774,6 +750,34 @@ function AgentEditor({
     updateField("allowedTools", form.allowedTools.filter((t) => t !== tool));
   }
 
+  // ── Click-outside handlers for dropdowns ──
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (modelDropdownRef.current && !modelDropdownRef.current.contains(e.target as Node)) {
+        setShowModelDropdown(false);
+      }
+      if (modeDropdownRef.current && !modeDropdownRef.current.contains(e.target as Node)) {
+        setShowModeDropdown(false);
+      }
+      if (envDropdownRef.current && !envDropdownRef.current.contains(e.target as Node)) {
+        setShowEnvDropdown(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  // Derive labels for pills
+  const selectedModel = models.find((m) => m.value === form.model) || models[0];
+  const selectedMode = modes.find((m) => m.value === form.permissionMode) || modes[0];
+  const selectedEnv = envProfiles.find((e) => e.slug === form.envSlug);
+  const folderLabel = form.cwd ? form.cwd.split("/").pop() || form.cwd : "temp";
+
+  // Common pill class
+  const pill = "flex items-center gap-1.5 px-2 py-1 text-xs rounded-md transition-colors cursor-pointer";
+  const pillDefault = `${pill} text-cc-muted hover:text-cc-fg hover:bg-cc-hover`;
+  const pillActive = `${pill} text-cc-primary bg-cc-primary/10 hover:bg-cc-primary/15`;
+
   return (
     <div className="h-full overflow-y-auto bg-cc-bg">
       <div className="max-w-3xl mx-auto p-6">
@@ -815,274 +819,343 @@ function AgentEditor({
           </div>
         )}
 
-        <div className="space-y-6">
-          {/* ── Basics ── */}
-          <section>
-            <h2 className="text-xs font-medium text-cc-muted uppercase tracking-wider mb-3">Basics</h2>
-            <div className="space-y-3">
-              <div className="flex gap-3">
-                <div className="flex-shrink-0">
-                  <label className="block text-xs text-cc-muted mb-1">Icon</label>
-                  <select
-                    value={form.icon}
-                    onChange={(e) => updateField("icon", e.target.value)}
-                    className="w-14 h-9 px-1 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-center text-lg focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                  >
-                    {ICON_OPTIONS.map((ic) => (
-                      <option key={ic} value={ic}>{ic || "—"}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="flex-1">
-                  <label className="block text-xs text-cc-muted mb-1">Name *</label>
-                  <input
-                    value={form.name}
-                    onChange={(e) => updateField("name", e.target.value)}
-                    placeholder="e.g., Docs Writer"
-                    className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                  />
-                </div>
-              </div>
-              <div>
-                <label className="block text-xs text-cc-muted mb-1">Description</label>
-                <input
-                  value={form.description}
-                  onChange={(e) => updateField("description", e.target.value)}
-                  placeholder="What does this agent do?"
-                  className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                />
-              </div>
+        <div className="space-y-5">
+          {/* ── Identity ── */}
+          <div className="flex gap-3 items-start">
+            <select
+              value={form.icon}
+              onChange={(e) => updateField("icon", e.target.value)}
+              className="w-10 h-10 px-0 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-center text-lg focus:outline-none focus:ring-1 focus:ring-cc-primary flex-shrink-0"
+              aria-label="Agent icon"
+            >
+              {ICON_OPTIONS.map((ic) => (
+                <option key={ic} value={ic}>{ic || "—"}</option>
+              ))}
+            </select>
+            <div className="flex-1 space-y-2">
+              <input
+                value={form.name}
+                onChange={(e) => updateField("name", e.target.value)}
+                placeholder="Agent name *"
+                className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm focus:outline-none focus:ring-1 focus:ring-cc-primary"
+              />
+              <input
+                value={form.description}
+                onChange={(e) => updateField("description", e.target.value)}
+                placeholder="Short description (optional)"
+                className="w-full px-3 py-1.5 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-xs focus:outline-none focus:ring-1 focus:ring-cc-primary"
+              />
             </div>
-          </section>
+          </div>
 
           {/* ── Prompt ── */}
-          <section>
-            <h2 className="text-xs font-medium text-cc-muted uppercase tracking-wider mb-3">Prompt *</h2>
+          <div>
             <textarea
               value={form.prompt}
               onChange={(e) => updateField("prompt", e.target.value)}
-              placeholder={"Write the agent's instructions here.\nUse {{input}} as a placeholder for trigger-provided input."}
+              placeholder={"System prompt *\nWrite the agent's instructions here.\nUse {{input}} as a placeholder for trigger-provided input."}
               className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm resize-none h-40 font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
             />
             <p className="text-[10px] text-cc-muted mt-1">
               Use <code className="px-1 py-0.5 rounded bg-cc-hover">{"{{input}}"}</code> where trigger input should be inserted.
             </p>
-          </section>
+          </div>
 
-          {/* ── Backend & Model ── */}
-          <section>
-            <h2 className="text-xs font-medium text-cc-muted uppercase tracking-wider mb-3">Backend</h2>
-            <div className="grid grid-cols-3 gap-3">
-              <div>
-                <label className="block text-xs text-cc-muted mb-1">Provider</label>
-                <div className="flex rounded-lg border border-cc-border overflow-hidden">
-                  <button
-                    onClick={() => handleBackendChange("claude")}
-                    className={`flex-1 px-3 py-1.5 text-xs transition-colors cursor-pointer ${form.backendType === "claude" ? "bg-cc-primary text-white" : "bg-cc-input-bg text-cc-muted hover:text-cc-fg"}`}
-                  >
-                    Claude
-                  </button>
-                  <button
-                    onClick={() => handleBackendChange("codex")}
-                    className={`flex-1 px-3 py-1.5 text-xs transition-colors cursor-pointer ${form.backendType === "codex" ? "bg-cc-primary text-white" : "bg-cc-input-bg text-cc-muted hover:text-cc-fg"}`}
-                  >
-                    Codex
-                  </button>
-                </div>
-              </div>
-              <div>
-                <label className="block text-xs text-cc-muted mb-1">Model</label>
-                <select
-                  value={form.model}
-                  onChange={(e) => updateField("model", e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                >
-                  {models.map((m) => (
-                    <option key={m.value} value={m.value}>{m.icon} {m.label}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs text-cc-muted mb-1">Mode</label>
-                <select
-                  value={form.permissionMode}
-                  onChange={(e) => updateField("permissionMode", e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                >
-                  {modes.map((m) => (
-                    <option key={m.value} value={m.value}>{m.label}</option>
-                  ))}
-                </select>
-              </div>
+          {/* ── Controls Row ── */}
+          <div className="flex items-center gap-1 sm:gap-2 flex-wrap" data-testid="controls-row">
+            {/* Backend toggle */}
+            <div className="flex items-center bg-cc-hover/50 rounded-lg p-0.5">
+              <button
+                onClick={() => handleBackendChange("claude")}
+                className={`flex items-center gap-1 px-2 py-1 text-xs rounded-md transition-colors cursor-pointer ${form.backendType === "claude" ? "bg-cc-card text-cc-fg font-medium shadow-sm" : "text-cc-muted hover:text-cc-fg"}`}
+              >
+                Claude
+              </button>
+              <button
+                onClick={() => handleBackendChange("codex")}
+                className={`flex items-center gap-1 px-2 py-1 text-xs rounded-md transition-colors cursor-pointer ${form.backendType === "codex" ? "bg-cc-card text-cc-fg font-medium shadow-sm" : "text-cc-muted hover:text-cc-fg"}`}
+              >
+                Codex
+              </button>
             </div>
-            {/* Codex internet access toggle */}
-            {form.backendType === "codex" && (
-              <label className="flex items-center gap-2 text-sm text-cc-fg cursor-pointer mt-3">
-                <input
-                  type="checkbox"
-                  checked={form.codexInternetAccess}
-                  onChange={(e) => updateField("codexInternetAccess", e.target.checked)}
-                  className="rounded"
-                />
-                Allow internet access
-              </label>
-            )}
-          </section>
 
-          {/* ── Working Directory ── */}
-          <section>
-            <h2 className="text-xs font-medium text-cc-muted uppercase tracking-wider mb-3">Working Directory</h2>
-            <div className="space-y-2">
-              <label className="flex items-center gap-2 text-sm text-cc-fg cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={form.useTempDir}
-                  onChange={(e) => updateField("useTempDir", e.target.checked)}
-                  className="rounded"
-                />
-                Use temporary directory
-              </label>
-              {!form.useTempDir && (
-                <div className="flex gap-2">
-                  <input
-                    value={form.cwd}
-                    onChange={(e) => updateField("cwd", e.target.value)}
-                    placeholder="/path/to/project"
-                    className="flex-1 px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                  />
-                  <button
-                    onClick={() => setShowFolderPicker(true)}
-                    className="px-3 py-2 rounded-lg border border-cc-border text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors text-xs cursor-pointer"
-                  >
-                    Browse
-                  </button>
+            {/* Model dropdown pill */}
+            <div className="relative" ref={modelDropdownRef}>
+              <button
+                onClick={() => { setShowModelDropdown(!showModelDropdown); setShowModeDropdown(false); setShowEnvDropdown(false); }}
+                aria-expanded={showModelDropdown}
+                className={pillDefault}
+              >
+                <span>{selectedModel?.icon}</span>
+                <span>{selectedModel?.label}</span>
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3 opacity-50"><path d="M4 6l4 4 4-4" /></svg>
+              </button>
+              {showModelDropdown && (
+                <div className="absolute left-0 top-full mt-1 w-48 bg-cc-card border border-cc-border rounded-[10px] shadow-lg z-10 py-1">
+                  {models.map((m) => (
+                    <button
+                      key={m.value}
+                      onClick={() => { updateField("model", m.value); setShowModelDropdown(false); }}
+                      className={`w-full px-3 py-2 text-xs text-left hover:bg-cc-hover transition-colors cursor-pointer flex items-center gap-2 ${m.value === form.model ? "text-cc-primary font-medium" : "text-cc-fg"}`}
+                    >
+                      <span>{m.icon}</span>
+                      {m.label}
+                    </button>
+                  ))}
                 </div>
               )}
             </div>
-            {showFolderPicker && (
-              <FolderPicker
-                initialPath={form.cwd || ""}
-                onSelect={(path) => {
-                  updateField("cwd", path);
-                  setShowFolderPicker(false);
-                }}
-                onClose={() => setShowFolderPicker(false)}
-              />
-            )}
-          </section>
 
-          {/* ── Environment ── */}
-          <section>
-            <h2 className="text-xs font-medium text-cc-muted uppercase tracking-wider mb-3">Environment</h2>
-            <div className="space-y-3">
-              {/* Env profile dropdown */}
-              <div>
-                <label className="block text-xs text-cc-muted mb-1">Environment Profile</label>
-                <select
-                  value={form.envSlug}
-                  onChange={(e) => updateField("envSlug", e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                >
-                  <option value="">None</option>
-                  {envProfiles.map((env) => (
-                    <option key={env.slug} value={env.slug}>{env.name}</option>
+            {/* Mode dropdown pill */}
+            <div className="relative" ref={modeDropdownRef}>
+              <button
+                onClick={() => { setShowModeDropdown(!showModeDropdown); setShowModelDropdown(false); setShowEnvDropdown(false); }}
+                aria-expanded={showModeDropdown}
+                className={pillDefault}
+              >
+                <span>{selectedMode?.label}</span>
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3 opacity-50"><path d="M4 6l4 4 4-4" /></svg>
+              </button>
+              {showModeDropdown && (
+                <div className="absolute left-0 top-full mt-1 w-48 bg-cc-card border border-cc-border rounded-[10px] shadow-lg z-10 py-1">
+                  {modes.map((m) => (
+                    <button
+                      key={m.value}
+                      onClick={() => { updateField("permissionMode", m.value); setShowModeDropdown(false); }}
+                      className={`w-full px-3 py-2 text-xs text-left hover:bg-cc-hover transition-colors cursor-pointer flex items-center gap-2 ${m.value === form.permissionMode ? "text-cc-primary font-medium" : "text-cc-fg"}`}
+                    >
+                      {m.label}
+                    </button>
                   ))}
-                </select>
-                <p className="text-[10px] text-cc-muted mt-1">
-                  Select a shared environment profile, or add variables below.
-                </p>
-              </div>
-              {/* Inline key-value editor */}
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="text-xs text-cc-muted">Extra Variables</label>
-                  <button
-                    onClick={addEnvVar}
-                    className="text-[10px] text-cc-muted hover:text-cc-fg transition-colors cursor-pointer"
-                  >
-                    + Add Variable
-                  </button>
                 </div>
-                {form.env.length === 0 ? (
-                  <p className="text-[10px] text-cc-muted">No extra variables set.</p>
-                ) : (
-                  <div className="space-y-1.5">
-                    {form.env.map((entry, i) => (
-                      <div key={i} className="flex gap-2 items-center">
-                        <input
-                          value={entry.key}
-                          onChange={(e) => updateEnvVar(i, "key", e.target.value)}
-                          placeholder="KEY"
-                          className="w-1/3 px-2 py-1.5 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-xs font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                        />
-                        <input
-                          value={entry.value}
-                          onChange={(e) => updateEnvVar(i, "value", e.target.value)}
-                          placeholder="value"
-                          className="flex-1 px-2 py-1.5 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-xs font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                        />
-                        <button
-                          onClick={() => removeEnvVar(i)}
-                          className="text-cc-muted hover:text-cc-error transition-colors cursor-pointer p-1"
-                          title="Remove variable"
-                        >
-                          <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
-                            <path d="M4.646 4.646a.5.5 0 01.708 0L8 7.293l2.646-2.647a.5.5 0 01.708.708L8.707 8l2.647 2.646a.5.5 0 01-.708.708L8 8.707l-2.646 2.647a.5.5 0 01-.708-.708L7.293 8 4.646 5.354a.5.5 0 010-.708z" />
-                          </svg>
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+              )}
             </div>
-          </section>
 
-          {/* ── Git (only when cwd is set and not using temp dir) ── */}
-          {!form.useTempDir && form.cwd && (
-            <section data-testid="git-section">
-              <h2 className="text-xs font-medium text-cc-muted uppercase tracking-wider mb-3">Git</h2>
-              <div className="space-y-3">
-                <div>
-                  <label className="block text-xs text-cc-muted mb-1">Branch</label>
+            {/* Folder pill */}
+            <button
+              onClick={() => setShowFolderPicker(true)}
+              className={form.cwd ? pillActive : pillDefault}
+              title={form.cwd || "Temporary directory"}
+            >
+              <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 opacity-60">
+                <path d="M1 3.5A1.5 1.5 0 012.5 2h3.879a1.5 1.5 0 011.06.44l1.122 1.12A1.5 1.5 0 009.62 4H13.5A1.5 1.5 0 0115 5.5v7a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 011 12.5v-9z" />
+              </svg>
+              <span className="max-w-[120px] sm:max-w-[200px] truncate font-mono-code">{folderLabel}</span>
+              {form.cwd && (
+                <svg
+                  viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3 opacity-50 hover:opacity-100"
+                  onClick={(e) => { e.stopPropagation(); updateField("cwd", ""); }}
+                >
+                  <path d="M4.646 4.646a.5.5 0 01.708 0L8 7.293l2.646-2.647a.5.5 0 01.708.708L8.707 8l2.647 2.646a.5.5 0 01-.708.708L8 8.707l-2.646 2.647a.5.5 0 01-.708-.708L7.293 8 4.646 5.354a.5.5 0 010-.708z" />
+                </svg>
+              )}
+            </button>
+
+            {/* Branch pill — only visible when folder is set */}
+            {form.cwd && (
+              showBranchInput ? (
+                <div className="flex items-center gap-1">
+                  <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 text-cc-muted opacity-60">
+                    <path d="M9.5 3.25a2.25 2.25 0 113 2.122V6.5A2.5 2.5 0 0110 9H6a1 1 0 00-1 1v1.128a2.251 2.251 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.492 2.492 0 016 7h4a1 1 0 001-1v-.878A2.25 2.25 0 019.5 3.25z" />
+                  </svg>
                   <input
                     value={form.branch}
                     onChange={(e) => updateField("branch", e.target.value)}
-                    placeholder="e.g., feature/my-branch"
-                    className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
+                    placeholder="branch name"
+                    className="w-28 px-1.5 py-1 text-xs rounded-md bg-cc-input-bg border border-cc-border text-cc-fg font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
+                    autoFocus
+                    onBlur={() => { if (!form.branch) setShowBranchInput(false); }}
                   />
+                  {form.branch && (
+                    <>
+                      <label className="flex items-center gap-1 text-[10px] text-cc-muted cursor-pointer" title="Create branch if it doesn't exist">
+                        <input
+                          type="checkbox"
+                          checked={form.createBranch}
+                          onChange={(e) => updateField("createBranch", e.target.checked)}
+                          className="rounded w-3 h-3"
+                        />
+                        create
+                      </label>
+                      <label className="flex items-center gap-1 text-[10px] text-cc-muted cursor-pointer" title="Use git worktree">
+                        <input
+                          type="checkbox"
+                          checked={form.useWorktree}
+                          onChange={(e) => updateField("useWorktree", e.target.checked)}
+                          className="rounded w-3 h-3"
+                        />
+                        worktree
+                      </label>
+                    </>
+                  )}
                 </div>
-                {form.branch && (
-                  <div className="flex items-center gap-4">
-                    <label className="flex items-center gap-2 text-sm text-cc-fg cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={form.createBranch}
-                        onChange={(e) => updateField("createBranch", e.target.checked)}
-                        className="rounded"
-                      />
-                      Create branch if missing
-                    </label>
-                    <label className="flex items-center gap-2 text-sm text-cc-fg cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={form.useWorktree}
-                        onChange={(e) => updateField("useWorktree", e.target.checked)}
-                        className="rounded"
-                      />
-                      Use worktree
-                    </label>
+              ) : (
+                <button
+                  onClick={() => setShowBranchInput(true)}
+                  className={pillDefault}
+                  title="Set a git branch"
+                >
+                  <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 opacity-60">
+                    <path d="M9.5 3.25a2.25 2.25 0 113 2.122V6.5A2.5 2.5 0 0110 9H6a1 1 0 00-1 1v1.128a2.251 2.251 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.492 2.492 0 016 7h4a1 1 0 001-1v-.878A2.25 2.25 0 019.5 3.25z" />
+                  </svg>
+                  <span>branch</span>
+                </button>
+              )
+            )}
+
+            {/* Env profile pill */}
+            <div className="relative" ref={envDropdownRef}>
+              <button
+                onClick={() => { setShowEnvDropdown(!showEnvDropdown); setShowModelDropdown(false); setShowModeDropdown(false); }}
+                aria-expanded={showEnvDropdown}
+                className={form.envSlug ? pillActive : pillDefault}
+              >
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 opacity-60">
+                  <path d="M8 1a2 2 0 012 2v4H6V3a2 2 0 012-2zm3.5 6V3a3.5 3.5 0 10-7 0v4A1.5 1.5 0 003 8.5v5A1.5 1.5 0 004.5 15h7a1.5 1.5 0 001.5-1.5v-5A1.5 1.5 0 0011.5 7z" />
+                </svg>
+                <span>{selectedEnv?.name || "None"}</span>
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3 opacity-50"><path d="M4 6l4 4 4-4" /></svg>
+              </button>
+              {showEnvDropdown && (
+                <div className="absolute left-0 top-full mt-1 w-48 bg-cc-card border border-cc-border rounded-[10px] shadow-lg z-10 py-1">
+                  <button
+                    onClick={() => { updateField("envSlug", ""); setShowEnvDropdown(false); }}
+                    className={`w-full px-3 py-2 text-xs text-left hover:bg-cc-hover transition-colors cursor-pointer ${!form.envSlug ? "text-cc-primary font-medium" : "text-cc-fg"}`}
+                  >
+                    None
+                  </button>
+                  {envProfiles.map((env) => (
+                    <button
+                      key={env.slug}
+                      onClick={() => { updateField("envSlug", env.slug); setShowEnvDropdown(false); }}
+                      className={`w-full px-3 py-2 text-xs text-left hover:bg-cc-hover transition-colors cursor-pointer ${form.envSlug === env.slug ? "text-cc-primary font-medium" : "text-cc-fg"}`}
+                    >
+                      {env.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Internet pill — codex only */}
+            {form.backendType === "codex" && (
+              <button
+                onClick={() => updateField("codexInternetAccess", !form.codexInternetAccess)}
+                className={form.codexInternetAccess ? pillActive : pillDefault}
+                title="Allow internet access (Codex)"
+              >
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 opacity-60">
+                  <path d="M0 8a8 8 0 1116 0A8 8 0 010 8zm7.5-6.923c-.67.204-1.335.82-1.887 1.855A7.97 7.97 0 005.145 4H7.5V1.077zM4.09 4a9.267 9.267 0 01.64-1.539 6.7 6.7 0 01.597-.933A6.504 6.504 0 002.536 4H4.09zm-.582 3.5c.03-.877.138-1.718.312-2.5H1.674a6.51 6.51 0 00-.656 2.5h2.49zM4.847 5a12.5 12.5 0 00-.338 2.5H7.5V5H4.847zM8.5 5v2.5h2.99a12.495 12.495 0 00-.337-2.5H8.5zM4.51 8.5a12.5 12.5 0 00.337 2.5H7.5V8.5H4.51zm3.99 0V11h2.653c.187-.765.306-1.608.338-2.5H8.5zM5.145 12c.138.386.295.744.468 1.068.552 1.035 1.218 1.65 1.887 1.855V12H5.145zm.182 2.472a6.696 6.696 0 01-.597-.933A9.268 9.268 0 014.09 12H2.536a6.504 6.504 0 002.79 2.472zM3.82 11a13.652 13.652 0 01-.312-2.5h-2.49c.062.89.291 1.733.656 2.5H3.82zm6.853 3.472A6.504 6.504 0 0013.464 12H11.91a9.27 9.27 0 01-.64 1.539 6.688 6.688 0 01-.597.933zM8.5 14.923c.67-.204 1.335-.82 1.887-1.855.173-.324.33-.682.468-1.068H8.5v2.923zm3.68-3.923c.174-.782.282-1.623.312-2.5H15c-.094.89-.323 1.733-.656 2.5h-2.163zM12.18 8.5c-.03-.877-.138-1.718-.312-2.5h2.158c.365.767.594 1.61.656 2.5H12.18zm-1.508-4.5h2.792a6.504 6.504 0 00-2.79-2.472c.218.284.418.598.597.933.226.423.424.896.59 1.539z" />
+                </svg>
+                <span>Internet</span>
+              </button>
+            )}
+          </div>
+
+          {showFolderPicker && (
+            <FolderPicker
+              initialPath={form.cwd || ""}
+              onSelect={(path) => {
+                updateField("cwd", path);
+                setShowFolderPicker(false);
+              }}
+              onClose={() => setShowFolderPicker(false)}
+            />
+          )}
+
+          {/* ── Triggers ── */}
+          <section>
+            <h2 className="text-xs text-cc-muted mb-2">Triggers</h2>
+            <div className="flex items-center gap-2 flex-wrap">
+              {/* Webhook toggle pill */}
+              <button
+                onClick={() => updateField("webhookEnabled", !form.webhookEnabled)}
+                className={form.webhookEnabled ? pillActive : pillDefault}
+              >
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 opacity-60">
+                  <path d="M8.543 2.232a.75.75 0 00-1.085 0l-5.25 5.5A.75.75 0 002.75 9H4v4a1 1 0 001 1h6a1 1 0 001-1V9h1.25a.75.75 0 00.543-1.268l-5.25-5.5z" />
+                </svg>
+                Webhook
+              </button>
+
+              {/* Schedule toggle pill */}
+              <button
+                onClick={() => updateField("scheduleEnabled", !form.scheduleEnabled)}
+                className={form.scheduleEnabled ? pillActive : pillDefault}
+              >
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 opacity-60">
+                  <path d="M8 3.5a.5.5 0 00-1 0V8a.5.5 0 00.252.434l3.5 2a.5.5 0 00.496-.868L8 7.71V3.5z" />
+                  <path d="M8 16A8 8 0 108 0a8 8 0 000 16zm7-8A7 7 0 111 8a7 7 0 0114 0z" />
+                </svg>
+                Schedule
+              </button>
+            </div>
+
+            {/* Webhook helper */}
+            {form.webhookEnabled && (
+              <p className="text-[10px] text-cc-muted mt-2">
+                A unique URL will be generated after saving. POST to it with <code className="px-1 py-0.5 rounded bg-cc-hover">{`{"input": "..."}`}</code>.
+              </p>
+            )}
+
+            {/* Schedule config */}
+            {form.scheduleEnabled && (
+              <div className="mt-3 space-y-2">
+                <div className="flex items-center gap-2">
+                  <label className="flex items-center gap-1.5 text-xs text-cc-muted cursor-pointer">
+                    <input
+                      type="radio"
+                      checked={form.scheduleRecurring}
+                      onChange={() => updateField("scheduleRecurring", true)}
+                    />
+                    Recurring
+                  </label>
+                  <label className="flex items-center gap-1.5 text-xs text-cc-muted cursor-pointer">
+                    <input
+                      type="radio"
+                      checked={!form.scheduleRecurring}
+                      onChange={() => updateField("scheduleRecurring", false)}
+                    />
+                    One-time
+                  </label>
+                </div>
+                {form.scheduleRecurring ? (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap gap-1">
+                      {CRON_PRESETS.map((p) => (
+                        <button
+                          key={p.value}
+                          onClick={() => updateField("scheduleExpression", p.value)}
+                          className={`px-2 py-1 text-[10px] rounded-lg border transition-colors cursor-pointer ${form.scheduleExpression === p.value ? "border-cc-primary text-cc-primary" : "border-cc-border text-cc-muted hover:text-cc-fg"}`}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                    <input
+                      value={form.scheduleExpression}
+                      onChange={(e) => updateField("scheduleExpression", e.target.value)}
+                      placeholder="Cron expression (e.g. 0 8 * * *)"
+                      className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
+                    />
                   </div>
+                ) : (
+                  <input
+                    type="datetime-local"
+                    value={form.scheduleExpression}
+                    onChange={(e) => updateField("scheduleExpression", e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm focus:outline-none focus:ring-1 focus:ring-cc-primary"
+                  />
                 )}
               </div>
-            </section>
-          )}
+            )}
+          </section>
 
           {/* ── Advanced (collapsible) ── */}
           <section>
             <button
               onClick={() => setShowAdvanced(!showAdvanced)}
-              className="flex items-center gap-2 text-xs font-medium text-cc-muted uppercase tracking-wider cursor-pointer hover:text-cc-fg transition-colors w-full"
+              className="flex items-center gap-2 text-xs text-cc-muted cursor-pointer hover:text-cc-fg transition-colors w-full"
             >
               <svg
                 viewBox="0 0 16 16"
@@ -1113,7 +1186,6 @@ function AgentEditor({
                     </button>
                   </div>
 
-                  {/* Existing servers list */}
                   {Object.keys(form.mcpServers).length === 0 && !showMcpForm && (
                     <p className="text-[10px] text-cc-muted">No MCP servers configured.</p>
                   )}
@@ -1135,7 +1207,6 @@ function AgentEditor({
                     </div>
                   ))}
 
-                  {/* Add server form */}
                   {showMcpForm && (
                     <div className="rounded-lg border border-cc-border p-3 mt-2 space-y-2">
                       <div>
@@ -1234,53 +1305,6 @@ function AgentEditor({
                   )}
                 </div>
 
-                {/* ── Docker Container ── */}
-                <div>
-                  <h3 className="text-xs font-medium text-cc-muted mb-2">Docker Container</h3>
-                  <div className="space-y-2">
-                    <div>
-                      <label className="block text-[10px] text-cc-muted mb-0.5">Image</label>
-                      <input
-                        value={form.containerImage}
-                        onChange={(e) => updateField("containerImage", e.target.value)}
-                        placeholder="e.g., the-companion:latest"
-                        className="w-full px-2 py-1.5 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-xs font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                      />
-                    </div>
-                    {form.containerImage && (
-                      <>
-                        <div>
-                          <label className="block text-[10px] text-cc-muted mb-0.5">Ports (comma-separated)</label>
-                          <input
-                            value={form.containerPorts}
-                            onChange={(e) => updateField("containerPorts", e.target.value)}
-                            placeholder="3000, 8080"
-                            className="w-full px-2 py-1.5 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-xs font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[10px] text-cc-muted mb-0.5">Volumes (one per line)</label>
-                          <textarea
-                            value={form.containerVolumes}
-                            onChange={(e) => updateField("containerVolumes", e.target.value)}
-                            placeholder="/host/path:/container/path"
-                            className="w-full px-2 py-1.5 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-xs font-mono-code resize-none h-16 focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[10px] text-cc-muted mb-0.5">Init Script</label>
-                          <textarea
-                            value={form.containerInitScript}
-                            onChange={(e) => updateField("containerInitScript", e.target.value)}
-                            placeholder="#!/bin/bash\napt-get update && ..."
-                            className="w-full px-2 py-1.5 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-xs font-mono-code resize-none h-20 focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                          />
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </div>
-
                 {/* ── Allowed Tools ── */}
                 <div>
                   <h3 className="text-xs font-medium text-cc-muted mb-2">Allowed Tools</h3>
@@ -1312,100 +1336,52 @@ function AgentEditor({
                     <p className="text-[10px] text-cc-muted">Leave empty to allow all tools.</p>
                   </div>
                 </div>
+
+                {/* ── Environment Variables ── */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="text-xs font-medium text-cc-muted">Environment Variables</h3>
+                    <button
+                      onClick={addEnvVar}
+                      className="text-[10px] text-cc-muted hover:text-cc-fg transition-colors cursor-pointer"
+                    >
+                      + Add Variable
+                    </button>
+                  </div>
+                  {form.env.length === 0 ? (
+                    <p className="text-[10px] text-cc-muted">No extra variables set.</p>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {form.env.map((entry, i) => (
+                        <div key={i} className="flex gap-2 items-center">
+                          <input
+                            value={entry.key}
+                            onChange={(e) => updateEnvVar(i, "key", e.target.value)}
+                            placeholder="KEY"
+                            className="w-1/3 px-2 py-1.5 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-xs font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
+                          />
+                          <input
+                            value={entry.value}
+                            onChange={(e) => updateEnvVar(i, "value", e.target.value)}
+                            placeholder="value"
+                            className="flex-1 px-2 py-1.5 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-xs font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
+                          />
+                          <button
+                            onClick={() => removeEnvVar(i)}
+                            className="text-cc-muted hover:text-cc-error transition-colors cursor-pointer p-1"
+                            title="Remove variable"
+                          >
+                            <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
+                              <path d="M4.646 4.646a.5.5 0 01.708 0L8 7.293l2.646-2.647a.5.5 0 01.708.708L8.707 8l2.647 2.646a.5.5 0 01-.708.708L8 8.707l-2.646 2.647a.5.5 0 01-.708-.708L7.293 8 4.646 5.354a.5.5 0 010-.708z" />
+                            </svg>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
-          </section>
-
-          {/* ── Triggers ── */}
-          <section>
-            <h2 className="text-xs font-medium text-cc-muted uppercase tracking-wider mb-3">Triggers</h2>
-            <div className="space-y-4">
-              {/* Manual — always available */}
-              <div className="flex items-center gap-2 text-sm text-cc-muted">
-                <span className="text-cc-success">●</span> Manual trigger is always available via the Run button.
-              </div>
-
-              {/* Webhook */}
-              <div className="rounded-lg border border-cc-border p-3">
-                <label className="flex items-center gap-2 text-sm text-cc-fg cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={form.webhookEnabled}
-                    onChange={(e) => updateField("webhookEnabled", e.target.checked)}
-                    className="rounded"
-                  />
-                  Webhook
-                </label>
-                {form.webhookEnabled && (
-                  <p className="text-[10px] text-cc-muted mt-2">
-                    A unique URL with a secret token will be generated after saving. You can POST to it with <code className="px-1 py-0.5 rounded bg-cc-hover">{`{"input": "..."}`}</code> to trigger the agent.
-                  </p>
-                )}
-              </div>
-
-              {/* Schedule */}
-              <div className="rounded-lg border border-cc-border p-3">
-                <label className="flex items-center gap-2 text-sm text-cc-fg cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={form.scheduleEnabled}
-                    onChange={(e) => updateField("scheduleEnabled", e.target.checked)}
-                    className="rounded"
-                  />
-                  Schedule
-                </label>
-                {form.scheduleEnabled && (
-                  <div className="mt-3 space-y-2">
-                    <div className="flex items-center gap-2">
-                      <label className="flex items-center gap-1.5 text-xs text-cc-muted cursor-pointer">
-                        <input
-                          type="radio"
-                          checked={form.scheduleRecurring}
-                          onChange={() => updateField("scheduleRecurring", true)}
-                        />
-                        Recurring
-                      </label>
-                      <label className="flex items-center gap-1.5 text-xs text-cc-muted cursor-pointer">
-                        <input
-                          type="radio"
-                          checked={!form.scheduleRecurring}
-                          onChange={() => updateField("scheduleRecurring", false)}
-                        />
-                        One-time
-                      </label>
-                    </div>
-                    {form.scheduleRecurring ? (
-                      <div className="space-y-2">
-                        <div className="flex flex-wrap gap-1">
-                          {CRON_PRESETS.map((p) => (
-                            <button
-                              key={p.value}
-                              onClick={() => updateField("scheduleExpression", p.value)}
-                              className={`px-2 py-1 text-[10px] rounded-lg border transition-colors cursor-pointer ${form.scheduleExpression === p.value ? "border-cc-primary text-cc-primary" : "border-cc-border text-cc-muted hover:text-cc-fg"}`}
-                            >
-                              {p.label}
-                            </button>
-                          ))}
-                        </div>
-                        <input
-                          value={form.scheduleExpression}
-                          onChange={(e) => updateField("scheduleExpression", e.target.value)}
-                          placeholder="Cron expression (e.g. 0 8 * * *)"
-                          className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm font-mono-code focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                        />
-                      </div>
-                    ) : (
-                      <input
-                        type="datetime-local"
-                        value={form.scheduleExpression}
-                        onChange={(e) => updateField("scheduleExpression", e.target.value)}
-                        className="w-full px-3 py-2 rounded-lg bg-cc-input-bg border border-cc-border text-cc-fg text-sm focus:outline-none focus:ring-1 focus:ring-cc-primary"
-                      />
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
           </section>
         </div>
       </div>

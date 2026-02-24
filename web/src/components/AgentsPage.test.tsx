@@ -157,12 +157,11 @@ describe("AgentsPage", () => {
     await screen.findByText("Docs Writer");
     expect(screen.getByText("Writes documentation")).toBeInTheDocument();
     expect(screen.getByText("Enabled")).toBeInTheDocument();
-    expect(screen.getByText("Claude")).toBeInTheDocument();
 
     // Trigger badges: Manual is always present, Webhook when enabled,
     // and schedule is humanized from the cron expression
     expect(screen.getByText("Manual")).toBeInTheDocument();
-    expect(screen.getByText("Webhook")).toBeInTheDocument();
+    // Webhook appears in trigger badges on the card
     expect(screen.getByText("Daily at 8:00 AM")).toBeInTheDocument();
   });
 
@@ -391,11 +390,43 @@ describe("AgentsPage", () => {
     expect(screen.getByText("Import")).toBeInTheDocument();
   });
 
-  // ── Environment Section ──────────────────────────────────────────────────
+  // ── Controls Row ──────────────────────────────────────────────────────────
 
-  it("editor shows environment section with profile dropdown", async () => {
-    // When the editor is opened, the Environment section should be visible
-    // with a dropdown for selecting an environment profile (fetched on mount).
+  it("editor shows controls row with backend toggle, model, and mode pills", async () => {
+    // The redesigned editor replaces the old Backend/Working Dir/Environment
+    // sections with a compact controls row of pill-style buttons.
+    render(<AgentsPage route={defaultRoute} />);
+    await waitFor(() => {
+      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("+ New Agent"));
+
+    // Controls row should be present
+    const controlsRow = screen.getByTestId("controls-row");
+    expect(controlsRow).toBeInTheDocument();
+
+    // Backend toggle pills (Claude and Codex) should be in the controls row
+    // Claude should be selected by default
+    const claudeBtn = controlsRow.querySelector("button");
+    expect(claudeBtn).toHaveTextContent("Claude");
+  });
+
+  it("editor shows folder pill defaulting to 'temp'", async () => {
+    // The folder pill shows "temp" when no cwd is set, indicating a
+    // temporary directory will be used.
+    render(<AgentsPage route={defaultRoute} />);
+    await waitFor(() => {
+      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("+ New Agent"));
+
+    // Folder pill shows "temp" by default
+    expect(screen.getByText("temp")).toBeInTheDocument();
+  });
+
+  it("editor shows env profile pill with dropdown", async () => {
+    // The environment profile pill opens a dropdown with available env profiles
+    // fetched from the API.
     mockApi.listEnvs.mockResolvedValue([
       { slug: "dev", name: "Development", variables: {} },
       { slug: "prod", name: "Production", variables: {} },
@@ -406,110 +437,94 @@ describe("AgentsPage", () => {
     });
     fireEvent.click(screen.getByText("+ New Agent"));
 
-    // Environment section header
-    expect(screen.getByText("Environment")).toBeInTheDocument();
-    // Env profile dropdown options (including "None" default)
-    expect(screen.getByText("Environment Profile")).toBeInTheDocument();
+    // Env pill shows "None" by default
+    await waitFor(() => {
+      expect(screen.getByText("None")).toBeInTheDocument();
+    });
+
+    // Click the env pill to open dropdown
+    fireEvent.click(screen.getByText("None"));
+
+    // Dropdown should show available profiles
     await waitFor(() => {
       expect(screen.getByText("Development")).toBeInTheDocument();
       expect(screen.getByText("Production")).toBeInTheDocument();
     });
   });
 
-  it("editor allows adding and removing environment variables", async () => {
-    // The inline key-value editor should support adding rows for env vars
-    // and removing them.
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+  it("branch pill appears when folder is set and shows inline input", async () => {
+    // The branch pill only appears when a working directory is set (not temp).
+    // Clicking it reveals an inline branch name input with create/worktree options.
+    const agent = makeAgent({
+      id: "a1",
+      name: "Branch Agent",
+      cwd: "/workspace",
+      branch: "",
     });
-    fireEvent.click(screen.getByText("+ New Agent"));
+    mockApi.listAgents.mockResolvedValue([agent]);
+    render(<AgentsPage route={defaultRoute} />);
 
-    // Initially shows "No extra variables set."
-    expect(screen.getByText("No extra variables set.")).toBeInTheDocument();
+    await screen.findByText("Branch Agent");
+    fireEvent.click(screen.getByTitle("Edit"));
 
-    // Click "+ Add Variable"
-    fireEvent.click(screen.getByText("+ Add Variable"));
+    // Branch pill should be visible since cwd is set
+    expect(screen.getByText("branch")).toBeInTheDocument();
 
-    // Should now have KEY and value input fields
-    expect(screen.getByPlaceholderText("KEY")).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("value")).toBeInTheDocument();
+    // Click branch pill to show inline input
+    fireEvent.click(screen.getByText("branch"));
 
-    // Remove the variable
-    fireEvent.click(screen.getByTitle("Remove variable"));
-    expect(screen.getByText("No extra variables set.")).toBeInTheDocument();
+    // Branch input should appear
+    expect(screen.getByPlaceholderText("branch name")).toBeInTheDocument();
   });
 
-  // ── Git Section ──────────────────────────────────────────────────────────
-
-  it("Git section appears only when cwd is set and useTempDir is false", async () => {
-    // The Git section should only render when the agent has a working directory
-    // and is not using a temp dir. This test verifies conditional rendering.
+  it("branch pill shows create and worktree checkboxes when branch is typed", async () => {
+    // After typing a branch name in the inline input, the create and worktree
+    // checkboxes should appear.
+    const agent = makeAgent({
+      id: "a1",
+      name: "Git Agent",
+      cwd: "/workspace",
+      branch: "feature/test",
+      createBranch: true,
+    });
+    mockApi.listAgents.mockResolvedValue([agent]);
     render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-    fireEvent.click(screen.getByText("+ New Agent"));
 
-    // Initially no Git section (cwd is empty, useTempDir is false)
-    expect(screen.queryByText("Git")).not.toBeInTheDocument();
+    await screen.findByText("Git Agent");
+    fireEvent.click(screen.getByTitle("Edit"));
 
-    // Set a cwd value
-    const cwdInput = screen.getByPlaceholderText("/path/to/project");
-    fireEvent.change(cwdInput, { target: { value: "/workspace/my-project" } });
+    // Branch input should be visible with the branch name pre-filled
+    expect(screen.getByDisplayValue("feature/test")).toBeInTheDocument();
 
-    // Git section should now appear
-    expect(screen.getByText("Git")).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("e.g., feature/my-branch")).toBeInTheDocument();
-  });
-
-  it("Git section shows createBranch and useWorktree checkboxes when branch is set", async () => {
-    // The branch-related checkboxes are only visible after a branch name is typed.
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-    fireEvent.click(screen.getByText("+ New Agent"));
-
-    // Set cwd to make Git section appear
-    fireEvent.change(screen.getByPlaceholderText("/path/to/project"), {
-      target: { value: "/workspace" },
-    });
-
-    // No checkboxes yet (branch is empty)
-    expect(screen.queryByText("Create branch if missing")).not.toBeInTheDocument();
-
-    // Type a branch name
-    fireEvent.change(screen.getByPlaceholderText("e.g., feature/my-branch"), {
-      target: { value: "feature/test" },
-    });
-
-    // Checkboxes should now appear
-    expect(screen.getByText("Create branch if missing")).toBeInTheDocument();
-    expect(screen.getByText("Use worktree")).toBeInTheDocument();
+    // Create and worktree checkboxes should be visible
+    expect(screen.getByText("create")).toBeInTheDocument();
+    expect(screen.getByText("worktree")).toBeInTheDocument();
   });
 
   // ── Codex Internet Access ────────────────────────────────────────────────
 
-  it("Codex internet access toggle is only visible for codex backend", async () => {
-    // The "Allow internet access" checkbox should only appear when the
-    // backend type is set to "codex".
+  it("Codex internet access pill is only visible for codex backend", async () => {
+    // The "Internet" pill should only appear when the backend type is set
+    // to "codex". In the redesigned editor, it's a toggle pill in the
+    // controls row instead of a checkbox.
     render(<AgentsPage route={defaultRoute} />);
     await waitFor(() => {
       expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
     });
     fireEvent.click(screen.getByText("+ New Agent"));
 
-    // Default is Claude, so internet access should not be visible
-    expect(screen.queryByText("Allow internet access")).not.toBeInTheDocument();
+    // Default is Claude, so Internet pill should not be visible
+    expect(screen.queryByText("Internet")).not.toBeInTheDocument();
 
-    // Switch to Codex backend — there are two "Codex" buttons (one in provider
-    // selector in the editor's Backend section)
-    const codexButtons = screen.getAllByText("Codex");
-    fireEvent.click(codexButtons[0]);
+    // Switch to Codex backend
+    const controlsRow = screen.getByTestId("controls-row");
+    const codexBtn = Array.from(controlsRow.querySelectorAll("button")).find(
+      (b) => b.textContent === "Codex",
+    );
+    fireEvent.click(codexBtn!);
 
-    // Now the toggle should appear
-    expect(screen.getByText("Allow internet access")).toBeInTheDocument();
+    // Now the Internet pill should appear
+    expect(screen.getByText("Internet")).toBeInTheDocument();
   });
 
   // ── Advanced Section ────────────────────────────────────────────────────
@@ -517,7 +532,7 @@ describe("AgentsPage", () => {
   it("Advanced section collapse/expand toggle works", async () => {
     // The Advanced section is collapsed by default for new agents.
     // Clicking the toggle should expand and show MCP Servers, Skills,
-    // Docker Container, and Allowed Tools sub-sections.
+    // Allowed Tools, and Environment Variables sub-sections.
     render(<AgentsPage route={defaultRoute} />);
     await waitFor(() => {
       expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
@@ -536,8 +551,8 @@ describe("AgentsPage", () => {
     // Sub-sections should now be visible
     expect(screen.getByText("MCP Servers")).toBeInTheDocument();
     expect(screen.getByText("Skills")).toBeInTheDocument();
-    expect(screen.getByText("Docker Container")).toBeInTheDocument();
     expect(screen.getByText("Allowed Tools")).toBeInTheDocument();
+    expect(screen.getByText("Environment Variables")).toBeInTheDocument();
   });
 
   it("Advanced section auto-expands when editing agent with advanced config", async () => {
@@ -560,6 +575,38 @@ describe("AgentsPage", () => {
     expect(screen.getByText("MCP Servers")).toBeInTheDocument();
     // The MCP server entry should be visible
     expect(screen.getByText("test-server")).toBeInTheDocument();
+  });
+
+  // ── Environment Variables (in Advanced) ────────────────────────────────
+
+  it("editor shows environment variables section inside Advanced", async () => {
+    // Environment variables have been moved into the Advanced section.
+    // The add/remove flow should still work.
+    render(<AgentsPage route={defaultRoute} />);
+    await waitFor(() => {
+      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("+ New Agent"));
+
+    // Expand Advanced
+    fireEvent.click(screen.getByText("Advanced"));
+
+    // Environment Variables sub-section should be visible
+    expect(screen.getByText("Environment Variables")).toBeInTheDocument();
+
+    // Initially shows "No extra variables set."
+    expect(screen.getByText("No extra variables set.")).toBeInTheDocument();
+
+    // Click "+ Add Variable"
+    fireEvent.click(screen.getByText("+ Add Variable"));
+
+    // Should now have KEY and value input fields
+    expect(screen.getByPlaceholderText("KEY")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("value")).toBeInTheDocument();
+
+    // Remove the variable
+    fireEvent.click(screen.getByTitle("Remove variable"));
+    expect(screen.getByText("No extra variables set.")).toBeInTheDocument();
   });
 
   // ── Skills ─────────────────────────────────────────────────────────────
@@ -672,32 +719,35 @@ describe("AgentsPage", () => {
     expect(screen.getByText("Leave empty to allow all tools.")).toBeInTheDocument();
   });
 
-  // ── Docker Container ───────────────────────────────────────────────────
+  // ── Triggers ──────────────────────────────────────────────────────────
 
-  it("Docker container fields render in advanced section", async () => {
-    // The Docker Container sub-section should show an Image input, and when
-    // an image is entered, Ports, Volumes, and Init Script fields appear.
+  it("Webhook and Schedule trigger pills toggle on click", async () => {
+    // The redesigned trigger section uses toggle pills instead of checkboxes
+    // in bordered cards. Clicking a pill toggles its state.
     render(<AgentsPage route={defaultRoute} />);
     await waitFor(() => {
       expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
     });
     fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Advanced"));
 
-    // Image input should be visible
-    expect(screen.getByPlaceholderText("e.g., the-companion:latest")).toBeInTheDocument();
+    // Both trigger pills should be visible
+    expect(screen.getByText("Webhook")).toBeInTheDocument();
+    expect(screen.getByText("Schedule")).toBeInTheDocument();
 
-    // Ports/Volumes/Init Script should NOT be visible yet
-    expect(screen.queryByPlaceholderText("3000, 8080")).not.toBeInTheDocument();
+    // Click Webhook to enable it
+    fireEvent.click(screen.getByText("Webhook"));
 
-    // Enter an image name
-    fireEvent.change(screen.getByPlaceholderText("e.g., the-companion:latest"), {
-      target: { value: "my-image:latest" },
+    // Helper text should appear
+    await waitFor(() => {
+      expect(screen.getByText(/unique URL will be generated/)).toBeInTheDocument();
     });
 
-    // Now Ports, Volumes, Init Script should be visible
-    expect(screen.getByPlaceholderText("3000, 8080")).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("/host/path:/container/path")).toBeInTheDocument();
+    // Click Schedule to enable it
+    fireEvent.click(screen.getByText("Schedule"));
+
+    // Schedule config should appear with Recurring/One-time options
+    expect(screen.getByText("Recurring")).toBeInTheDocument();
+    expect(screen.getByText("One-time")).toBeInTheDocument();
   });
 
   // ── Edit Mode Deserialization ──────────────────────────────────────────
@@ -705,6 +755,8 @@ describe("AgentsPage", () => {
   it("edit mode deserializes all agent fields into form", async () => {
     // When editing an agent with all fields configured, the form should
     // correctly deserialize all values from AgentInfo to AgentFormData.
+    // Docker container fields are no longer part of the agent editor (they
+    // belong in Environment profiles via EnvManager).
     const agent = makeAgent({
       id: "a1",
       name: "Full Agent",
@@ -717,7 +769,6 @@ describe("AgentsPage", () => {
       allowedTools: ["Read", "Write"],
       skills: ["code-review"],
       mcpServers: { "my-server": { type: "sse", url: "https://example.com" } },
-      container: { image: "test:latest", ports: [3000], volumes: ["/data:/data"], initScript: "echo hi" },
     });
     mockApi.listAgents.mockResolvedValue([agent]);
     render(<AgentsPage route={defaultRoute} />);
@@ -728,21 +779,40 @@ describe("AgentsPage", () => {
     // Verify basic fields
     expect(screen.getByDisplayValue("Full Agent")).toBeInTheDocument();
 
-    // Codex internet access should be checked
-    expect(screen.getByText("Allow internet access")).toBeInTheDocument();
-
-    // Env vars should be populated (2 rows)
-    expect(screen.getByDisplayValue("API_KEY")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("secret123")).toBeInTheDocument();
+    // Codex internet pill should be active (visible in controls row)
+    expect(screen.getByText("Internet")).toBeInTheDocument();
 
     // Branch should be populated
     expect(screen.getByDisplayValue("feature/test")).toBeInTheDocument();
 
-    // Advanced should be auto-expanded (has MCP + allowed tools + container)
+    // Advanced should be auto-expanded (has MCP + allowed tools + env vars)
     expect(screen.getByText("my-server")).toBeInTheDocument();
     expect(screen.getByText("Read")).toBeInTheDocument();
     expect(screen.getByText("Write")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("test:latest")).toBeInTheDocument();
+
+    // Env vars should be populated in Advanced section
+    expect(screen.getByDisplayValue("API_KEY")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("secret123")).toBeInTheDocument();
+  });
+
+  // ── No old section headers ─────────────────────────────────────────────
+
+  it("editor does not render old section headers (Basics, Backend, Working Directory, Environment)", async () => {
+    // The redesigned editor removes the separate section headers for
+    // Basics, Backend, Working Directory, and Environment. These are now
+    // either inline (identity) or in the controls row.
+    render(<AgentsPage route={defaultRoute} />);
+    await waitFor(() => {
+      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByText("+ New Agent"));
+
+    // None of these old section headers should exist
+    expect(screen.queryByText("Basics")).not.toBeInTheDocument();
+    expect(screen.queryByText("Backend")).not.toBeInTheDocument();
+    expect(screen.queryByText("Working Directory")).not.toBeInTheDocument();
+    // "Environment" as a section header is gone; env vars are now in Advanced
+    // as "Environment Variables"
   });
 
   // ── Accessibility ──────────────────────────────────────────────────────────

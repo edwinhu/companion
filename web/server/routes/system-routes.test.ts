@@ -126,7 +126,7 @@ describe("GET /api/sessions/:id/usage-limits", () => {
     wsBridge.getCodexRateLimits.mockReturnValue({
       primary: { usedPercent: 0.42, windowDurationMins: 300, resetsAt: 1700000000 },
       secondary: null,
-    });
+    } as any);
 
     const res = await app.request("/api/sessions/codex-sess-1/usage-limits");
 

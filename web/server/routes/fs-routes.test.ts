@@ -1049,7 +1049,7 @@ describe("GET /fs/claude-config", () => {
     registerFsRoutes(configApp, { allowedBases: [configDir] });
   });
 
-  afterAll(() => {
+  afterEach(() => {
     try {
       rmSync(configDir, { recursive: true, force: true });
     } catch {

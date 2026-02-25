@@ -227,7 +227,7 @@ describe("attachCodexAdapterHandlers", () => {
 
     expect(session.messageHistory).toHaveLength(1);
     expect(session.messageHistory[0].type).toBe("assistant");
-    expect(session.messageHistory[0].timestamp).toBe(1700000000000);
+    expect((session.messageHistory[0] as any).timestamp).toBe(1700000000000);
     expect(deps.persistSession).toHaveBeenCalled();
   });
 
@@ -268,7 +268,7 @@ describe("attachCodexAdapterHandlers", () => {
         type: "result",
         subtype: "success",
         is_error: false,
-        result: null,
+        result: undefined,
         duration_ms: 100,
         duration_api_ms: 80,
         num_turns: 1,
@@ -355,7 +355,7 @@ describe("attachCodexAdapterHandlers", () => {
           type: "result",
           subtype: "success",
           is_error: false,
-          result: null,
+          result: undefined,
           duration_ms: 0,
           duration_api_ms: 0,
           num_turns: 1,

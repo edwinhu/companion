@@ -1031,6 +1031,8 @@ describe("Linear issues", () => {
     stateName: "In Progress",
     stateType: "started",
     teamName: "Engineering",
+    teamKey: "ENG",
+    teamId: "team-1",
   };
 
   it("setLinkedLinearIssue: stores issue for a session", () => {
@@ -1442,7 +1444,7 @@ describe("removeSession: comprehensive cleanup", () => {
     useStore.getState().setLinkedLinearIssue("s1", {
       id: "i1", identifier: "ENG-1", title: "t", description: "d",
       url: "u", branchName: "b", priorityLabel: "p", stateName: "s",
-      stateType: "st", teamName: "tm",
+      stateType: "st", teamName: "tm", teamKey: "ENG", teamId: "t1",
     });
     useStore.getState().markChatTabReentry("s1");
     useStore.getState().setDiffPanelSelectedFile("s1", "file.ts");

@@ -59,6 +59,13 @@ let app: Hono;
 // Save original global fetch so we can restore it
 const originalFetch = globalThis.fetch;
 
+/** Helper to mock globalThis.fetch without TS errors about missing `preconnect` */
+function mockFetch() {
+  const fn = vi.fn();
+  globalThis.fetch = fn as any;
+  return fn;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
 
@@ -148,7 +155,7 @@ describe("GET /api/linear/issues", () => {
 
   it("searches Linear and returns mapped issues, filtering out completed/canceled (covers lines 87-108)", async () => {
     // Mock global fetch to simulate Linear API response with mixed states
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         searchIssues: {
           nodes: [
@@ -181,19 +188,19 @@ describe("GET /api/linear/issues", () => {
   });
 
   it("clamps limit between 1 and 20", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({ searchIssues: { nodes: [] } }),
     );
 
     // Test limit > 20 gets clamped
     await app.request("/api/linear/issues?query=test&limit=100");
-    const fetchCall = vi.mocked(globalThis.fetch).mock.calls[0];
+    const fetchCall = vi.mocked(globalThis.fetch as any).mock.calls[0];
     const body = JSON.parse(fetchCall[1]?.body as string);
     expect(body.variables.first).toBe(20);
   });
 
   it("returns 502 when Linear API returns errors (covers lines 106-108)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearError("Authentication failed"),
     );
 
@@ -204,7 +211,7 @@ describe("GET /api/linear/issues", () => {
   });
 
   it("returns 502 when Linear API returns non-ok HTTP status", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearHttpError("Unauthorized", 401),
     );
 
@@ -215,7 +222,7 @@ describe("GET /api/linear/issues", () => {
   });
 
   it("returns 502 when fetch itself throws (network error)", async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
+    mockFetch().mockRejectedValue(new Error("ECONNREFUSED"));
 
     const res = await app.request("/api/linear/issues?query=test");
     expect(res.status).toBe(502);
@@ -224,7 +231,7 @@ describe("GET /api/linear/issues", () => {
   });
 
   it("handles issues with null optional fields gracefully (covers lines 87-100)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         searchIssues: {
           nodes: [
@@ -273,7 +280,7 @@ describe("GET /api/linear/connection", () => {
   });
 
   it("returns connection info with viewer and team (covers lines 118-120, 124-128)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         viewer: { id: "user-1", name: "Test User", email: "test@example.com" },
         teams: { nodes: [{ id: "team-1", key: "COMP", name: "Companion" }] },
@@ -291,7 +298,7 @@ describe("GET /api/linear/connection", () => {
   });
 
   it("returns 502 when Linear API returns errors", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearError("Invalid API key"),
     );
 
@@ -302,7 +309,7 @@ describe("GET /api/linear/connection", () => {
   });
 
   it("returns 502 when fetch throws a network error", async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error("Network down"));
+    mockFetch().mockRejectedValue(new Error("Network down"));
 
     const res = await app.request("/api/linear/connection");
     expect(res.status).toBe(502);
@@ -481,7 +488,7 @@ describe("GET /api/sessions/:id/linear-issue", () => {
     };
     vi.mocked(sessionLinearIssues.getLinearIssue).mockReturnValue(stored);
 
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         issue: {
           id: "issue-1",
@@ -583,7 +590,7 @@ describe("GET /api/sessions/:id/linear-issue", () => {
     };
     vi.mocked(sessionLinearIssues.getLinearIssue).mockReturnValue(stored);
 
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({ issue: null }),
     );
 
@@ -648,7 +655,7 @@ describe("POST /api/linear/issues/:issueId/comments", () => {
   });
 
   it("creates a comment and returns it (covers lines 330-388)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         commentCreate: {
           success: true,
@@ -680,7 +687,7 @@ describe("POST /api/linear/issues/:issueId/comments", () => {
   });
 
   it("returns 502 when Linear returns GraphQL errors (covers lines 366-369)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearError("Issue not found"),
     );
 
@@ -696,7 +703,7 @@ describe("POST /api/linear/issues/:issueId/comments", () => {
   });
 
   it("returns 502 when Linear returns non-ok HTTP (covers lines 366-369)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearHttpError("Server Error", 500),
     );
 
@@ -710,7 +717,7 @@ describe("POST /api/linear/issues/:issueId/comments", () => {
   });
 
   it("returns 502 when commentCreate reports failure (covers lines 371-373)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         commentCreate: { success: false, comment: null },
       }),
@@ -728,7 +735,7 @@ describe("POST /api/linear/issues/:issueId/comments", () => {
   });
 
   it("handles fetch network error by throwing (covers line 347-348)", async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
+    mockFetch().mockRejectedValue(new Error("ECONNREFUSED"));
 
     const res = await app.request("/api/linear/issues/issue-1/comments", {
       method: "POST",
@@ -756,7 +763,7 @@ describe("GET /api/linear/states", () => {
   });
 
   it("returns mapped team states (covers lines 455-467)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         teams: {
           nodes: [
@@ -786,7 +793,7 @@ describe("GET /api/linear/states", () => {
   });
 
   it("handles null/empty fields in team states (covers lines 456-463)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         teams: {
           nodes: [
@@ -813,7 +820,7 @@ describe("GET /api/linear/states", () => {
   });
 
   it("returns 502 on Linear API error (covers lines 468-470)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearError("Rate limited"),
     );
 
@@ -824,7 +831,7 @@ describe("GET /api/linear/states", () => {
   });
 
   it("returns 502 on network error", async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error("timeout"));
+    mockFetch().mockRejectedValue(new Error("timeout"));
 
     const res = await app.request("/api/linear/states");
     expect(res.status).toBe(502);
@@ -854,7 +861,7 @@ describe("GET /api/linear/project-issues", () => {
   });
 
   it("returns mapped project issues, filtering done and sorting by state (covers lines 580-628)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         issues: {
           nodes: [
@@ -917,7 +924,7 @@ describe("GET /api/linear/project-issues", () => {
   });
 
   it("returns 502 when Linear API returns errors (covers lines 603-605)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearError("Auth error"),
     );
 
@@ -928,7 +935,7 @@ describe("GET /api/linear/project-issues", () => {
   });
 
   it("returns 502 on network error (covers lines 627-628)", async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error("connection reset"));
+    mockFetch().mockRejectedValue(new Error("connection reset"));
 
     const res = await app.request("/api/linear/project-issues?projectId=proj-1");
     expect(res.status).toBe(502);
@@ -937,12 +944,12 @@ describe("GET /api/linear/project-issues", () => {
   });
 
   it("clamps limit to max 50 and min 1", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({ issues: { nodes: [] } }),
     );
 
     await app.request("/api/linear/project-issues?projectId=proj-1&limit=999");
-    const fetchCall = vi.mocked(globalThis.fetch).mock.calls[0];
+    const fetchCall = vi.mocked(globalThis.fetch as any).mock.calls[0];
     const body = JSON.parse(fetchCall[1]?.body as string);
     expect(body.variables.first).toBe(50);
   });
@@ -1126,7 +1133,7 @@ describe("POST /api/linear/issues/:id/transition", () => {
     mockSettings.linearAutoTransition = true;
     mockSettings.linearAutoTransitionStateId = "state-in-progress";
 
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         issueUpdate: {
           success: true,
@@ -1159,7 +1166,7 @@ describe("POST /api/linear/issues/:id/transition", () => {
     mockSettings.linearAutoTransition = true;
     mockSettings.linearAutoTransitionStateId = "state-1";
 
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearError("State not found"),
     );
 
@@ -1176,7 +1183,7 @@ describe("POST /api/linear/issues/:id/transition", () => {
     mockSettings.linearAutoTransition = true;
     mockSettings.linearAutoTransitionStateId = "state-1";
 
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearHttpError("Bad Gateway", 502),
     );
 
@@ -1191,7 +1198,7 @@ describe("POST /api/linear/issues/:id/transition", () => {
     mockSettings.linearAutoTransition = true;
     mockSettings.linearAutoTransitionStateId = "state-1";
 
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
+    mockFetch().mockRejectedValue(new Error("ECONNREFUSED"));
 
     const res = await app.request("/api/linear/issues/issue-1/transition", {
       method: "POST",
@@ -1207,7 +1214,7 @@ describe("POST /api/linear/issues/:id/transition", () => {
     mockSettings.linearAutoTransition = true;
     mockSettings.linearAutoTransitionStateId = "state-1";
 
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         issueUpdate: {
           success: true,
@@ -1244,7 +1251,7 @@ describe("GET /api/linear/projects", () => {
   });
 
   it("returns mapped projects", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         projects: {
           nodes: [
@@ -1263,7 +1270,7 @@ describe("GET /api/linear/projects", () => {
   });
 
   it("returns 502 on Linear API error", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearError("Rate limit exceeded"),
     );
 
@@ -1274,7 +1281,7 @@ describe("GET /api/linear/projects", () => {
   });
 
   it("returns 502 on network error", async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error("DNS lookup failed"));
+    mockFetch().mockRejectedValue(new Error("DNS lookup failed"));
 
     const res = await app.request("/api/linear/projects");
     expect(res.status).toBe(502);
@@ -1283,7 +1290,7 @@ describe("GET /api/linear/projects", () => {
   });
 
   it("handles null fields in project data", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         projects: {
           nodes: [{ id: undefined, name: null, state: null }],
@@ -1307,7 +1314,7 @@ describe("linearIssueStateCategory (via issue filtering)", () => {
   // We test it through the search endpoint which uses it for filtering/sorting.
 
   it("categorizes 'canceled' stateType as done (filtered out)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         searchIssues: {
           nodes: [
@@ -1323,7 +1330,7 @@ describe("linearIssueStateCategory (via issue filtering)", () => {
   });
 
   it("categorizes 'cancelled' stateType as done (filtered out)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         searchIssues: {
           nodes: [
@@ -1339,7 +1346,7 @@ describe("linearIssueStateCategory (via issue filtering)", () => {
   });
 
   it("categorizes 'done' stateName as done (filtered out)", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         searchIssues: {
           nodes: [
@@ -1355,7 +1362,7 @@ describe("linearIssueStateCategory (via issue filtering)", () => {
   });
 
   it("keeps 'started' issues and sorts them after unstarted", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
+    mockFetch().mockResolvedValue(
       linearOk({
         searchIssues: {
           nodes: [

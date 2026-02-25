@@ -8,7 +8,7 @@ import { vi, describe, it, expect, beforeEach } from "vitest";
 const mockExistsSync = vi.hoisted(() => vi.fn(() => false));
 const mockReaddir = vi.hoisted(() => vi.fn(async () => []));
 const mockReadFile = vi.hoisted(() => vi.fn(async () => ""));
-const mockWriteFile = vi.hoisted(() => vi.fn(async () => {}));
+const mockWriteFile = vi.hoisted(() => vi.fn(async (_path: string, _content: string) => {}));
 const mockRm = vi.hoisted(() => vi.fn(async () => {}));
 const mockMkdir = vi.hoisted(() => vi.fn(async () => {}));
 

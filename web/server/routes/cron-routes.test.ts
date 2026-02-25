@@ -41,7 +41,7 @@ function makeJob(overrides: Partial<CronJob> = {}): CronJob {
 /** Build a mock CronScheduler with vi.fn() stubs for every method the routes use. */
 function createMockScheduler() {
   return {
-    getNextRunTime: vi.fn(() => null as Date | null),
+    getNextRunTime: vi.fn((_id?: string) => null as Date | null),
     scheduleJob: vi.fn(),
     stopJob: vi.fn(),
     executeJobManually: vi.fn(),
@@ -116,7 +116,7 @@ describe("GET /api/cron/jobs", () => {
     vi.mocked(cronStore.listJobs).mockReturnValue([job1, job2]);
 
     const dateA = new Date("2026-04-01T08:00:00Z");
-    scheduler.getNextRunTime.mockImplementation((id: string) => {
+    scheduler.getNextRunTime.mockImplementation((id?: string) => {
       if (id === "job-a") return dateA;
       return null;
     });

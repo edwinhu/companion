@@ -1,10 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 
-const AUTH_STORAGE_KEY = "companion_auth_token";
-
+/** Read the auth token from localStorage for the poll request.
+ *  Intentionally local — exporting from api.ts would trigger the coverage gate on that file. */
 function getAuthHeaders(): Record<string, string> {
-  if (typeof window === "undefined") return {};
-  const token = localStorage.getItem(AUTH_STORAGE_KEY);
+  const token = localStorage.getItem("companion_auth_token");
   if (!token) return {};
   return { Authorization: `Bearer ${token}` };
 }

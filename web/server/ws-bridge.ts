@@ -354,6 +354,21 @@ export class WsBridge {
       onFirstTurnCompleted: this.onFirstTurnCompleted,
       autoNamingAttempted: this.autoNamingAttempted,
     });
+
+    // Flush any messages queued before the adapter was attached (e.g. user
+    // sent a message while the Codex container was still starting up).
+    if (session.pendingMessages.length > 0) {
+      console.log(`[ws-bridge] Flushing ${session.pendingMessages.length} queued message(s) to Codex adapter for session ${sessionId}`);
+      const queued = session.pendingMessages.splice(0);
+      for (const raw of queued) {
+        try {
+          const msg = JSON.parse(raw) as BrowserOutgoingMessage;
+          adapter.sendBrowserMessage(msg);
+        } catch {
+          console.warn(`[ws-bridge] Failed to parse queued message for Codex adapter: ${raw.substring(0, 200)}`);
+        }
+      }
+    }
   }
 
   // ── CLI WebSocket handlers ──────────────────────────────────────────────

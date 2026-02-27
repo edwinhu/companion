@@ -1954,6 +1954,18 @@ describe("PUT /api/settings", () => {
     expect(json).toEqual({ error: "editorTabEnabled must be a boolean" });
   });
 
+  it("returns 400 for non-string deepgram key", async () => {
+    const res = await app.request("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deepgramApiKey: 123 }),
+    });
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json).toEqual({ error: "deepgramApiKey must be a string" });
+  });
+
   it("returns 400 when no settings fields are provided", async () => {
     const res = await app.request("/api/settings", {
       method: "PUT",

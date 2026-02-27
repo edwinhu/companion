@@ -549,6 +549,91 @@ describe("Composer layout", () => {
   });
 });
 
+// ─── Microphone / push-to-talk ───────────────────────────────────────────────
+
+describe("Composer microphone button", () => {
+  it("mic button is hidden when Deepgram is not configured", async () => {
+    // Default mock returns deepgramApiKeyConfigured: false
+    render(<Composer sessionId="s1" />);
+    await waitFor(() => {
+      // The button should not be present at all
+      expect(screen.queryByLabelText("Push-to-talk microphone")).toBeNull();
+    });
+  });
+
+  it("mic button is shown when Deepgram is configured", async () => {
+    // Override the mock to return deepgramConfigured: true
+    const { api } = await import("../api.js");
+    vi.mocked(api.getSettings).mockResolvedValueOnce({
+      deepgramApiKeyConfigured: true,
+      openrouterApiKeyConfigured: false,
+      openrouterModel: "openrouter/free",
+      linearApiKeyConfigured: false,
+      linearAutoTransition: false,
+      linearAutoTransitionStateName: "",
+      editorTabEnabled: false,
+      aiValidationEnabled: false,
+      aiValidationAutoApprove: false,
+      aiValidationAutoDeny: false,
+    });
+
+    render(<Composer sessionId="s1" />);
+
+    // Wait for the mic button to appear (rendered for both mobile and desktop)
+    const micButtons = await screen.findAllByLabelText("Push-to-talk microphone");
+    expect(micButtons.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("mic button has proper accessible label", async () => {
+    const { api } = await import("../api.js");
+    vi.mocked(api.getSettings).mockResolvedValueOnce({
+      deepgramApiKeyConfigured: true,
+      openrouterApiKeyConfigured: false,
+      openrouterModel: "openrouter/free",
+      linearApiKeyConfigured: false,
+      linearAutoTransition: false,
+      linearAutoTransitionStateName: "",
+      editorTabEnabled: false,
+      aiValidationEnabled: false,
+      aiValidationAutoApprove: false,
+      aiValidationAutoDeny: false,
+    });
+
+    render(<Composer sessionId="s1" />);
+
+    const micButtons = await screen.findAllByLabelText("Push-to-talk microphone");
+    // Both mobile and desktop buttons should have the label
+    expect(micButtons.length).toBe(2);
+    micButtons.forEach((btn) => {
+      expect(btn.tagName).toBe("BUTTON");
+    });
+  });
+
+  it("mic button is disabled when not connected", async () => {
+    setupMockStore({ isConnected: false });
+    const { api } = await import("../api.js");
+    vi.mocked(api.getSettings).mockResolvedValueOnce({
+      deepgramApiKeyConfigured: true,
+      openrouterApiKeyConfigured: false,
+      openrouterModel: "openrouter/free",
+      linearApiKeyConfigured: false,
+      linearAutoTransition: false,
+      linearAutoTransitionStateName: "",
+      editorTabEnabled: false,
+      aiValidationEnabled: false,
+      aiValidationAutoApprove: false,
+      aiValidationAutoDeny: false,
+    });
+
+    render(<Composer sessionId="s1" />);
+
+    const micButtons = await screen.findAllByLabelText("Push-to-talk microphone");
+    micButtons.forEach((btn) => {
+      expect(btn.hasAttribute("disabled")).toBe(true);
+    });
+  });
+});
+
 describe("Composer save prompt", () => {
   it("shows save error when create prompt fails", async () => {
     // Validates API failures are visible to the user instead of being silently ignored.

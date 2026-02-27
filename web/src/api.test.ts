@@ -1780,6 +1780,68 @@ describe("saved prompts API", () => {
 });
 
 // ===========================================================================
+// Deepgram API
+// ===========================================================================
+describe("Deepgram API", () => {
+  it("verifyDeepgramConnection sends POST to /api/deepgram/verify", async () => {
+    const data = { connected: true, projectName: "My DG Project" };
+    mockFetch.mockResolvedValueOnce(mockResponse(data));
+
+    const result = await api.verifyDeepgramConnection();
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/deepgram/verify");
+    expect(opts.method).toBe("POST");
+    expect(result).toEqual(data);
+  });
+
+  it("transcribeAudio sends FormData to /api/deepgram/transcribe", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: () => Promise.resolve({ text: "Hello world" }),
+    });
+
+    const blob = new Blob(["fake-audio"], { type: "audio/webm" });
+    const result = await api.transcribeAudio(blob);
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/deepgram/transcribe");
+    expect(opts.method).toBe("POST");
+    expect(opts.body).toBeInstanceOf(FormData);
+    expect(result).toEqual({ text: "Hello world" });
+  });
+
+  it("transcribeAudio includes keywords in query params", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: () => Promise.resolve({ text: "React is great" }),
+    });
+
+    const blob = new Blob(["fake-audio"], { type: "audio/webm" });
+    await api.transcribeAudio(blob, "react,typescript");
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe(`/api/deepgram/transcribe?keywords=${encodeURIComponent("react,typescript")}`);
+  });
+
+  it("transcribeAudio throws on non-ok response", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 502,
+      statusText: "Bad Gateway",
+      json: () => Promise.resolve({ error: "Deepgram error: 500" }),
+    });
+
+    const blob = new Blob(["fake-audio"], { type: "audio/webm" });
+    await expect(api.transcribeAudio(blob)).rejects.toThrow("Deepgram error: 500");
+  });
+});
+
+// ===========================================================================
 // PUT / PATCH / DELETE error handling (verifies these HTTP helpers work like post/get)
 // ===========================================================================
 describe("put() error handling", () => {

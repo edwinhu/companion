@@ -97,6 +97,7 @@ function resetStore() {
   mockStoreValues.streamingStartedAt = new Map();
   mockStoreValues.streamingOutputTokens = new Map();
   mockStoreValues.sessionStatus = new Map();
+  mockStoreValues.toolProgress = new Map();
   mockStoreValues.chatTabReentryTickBySession = new Map();
   mockStoreValues.sdkSessions = [];
 }
@@ -340,6 +341,71 @@ describe("MessageFeed - lazy resume transcript", () => {
     });
     expect(await screen.findByText("Earlier question")).toBeTruthy();
     expect(await screen.findByText("Earlier answer")).toBeTruthy();
+  });
+
+  it("shows inline resume banner for active chats and updates loaded transcript status", async () => {
+    const sid = "test-resume-inline";
+    setStoreMessages(sid, [makeMessage({ id: "u1", role: "user", content: "Continue from here" })]);
+    setSdkSessions([
+      {
+        sessionId: sid,
+        state: "connected",
+        cwd: "/Users/test/repo",
+        createdAt: Date.now(),
+        backendType: "claude",
+        resumeSessionAt: "prior-inline-456",
+        forkSession: true,
+      },
+    ]);
+    getClaudeSessionHistoryMock.mockResolvedValueOnce({
+      sourceFile: "/Users/test/.claude/projects/repo/prior-inline-456.jsonl",
+      nextCursor: 1,
+      hasMore: false,
+      totalMessages: 1,
+      messages: [
+        {
+          id: "resume-prior-inline-456-assistant-a1",
+          role: "assistant",
+          content: "Loaded from previous thread",
+          timestamp: 2,
+        },
+      ],
+    });
+
+    render(<MessageFeed sessionId={sid} />);
+
+    expect(screen.getByText("Forked from existing Claude thread")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /load previous history/i }));
+
+    await waitFor(() => {
+      expect(getClaudeSessionHistoryMock).toHaveBeenCalledWith("prior-inline-456", {
+        cursor: 0,
+        limit: 40,
+      });
+    });
+
+    expect(await screen.findByText("Loaded all available prior transcript")).toBeTruthy();
+  });
+});
+
+describe("MessageFeed - tool progress indicator", () => {
+  it("renders tool progress while tools are running", () => {
+    const sid = "test-tool-progress";
+    setStoreMessages(sid, [makeMessage({ role: "user", content: "run checks" })]);
+    const progressBySession = new Map();
+    progressBySession.set(sid, new Map([
+      ["bash-1", { toolName: "Bash", elapsedSeconds: 7 }],
+      ["read-1", { toolName: "Read", elapsedSeconds: 2 }],
+    ]));
+    mockStoreValues.toolProgress = progressBySession;
+
+    render(<MessageFeed sessionId={sid} />);
+
+    expect(screen.getByText("Terminal")).toBeTruthy();
+    expect(screen.getByText("Read File")).toBeTruthy();
+    expect(screen.getByText("7s")).toBeTruthy();
+    expect(screen.getByText("2s")).toBeTruthy();
   });
 });
 

@@ -257,6 +257,78 @@ describe("DockerBuilderPage build status", () => {
     await screen.findByText("Docker daemon not running");
   });
 
+  it("shows success state after build completes via poll", async () => {
+    // Simulate: buildEnvImage resolves, then getEnvBuildStatus returns "success".
+    // The component uses setTimeout(poll, 2000) internally, so we wait for
+    // the poll to fire and resolve.
+    mockBuildEnvImage.mockResolvedValue({ ok: true });
+    mockGetEnvBuildStatus.mockResolvedValue({
+      buildStatus: "success",
+      imageTag: "companion-env-production:latest",
+      lastBuiltAt: 1700000000000,
+    });
+    mockListEnvs.mockResolvedValue([makeEnv()]);
+
+    render(<DockerBuilderPage />);
+    await screen.findByText("Docker Builder");
+    await selectProductionEnv();
+
+    fireEvent.click(screen.getByRole("button", { name: /build image/i }));
+
+    // Wait for the poll to complete and success to render
+    await waitFor(() => {
+      expect(screen.getByText("Success")).toBeInTheDocument();
+    }, { timeout: 10000 });
+  });
+
+  it("shows error when build poll returns failed status", async () => {
+    // Covers the branch where getEnvBuildStatus returns a non-success,
+    // non-building status with a buildError message.
+    mockBuildEnvImage.mockResolvedValue({ ok: true });
+    mockGetEnvBuildStatus.mockResolvedValue({
+      buildStatus: "failed",
+      buildError: "Dockerfile syntax error",
+    });
+
+    render(<DockerBuilderPage />);
+    await screen.findByText("Docker Builder");
+    await selectProductionEnv();
+
+    fireEvent.click(screen.getByRole("button", { name: /build image/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Dockerfile syntax error")).toBeInTheDocument();
+    }, { timeout: 10000 });
+  });
+
+  it("resets build state when environment selection changes", async () => {
+    // After building env A and seeing an error, switching to env B should
+    // clear the build status back to idle so stale results don't show.
+    mockBuildEnvImage.mockRejectedValue(new Error("build failed"));
+    mockListEnvs.mockResolvedValue([
+      makeEnv(),
+      makeEnv({ name: "Staging", slug: "staging", dockerfile: "FROM alpine" }),
+    ]);
+
+    render(<DockerBuilderPage />);
+    await screen.findByText("Docker Builder");
+    await selectProductionEnv();
+
+    fireEvent.click(screen.getByRole("button", { name: /build image/i }));
+    await waitFor(() => {
+      expect(screen.getAllByText(/build failed/).length).toBeGreaterThan(0);
+    });
+
+    // Switch to a different env
+    const selects = screen.getAllByRole("combobox");
+    fireEvent.change(selects[0], { target: { value: "staging" } });
+
+    // Build state should reset to idle
+    await waitFor(() => {
+      expect(screen.getByText("No build in progress.")).toBeInTheDocument();
+    });
+  });
+
   it("clears build log on clear button click", async () => {
     mockBuildEnvImage.mockRejectedValue(new Error("failed"));
     render(<DockerBuilderPage />);
@@ -276,6 +348,54 @@ describe("DockerBuilderPage build status", () => {
 
     // Build log should be cleared, back to idle
     await screen.findByText("No build in progress.");
+  });
+});
+
+// ─── Pull Base Image ──────────────────────────────────────────
+
+describe("DockerBuilderPage pull base image", () => {
+  it("shows Pull base image button when env with baseImage is selected", async () => {
+    // When an env with a baseImage is selected and the image status is "idle"
+    // (not yet downloaded), a "Pull base image" button appears.
+    mockGetImageStatus.mockResolvedValue({ image: "node:20", status: "idle", progress: [] });
+    render(<DockerBuilderPage />);
+    await screen.findByText("Docker Builder");
+    await selectProductionEnv();
+
+    await waitFor(() => {
+      expect(screen.getByText("Pull base image")).toBeInTheDocument();
+    });
+  });
+
+  it("calls pullImage when Pull base image is clicked", async () => {
+    // Clicking the pull base image button should call the pullImage API
+    // with the env's base image tag.
+    mockGetImageStatus.mockResolvedValue({ image: "node:20", status: "idle", progress: [] });
+    render(<DockerBuilderPage />);
+    await screen.findByText("Docker Builder");
+    await selectProductionEnv();
+
+    await waitFor(() => {
+      expect(screen.getByText("Pull base image")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText("Pull base image"));
+
+    await waitFor(() => {
+      expect(mockPullImage).toHaveBeenCalledWith("node:20");
+    });
+  });
+
+  it("shows Pull / Update base image when base image is ready", async () => {
+    // When the base image status is "ready", the button text changes.
+    mockGetImageStatus.mockResolvedValue({ image: "node:20", status: "ready", progress: [] });
+    render(<DockerBuilderPage />);
+    await screen.findByText("Docker Builder");
+    await selectProductionEnv();
+
+    await waitFor(() => {
+      expect(screen.getByText("Pull / Update base image")).toBeInTheDocument();
+    });
   });
 });
 

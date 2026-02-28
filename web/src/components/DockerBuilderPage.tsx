@@ -104,6 +104,17 @@ export function DockerBuilderPage() {
 
   const pollCountRef = useRef(0);
 
+  // Reset build state when environment selection changes so stale results
+  // from a previous env don't carry over to the newly selected env.
+  useEffect(() => {
+    setBuildState("idle");
+    setBuildLog("");
+    setBuildError("");
+    setLastBuiltTag("");
+    setLastBuiltAt(null);
+    pollCountRef.current = 0;
+  }, [selectedEnvSlug]);
+
   async function handleBuild() {
     if (!selectedEnvSlug) return;
     setBuildState("building");

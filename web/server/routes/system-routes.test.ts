@@ -18,6 +18,7 @@ vi.mock("../update-checker.js", () => ({
     isServiceMode: false,
     checking: false,
     updateInProgress: false,
+    channel: "stable",
   })),
   checkForUpdate: vi.fn(async () => {}),
   isUpdateAvailable: vi.fn(() => false),
@@ -200,6 +201,7 @@ describe("GET /api/update-check", () => {
       isServiceMode: false,
       checking: false,
       updateInProgress: false,
+      channel: "stable",
     });
     vi.mocked(isUpdateAvailable).mockReturnValue(false);
 
@@ -210,6 +212,7 @@ describe("GET /api/update-check", () => {
     const json = await res.json();
     expect(json.currentVersion).toBe("1.0.0");
     expect(json.updateAvailable).toBe(false);
+    expect(json.channel).toBe("stable");
   });
 
   it("does NOT call checkForUpdate when lastChecked is recent (not stale)", async () => {
@@ -221,6 +224,7 @@ describe("GET /api/update-check", () => {
       isServiceMode: false,
       checking: false,
       updateInProgress: false,
+      channel: "stable",
     });
     vi.mocked(isUpdateAvailable).mockReturnValue(false);
 
@@ -244,6 +248,7 @@ describe("POST /api/update-check", () => {
       isServiceMode: true,
       checking: false,
       updateInProgress: false,
+      channel: "stable",
     });
     vi.mocked(isUpdateAvailable).mockReturnValue(true);
 
@@ -270,6 +275,7 @@ describe("POST /api/update", () => {
       isServiceMode: false,
       checking: false,
       updateInProgress: false,
+      channel: "stable",
     });
 
     const res = await app.request("/api/update", { method: "POST" });
@@ -287,6 +293,7 @@ describe("POST /api/update", () => {
       isServiceMode: true,
       checking: false,
       updateInProgress: false,
+      channel: "stable",
     });
     vi.mocked(isUpdateAvailable).mockReturnValue(false);
 
@@ -305,6 +312,7 @@ describe("POST /api/update", () => {
       isServiceMode: true,
       checking: false,
       updateInProgress: true,
+      channel: "stable",
     });
     vi.mocked(isUpdateAvailable).mockReturnValue(true);
 
@@ -323,6 +331,7 @@ describe("POST /api/update", () => {
       isServiceMode: true,
       checking: false,
       updateInProgress: false,
+      channel: "stable",
     });
     vi.mocked(isUpdateAvailable).mockReturnValue(true);
 

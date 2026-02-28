@@ -15,6 +15,7 @@ const mockApi = {
   createPrompt: vi.fn(),
   updatePrompt: vi.fn(),
   deletePrompt: vi.fn(),
+  listDirs: vi.fn(),
 };
 
 vi.mock("../api.js", () => ({
@@ -23,6 +24,7 @@ vi.mock("../api.js", () => ({
     createPrompt: (...args: unknown[]) => mockApi.createPrompt(...args),
     updatePrompt: (...args: unknown[]) => mockApi.updatePrompt(...args),
     deletePrompt: (...args: unknown[]) => mockApi.deletePrompt(...args),
+    listDirs: (...args: unknown[]) => mockApi.listDirs(...args),
   },
 }));
 
@@ -30,6 +32,15 @@ vi.mock("../store.js", () => {
   const useStoreFn = (selector: (state: MockStoreState) => unknown) => selector(mockState);
   useStoreFn.getState = () => mockState;
   return { useStore: useStoreFn };
+});
+
+// Mock createPortal for FolderPicker
+vi.mock("react-dom", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react-dom")>();
+  return {
+    ...actual,
+    createPortal: (children: React.ReactNode) => children,
+  };
 });
 
 import { PromptsPage } from "./PromptsPage.js";
@@ -46,8 +57,7 @@ beforeEach(() => {
     id: "p1",
     name: "review-pr",
     content: "Review this PR",
-    scope: "project",
-    projectPath: "/repo",
+    scope: "global",
     createdAt: Date.now(),
     updatedAt: Date.now(),
   });
@@ -55,27 +65,26 @@ beforeEach(() => {
     id: "p1",
     name: "updated",
     content: "Updated prompt content",
-    scope: "project",
-    projectPath: "/repo",
+    scope: "global",
     createdAt: Date.now(),
     updatedAt: Date.now(),
   });
   mockApi.deletePrompt.mockResolvedValue({ ok: true });
+  mockApi.listDirs.mockResolvedValue({ path: "/", dirs: [], home: "/" });
 });
 
 describe("PromptsPage", () => {
-  it("loads prompts on mount using current session cwd", async () => {
-    // Validates global-only prompt listing is fetched with global scope.
+  it("loads prompts on mount using current session cwd (no scope filter)", async () => {
+    // Validates prompt listing now fetches all scopes visible for cwd.
     render(<PromptsPage embedded />);
     await waitFor(() => {
-      expect(mockApi.listPrompts).toHaveBeenCalledWith("/repo", "global");
+      expect(mockApi.listPrompts).toHaveBeenCalledWith("/repo");
     });
   });
 
-  it("creates a global prompt", async () => {
-    // Validates create payload is forced to global scope.
+  it("creates a global prompt by default", async () => {
+    // Validates create payload defaults to global scope.
     render(<PromptsPage embedded />);
-    // Open the collapsible create form first
     fireEvent.click(screen.getByRole("button", { name: /new prompt/i }));
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "review-pr" } });
     fireEvent.change(screen.getByLabelText("Content"), { target: { value: "Review this PR" } });
@@ -90,6 +99,28 @@ describe("PromptsPage", () => {
     });
   });
 
+  it("creates a project-scoped prompt with cwd pre-filled", async () => {
+    // Validates clicking "Project folders" scope sets projectPaths from cwd.
+    render(<PromptsPage embedded />);
+    fireEvent.click(screen.getByRole("button", { name: /new prompt/i }));
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "project-prompt" } });
+    fireEvent.change(screen.getByLabelText("Content"), { target: { value: "Project content" } });
+
+    // Switch to project scope
+    fireEvent.click(screen.getByRole("button", { name: "Project folders" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Prompt" }));
+
+    await waitFor(() => {
+      expect(mockApi.createPrompt).toHaveBeenCalledWith({
+        name: "project-prompt",
+        content: "Project content",
+        scope: "project",
+        projectPaths: ["/repo"],
+      });
+    });
+  });
+
   it("can create a global prompt without cwd", async () => {
     // Edge case: creation should work with no active session in global-only mode.
     mockState = {
@@ -98,7 +129,6 @@ describe("PromptsPage", () => {
       sdkSessions: [],
     };
     render(<PromptsPage embedded />);
-    // Open the collapsible create form first
     fireEvent.click(screen.getByRole("button", { name: /new prompt/i }));
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "global" } });
     fireEvent.change(screen.getByLabelText("Content"), { target: { value: "Always do X" } });
@@ -135,7 +165,7 @@ describe("PromptsPage", () => {
   });
 
   it("edits an existing prompt", async () => {
-    // Validates inline edit mode persists name and content through updatePrompt.
+    // Validates inline edit mode persists name, content, scope through updatePrompt.
     mockApi.listPrompts.mockResolvedValueOnce([
       {
         id: "p1",
@@ -160,6 +190,38 @@ describe("PromptsPage", () => {
       expect(mockApi.updatePrompt).toHaveBeenCalledWith("p1", {
         name: "review-updated",
         content: "Updated content",
+        scope: "global",
+      });
+    });
+  });
+
+  it("edits a project prompt and preserves scope/paths", async () => {
+    // Validates that editing a project-scoped prompt preserves scope and paths.
+    mockApi.listPrompts.mockResolvedValueOnce([
+      {
+        id: "p2",
+        name: "local-check",
+        content: "Run local checks",
+        scope: "project",
+        projectPath: "/repo",
+        projectPaths: ["/repo"],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    render(<PromptsPage embedded />);
+    await screen.findByText("local-check");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    fireEvent.change(screen.getByDisplayValue("local-check"), { target: { value: "local-check-v2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(mockApi.updatePrompt).toHaveBeenCalledWith("p2", {
+        name: "local-check-v2",
+        content: "Run local checks",
+        scope: "project",
+        projectPaths: ["/repo"],
       });
     });
   });
@@ -197,5 +259,53 @@ describe("PromptsPage", () => {
       target: { value: "not-found" },
     });
     expect(screen.getByText("No prompts match your search.")).toBeInTheDocument();
+  });
+
+  it("shows scope badge with folder name for project prompts", async () => {
+    // Validates the scope badge shows folder directory name for project-scoped prompts.
+    mockApi.listPrompts.mockResolvedValueOnce([
+      {
+        id: "p1",
+        name: "project-prompt",
+        content: "Content",
+        scope: "project",
+        projectPath: "/home/user/my-project",
+        projectPaths: ["/home/user/my-project"],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    render(<PromptsPage embedded />);
+    await screen.findByText("project-prompt");
+    // The scope badge should show the folder name
+    expect(screen.getByText("my-project")).toBeInTheDocument();
+  });
+
+  it("shows scope selector in create form with Global and Project folders buttons", async () => {
+    // Validates the scope selector UI is rendered.
+    render(<PromptsPage embedded />);
+    fireEvent.click(screen.getByRole("button", { name: /new prompt/i }));
+    expect(screen.getByText("Scope")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Global" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Project folders" })).toBeInTheDocument();
+  });
+
+  it("passes axe accessibility checks", async () => {
+    // Ensures the PromptsPage meets WCAG accessibility standards.
+    const { axe } = await import("vitest-axe");
+    mockApi.listPrompts.mockResolvedValueOnce([
+      {
+        id: "p1",
+        name: "review-pr",
+        content: "Review this PR",
+        scope: "global",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    const { container } = render(<PromptsPage embedded />);
+    await screen.findByText("review-pr");
+    const results = await axe(container);
+    expect(results).toHaveNoViolations();
   });
 });

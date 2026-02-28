@@ -565,6 +565,56 @@ describe("Composer save prompt", () => {
     expect(await screen.findByText("Could not save prompt right now")).toBeTruthy();
   });
 
+  it("renders scope buttons in save prompt modal", async () => {
+    // Validates the Global / This project scope selector is visible in the save prompt modal.
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "Some text" } });
+    fireEvent.click(screen.getAllByTitle("Save as prompt")[0]);
+
+    expect(screen.getByText("Global")).toBeTruthy();
+    expect(screen.getByText("This project")).toBeTruthy();
+  });
+
+  it("saves project-scoped prompt with session cwd", async () => {
+    // Validates that selecting "This project" sends projectPaths with the session cwd.
+    mockCreatePrompt.mockResolvedValue({ id: "p1", name: "test", content: "body", scope: "project", projectPaths: ["/test"] });
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "Prompt body" } });
+    fireEvent.click(screen.getAllByTitle("Save as prompt")[0]);
+    fireEvent.change(screen.getByPlaceholderText("Prompt title"), { target: { value: "My Prompt" } });
+
+    // Switch to project scope
+    fireEvent.click(screen.getByText("This project"));
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => {
+      expect(mockCreatePrompt).toHaveBeenCalledWith({
+        name: "My Prompt",
+        content: "Prompt body",
+        scope: "project",
+        projectPaths: ["/test"],
+      });
+    });
+  });
+
+  it("shows error when saving project-scoped prompt without cwd", async () => {
+    // Validates that an informative error is shown when cwd is not available.
+    setupMockStore({ isConnected: true, session: { cwd: "" } });
+    const { container } = render(<Composer sessionId="s1" />);
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: "Prompt body" } });
+    fireEvent.click(screen.getAllByTitle("Save as prompt")[0]);
+    fireEvent.change(screen.getByPlaceholderText("Prompt title"), { target: { value: "My Prompt" } });
+
+    fireEvent.click(screen.getByText("This project"));
+    fireEvent.click(screen.getByText("Save"));
+
+    expect(await screen.findByText("No project folder available for this session")).toBeTruthy();
+    expect(mockCreatePrompt).not.toHaveBeenCalled();
+  });
+
   it("passes axe accessibility checks", async () => {
     const { axe } = await import("vitest-axe");
     setupMockStore({ isConnected: true });

@@ -290,6 +290,103 @@ describe("PromptsPage", () => {
     expect(screen.getByRole("button", { name: "Project folders" })).toBeInTheDocument();
   });
 
+  it("shows folder chips and Add folder button when project scope selected", async () => {
+    // Validates the folder chip UI renders with remove buttons when project scope is active.
+    render(<PromptsPage embedded />);
+    fireEvent.click(screen.getByRole("button", { name: /new prompt/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Project folders" }));
+
+    // cwd "/repo" should be auto-filled as a chip
+    expect(screen.getByText("repo")).toBeInTheDocument();
+    expect(screen.getByLabelText("Remove folder /repo")).toBeInTheDocument();
+    expect(screen.getByText("Add folder")).toBeInTheDocument();
+  });
+
+  it("removes a folder chip when remove button clicked", async () => {
+    // Validates folder removal interaction in the scope selector.
+    render(<PromptsPage embedded />);
+    fireEvent.click(screen.getByRole("button", { name: /new prompt/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Project folders" }));
+
+    // Remove the auto-filled folder
+    fireEvent.click(screen.getByLabelText("Remove folder /repo"));
+
+    // No chips should remain, but Add folder should still be visible
+    expect(screen.queryByText("repo")).not.toBeInTheDocument();
+    expect(screen.getByText("Add folder")).toBeInTheDocument();
+  });
+
+  it("shows error when creating project prompt with no folders selected", async () => {
+    // Validates client-side validation for empty folder list.
+    render(<PromptsPage embedded />);
+    fireEvent.click(screen.getByRole("button", { name: /new prompt/i }));
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "test" } });
+    fireEvent.change(screen.getByLabelText("Content"), { target: { value: "content" } });
+    fireEvent.click(screen.getByRole("button", { name: "Project folders" }));
+
+    // Remove auto-filled folder
+    fireEvent.click(screen.getByLabelText("Remove folder /repo"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Prompt" }));
+
+    expect(screen.getByText("Select at least one project folder")).toBeInTheDocument();
+    expect(mockApi.createPrompt).not.toHaveBeenCalled();
+  });
+
+  it("displays multi-folder scope badge with count", async () => {
+    // Validates the scope badge shows +N count for prompts with multiple folders.
+    mockApi.listPrompts.mockResolvedValueOnce([
+      {
+        id: "p1",
+        name: "multi-folder",
+        content: "Content",
+        scope: "project",
+        projectPath: "/home/user/repo-a",
+        projectPaths: ["/home/user/repo-a", "/home/user/repo-b", "/home/user/repo-c"],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    render(<PromptsPage embedded />);
+    await screen.findByText("multi-folder");
+    expect(screen.getByText("repo-a +2")).toBeInTheDocument();
+  });
+
+  it("shows Back button in non-embedded mode", async () => {
+    // Validates the Back button renders when not embedded.
+    render(<PromptsPage />);
+    expect(screen.getByText("Back")).toBeInTheDocument();
+  });
+
+  it("cancels editing and resets state", async () => {
+    // Validates cancel in edit mode clears edit state.
+    mockApi.listPrompts.mockResolvedValueOnce([
+      {
+        id: "p1",
+        name: "review-pr",
+        content: "Review this PR",
+        scope: "global",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    render(<PromptsPage embedded />);
+    await screen.findByText("review-pr");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByDisplayValue("review-pr")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    // Should be back to display mode
+    expect(screen.queryByDisplayValue("review-pr")).not.toBeInTheDocument();
+    expect(screen.getByText("review-pr")).toBeInTheDocument();
+  });
+
+  it("shows loading state initially", () => {
+    // Validates loading indicator appears before prompts load.
+    render(<PromptsPage embedded />);
+    expect(screen.getByText("Loading prompts...")).toBeInTheDocument();
+  });
+
   it("passes axe accessibility checks", async () => {
     // Ensures the PromptsPage meets WCAG accessibility standards.
     const { axe } = await import("vitest-axe");

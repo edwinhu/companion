@@ -67,6 +67,9 @@ export class ChatBot {
     this.chat = new Chat<Record<string, Adapter>, CompanionThreadState>({
       userName: process.env.LINEAR_BOT_USERNAME || "companion",
       adapters,
+      // NOTE: In-memory state — thread→session mappings are lost on server restart.
+      // After a restart, follow-up messages create new sessions instead of continuing.
+      // For production, consider implementing a disk-backed state adapter.
       state: createMemoryState(),
       logger: new ConsoleLogger("warn"),
     });
@@ -133,6 +136,11 @@ export class ChatBot {
 
       const sessionId = sessionInfo.sessionId;
 
+      // Register listeners BEFORE any async platform calls — a fast agent may
+      // complete before setState/subscribe finish, and without listeners
+      // registered the first turn's response would be silently dropped.
+      this.setupResponseRelay(sessionId, thread);
+
       // Store thread→session mapping
       await thread.setState({ sessionId, agentId: agent.id });
 
@@ -141,9 +149,6 @@ export class ChatBot {
       if (binding?.autoSubscribe !== false) {
         await thread.subscribe();
       }
-
-      // Set up response relay: when the agent responds, post back to the platform
-      this.setupResponseRelay(sessionId, thread);
     } catch (err) {
       console.error("[chat-bot] Error handling mention:", err);
       await thread.post(`Error starting session: ${err instanceof Error ? err.message : String(err)}`);

@@ -55,18 +55,20 @@ export class ExecutionStore {
   /** Update an existing execution in the cache and persist to disk. */
   update(sessionId: string, updates: Partial<AgentExecution>): void {
     const idx = this.recentCache.findIndex((e) => e.sessionId === sessionId);
-    if (idx >= 0) {
-      Object.assign(this.recentCache[idx], updates);
-      // Re-append the updated record to disk for durability.
-      // On next load, dedup by sessionId keeps the latest entry.
-      const updated = this.recentCache[idx];
-      const filename = this.dailyFilename(updated.startedAt);
-      const filepath = join(this.dir, filename);
-      try {
-        appendFileSync(filepath, JSON.stringify(updated) + "\n", "utf-8");
-      } catch (err) {
-        console.error("[execution-store] Failed to persist update:", err);
-      }
+    if (idx < 0) {
+      console.warn(`[execution-store] update() called for unknown sessionId: ${sessionId} (not in cache)`);
+      return;
+    }
+    Object.assign(this.recentCache[idx], updates);
+    // Re-append the updated record to disk for durability.
+    // On next load, dedup by sessionId keeps the latest entry.
+    const updated = this.recentCache[idx];
+    const filename = this.dailyFilename(updated.startedAt);
+    const filepath = join(this.dir, filename);
+    try {
+      appendFileSync(filepath, JSON.stringify(updated) + "\n", "utf-8");
+    } catch (err) {
+      console.error("[execution-store] Failed to persist update:", err);
     }
   }
 

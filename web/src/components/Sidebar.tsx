@@ -638,8 +638,8 @@ export function Sidebar() {
       </div>
 
       {/* Footer */}
-      <div className="p-2 pb-safe bg-cc-sidebar-footer">
-        <div className="grid grid-cols-3 gap-1">
+      <div className="px-2 py-1.5 pb-safe bg-cc-sidebar-footer">
+        <nav className="flex flex-col gap-0.5" aria-label="Navigation">
           {NAV_ITEMS.map((item) => {
             const isActive = item.activePages
               ? item.activePages.some((p) => route.page === p)
@@ -658,21 +658,21 @@ export function Sidebar() {
                   }
                 }}
                 title={item.label}
-                className={`flex flex-col items-center justify-center gap-0.5 py-2.5 px-1.5 min-h-[44px] rounded-lg transition-colors cursor-pointer ${
+                className={`flex items-center gap-2.5 px-2.5 py-1.5 min-h-[32px] rounded-md text-[12px] font-medium transition-colors duration-150 cursor-pointer ${
                   isActive
                     ? "bg-cc-active text-cc-fg"
                     : "text-cc-muted hover:text-cc-fg hover:bg-cc-hover"
                 }`}
               >
-                <svg viewBox={item.viewBox} fill="currentColor" className="w-4 h-4">
+                <svg viewBox={item.viewBox} fill="currentColor" className="w-4 h-4 shrink-0">
                   <path d={item.iconPath} fillRule={item.fillRule} clipRule={item.clipRule} />
                 </svg>
-                <span className="text-[10px] font-medium leading-none">{item.shortLabel}</span>
+                <span>{item.label}</span>
               </button>
             );
           })}
-        </div>
-        <div className="flex items-center justify-center gap-1 mt-1.5 pt-1.5 border-t border-cc-border/30">
+        </nav>
+        <div className="flex items-center gap-1 mt-1.5 pt-1.5 border-t border-cc-border/30 px-1.5">
           {EXTERNAL_LINKS.map((link) => (
             <a
               key={link.label}
@@ -681,7 +681,7 @@ export function Sidebar() {
               rel="noopener noreferrer"
               title={link.label}
               aria-label={`Open ${link.label.toLowerCase()}`}
-              className="w-8 h-8 rounded-lg flex items-center justify-center text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors"
+              className="w-7 h-7 rounded-md flex items-center justify-center text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors"
             >
               <svg viewBox={link.viewBox} fill="currentColor" className="w-3.5 h-3.5">
                 <path d={link.iconPath} />

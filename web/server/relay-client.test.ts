@@ -115,6 +115,28 @@ describe("RelayClient", () => {
       expect(capturedWs!.url).toBe("ws://localhost:8787/ws/relay?secret=dev-secret");
     });
 
+    it("redacts the secret from log output", () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const chatBot = createMockChatBot();
+      const client = new RelayClient(
+        "https://relay.example.com",
+        "super-secret-value",
+        chatBot as any,
+      );
+
+      client.connect();
+
+      // The log message should contain the URL but with the secret redacted
+      const logCall = logSpy.mock.calls.find((args) =>
+        typeof args[0] === "string" && args[0].includes("[relay-client] Connecting to"),
+      );
+      expect(logCall).toBeDefined();
+      expect(logCall![0]).not.toContain("super-secret-value");
+      expect(logCall![0]).toContain("secret=***");
+
+      logSpy.mockRestore();
+    });
+
     it("strips trailing slashes from the relay URL", () => {
       const chatBot = createMockChatBot();
       const client = new RelayClient(

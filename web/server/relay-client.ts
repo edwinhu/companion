@@ -61,7 +61,8 @@ export class RelayClient {
 
     // Convert http(s) URL to ws(s) URL
     const wsUrl = this.buildWsUrl();
-    console.log(`[relay-client] Connecting to ${wsUrl}`);
+    const displayUrl = wsUrl.replace(/([?&])(secret)=[^&]*/gi, "$1$2=***");
+    console.log(`[relay-client] Connecting to ${displayUrl}`);
 
     try {
       this.ws = new WebSocket(wsUrl);

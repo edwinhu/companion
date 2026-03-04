@@ -755,6 +755,15 @@ describe("Sidebar", () => {
     expect(screen.getByText("Settings")).toBeInTheDocument();
   });
 
+  it("footer navigation is grouped into clear sections", () => {
+    // Verifies that the redesigned menu exposes explicit grouping labels
+    // to improve scanability and information architecture.
+    render(<Sidebar />);
+    expect(screen.getByText("Workbench")).toBeInTheDocument();
+    expect(screen.getByText("Workspace")).toBeInTheDocument();
+    expect(screen.getByText("Resources")).toBeInTheDocument();
+  });
+
   it("session item has minimum touch target height", () => {
     const session = makeSession("s1");
     const sdk = makeSdkSession("s1");
@@ -1570,6 +1579,16 @@ describe("Sidebar", () => {
 
     const integrationsBtn = screen.getByTitle("Integrations");
     expect(integrationsBtn).toHaveClass("bg-cc-active");
+  });
+
+  it("agents nav button is active on agent detail routes with aria-current", () => {
+    // Verifies active state semantics for nested agent pages.
+    window.location.hash = "#/agents/agent-123";
+    render(<Sidebar />);
+
+    const agentsBtn = screen.getByTitle("Agents");
+    expect(agentsBtn).toHaveClass("bg-cc-active");
+    expect(agentsBtn).toHaveAttribute("aria-current", "page");
   });
 
   // ─── Close sidebar button (mobile) ─────────────────────────────────────────

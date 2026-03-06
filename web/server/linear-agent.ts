@@ -98,6 +98,17 @@ export interface AgentSessionEventPayload {
 
 // ─── GraphQL helper ─────────────────────────────────────────────────────────
 
+/** Guard against concurrent 401s triggering multiple simultaneous refresh requests. */
+let refreshPromise: Promise<string | null> | null = null;
+
+/** Get a refreshed token, coalescing concurrent refresh requests into a single call. */
+async function getRefreshedToken(): Promise<string | null> {
+  if (!refreshPromise) {
+    refreshPromise = refreshAccessToken().finally(() => { refreshPromise = null; });
+  }
+  return refreshPromise;
+}
+
 /** Execute a GraphQL query against the Linear API with automatic token refresh. */
 export async function linearGraphQL<T = unknown>(
   query: string,
@@ -112,9 +123,9 @@ export async function linearGraphQL<T = unknown>(
 
   let response = await fetchGraphQL(token, query, variables);
 
-  // Auto-refresh on 401
+  // Auto-refresh on 401 — coalesced to prevent concurrent refresh races
   if (response.status === 401 && settings.linearOAuthRefreshToken) {
-    const refreshed = await refreshAccessToken();
+    const refreshed = await getRefreshedToken();
     if (refreshed) {
       token = refreshed;
       response = await fetchGraphQL(token, query, variables);

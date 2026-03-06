@@ -14,13 +14,6 @@ import * as linearAgent from "./linear-agent.js";
 import type { AgentSessionEventPayload } from "./linear-agent.js";
 import { getSettings } from "./settings-manager.js";
 
-/** Maps Linear agent session IDs to Companion session IDs */
-const sessionMap = new Map<string, string>();
-/** Maps Companion session IDs back to Linear agent session IDs */
-const reverseMap = new Map<string, string>();
-/** Track active session unsubscribers for cleanup */
-const sessionCleanups = new Map<string, Array<() => void>>();
-
 /** Safely extract the content array from an assistant-type message. */
 function getAssistantContent(msg: BrowserIncomingMessage): unknown[] | null {
   if (msg.type !== "assistant") return null;
@@ -59,6 +52,13 @@ function extractToolUse(msg: BrowserIncomingMessage): { name: string; input: str
 export class LinearAgentBridge {
   private agentExecutor: AgentExecutor;
   private wsBridge: WsBridge;
+
+  /** Maps Linear agent session IDs to Companion session IDs */
+  private sessionMap = new Map<string, string>();
+  /** Maps Companion session IDs back to Linear agent session IDs */
+  private reverseMap = new Map<string, string>();
+  /** Track active session unsubscribers for cleanup */
+  private sessionCleanups = new Map<string, Array<() => void>>();
 
   constructor(agentExecutor: AgentExecutor, wsBridge: WsBridge) {
     this.agentExecutor = agentExecutor;
@@ -121,8 +121,8 @@ export class LinearAgentBridge {
       const companionSessionId = sessionInfo.sessionId;
 
       // 4. Map sessions
-      sessionMap.set(linearSessionId, companionSessionId);
-      reverseMap.set(companionSessionId, linearSessionId);
+      this.sessionMap.set(linearSessionId, companionSessionId);
+      this.reverseMap.set(companionSessionId, linearSessionId);
 
       // 5. Set external URL linking back to Companion
       const settings = getSettings();
@@ -152,11 +152,15 @@ export class LinearAgentBridge {
     const linearSessionId = payload.data.id;
     const message = payload.agentActivity?.body || "";
 
-    const companionSessionId = sessionMap.get(linearSessionId);
+    const companionSessionId = this.sessionMap.get(linearSessionId);
     if (!companionSessionId) {
-      // Session not found — might have expired. Create a new one.
+      // Session not found — might have expired. Create a new one with the follow-up message.
       console.log(`[linear-agent-bridge] No session mapping for ${linearSessionId}, creating new`);
-      await this.handleCreated(payload);
+      await this.handleCreated({
+        ...payload,
+        action: "created",
+        data: { ...payload.data, promptContext: message },
+      });
       return;
     }
 
@@ -167,11 +171,15 @@ export class LinearAgentBridge {
     if (!session) {
       console.log(`[linear-agent-bridge] Session ${companionSessionId} is dead, creating new`);
       // Clean up stale mapping
-      sessionMap.delete(linearSessionId);
-      reverseMap.delete(companionSessionId);
+      this.sessionMap.delete(linearSessionId);
+      this.reverseMap.delete(companionSessionId);
       this.cleanupRelay(companionSessionId);
-      // Start a new session with the follow-up as the prompt
-      await this.handleCreated(payload);
+      // Start a new session with the follow-up message as prompt context
+      await this.handleCreated({
+        ...payload,
+        action: "created",
+        data: { ...payload.data, promptContext: message },
+      });
       return;
     }
 
@@ -228,22 +236,24 @@ export class LinearAgentBridge {
         pendingText = "";
       }
 
-      // Clean up session mappings to prevent memory leaks
-      this.cleanupRelay(companionSessionId);
-      sessionMap.delete(linearSessionId);
-      reverseMap.delete(companionSessionId);
+      // Defer cleanup to the next microtask to avoid unsub from inside its own callback
+      Promise.resolve().then(() => {
+        this.cleanupRelay(companionSessionId);
+        this.sessionMap.delete(linearSessionId);
+        this.reverseMap.delete(companionSessionId);
+      });
     });
     cleanups.push(unsubResult);
 
-    sessionCleanups.set(companionSessionId, cleanups);
+    this.sessionCleanups.set(companionSessionId, cleanups);
   }
 
   /** Clean up listeners for a session. */
   private cleanupRelay(companionSessionId: string): void {
-    const cleanups = sessionCleanups.get(companionSessionId);
+    const cleanups = this.sessionCleanups.get(companionSessionId);
     if (cleanups) {
       cleanups.forEach((fn) => fn());
-      sessionCleanups.delete(companionSessionId);
+      this.sessionCleanups.delete(companionSessionId);
     }
   }
 
@@ -255,10 +265,10 @@ export class LinearAgentBridge {
 
   /** Clean up all session mappings and listeners. */
   shutdown(): void {
-    for (const [companionSessionId] of sessionCleanups) {
+    for (const [companionSessionId] of this.sessionCleanups) {
       this.cleanupRelay(companionSessionId);
     }
-    sessionMap.clear();
-    reverseMap.clear();
+    this.sessionMap.clear();
+    this.reverseMap.clear();
   }
 }

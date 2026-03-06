@@ -232,7 +232,7 @@ describe("LinearAgentBridge", () => {
       expect(wsBridge.injectUserMessage).toHaveBeenCalledWith("comp-sess-1", "What's the status?");
     });
 
-    it("creates new session when Companion session is dead", async () => {
+    it("creates new session with follow-up message when Companion session is dead", async () => {
       // Create a session first
       vi.mocked(agentStore.listAgents).mockReturnValue([testAgent] as ReturnType<typeof agentStore.listAgents>);
       vi.mocked(executor.executeAgent).mockResolvedValue({ sessionId: "comp-sess-1" } as never);
@@ -246,20 +246,30 @@ describe("LinearAgentBridge", () => {
 
       await bridge.handleEvent(makePromptedEvent("linear-session-1", "Follow up?"));
 
-      // Should launch a new session instead of injecting
-      expect(executor.executeAgent).toHaveBeenCalled();
+      // Should launch a new session with the follow-up message as prompt context
+      expect(executor.executeAgent).toHaveBeenCalledWith(
+        "agent-1",
+        "Follow up?",
+        expect.objectContaining({ triggerType: "linear" }),
+      );
       expect(wsBridge.injectUserMessage).not.toHaveBeenCalled();
     });
 
-    it("creates new session when no mapping exists for prompted event", async () => {
-      // Send prompted event without a prior created event
+    it("creates new session with follow-up message when no mapping exists", async () => {
+      // Send prompted event without a prior created event — the user's
+      // message (agentActivity.body) should be passed as promptContext
+      // to the new session so the message is not silently dropped.
       vi.mocked(agentStore.listAgents).mockReturnValue([testAgent] as ReturnType<typeof agentStore.listAgents>);
       vi.mocked(executor.executeAgent).mockResolvedValue({ sessionId: "comp-sess-new" } as never);
 
       await bridge.handleEvent(makePromptedEvent("unknown-session", "help"));
 
-      // Should fall back to handleCreated → launch new session
-      expect(executor.executeAgent).toHaveBeenCalled();
+      // Should fall back to handleCreated with the follow-up message as prompt
+      expect(executor.executeAgent).toHaveBeenCalledWith(
+        "agent-1",
+        "help",
+        expect.objectContaining({ triggerType: "linear" }),
+      );
     });
   });
 

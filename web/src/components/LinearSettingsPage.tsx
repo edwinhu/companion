@@ -787,9 +787,9 @@ export function LinearSettingsPage({ embedded = false }: LinearSettingsPageProps
                     setOauthError(e instanceof Error ? e.message : String(e));
                   }
                 }}
-                disabled={!oauthConfigured && !oauthClientId.trim()}
+                disabled={!oauthConfigured || savingOauth}
                 className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-                  !oauthConfigured && !oauthClientId.trim()
+                  !oauthConfigured || savingOauth
                     ? "bg-cc-hover text-cc-muted cursor-not-allowed"
                     : "bg-violet-600 hover:bg-violet-700 text-white cursor-pointer"
                 }`}

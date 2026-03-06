@@ -399,4 +399,21 @@ describe("LinearSettingsPage — OAuth Agent App section", () => {
     const saveBtn = screen.getByRole("button", { name: "Save Credentials" });
     expect(saveBtn).toBeDisabled();
   });
+
+  it("disables Install to Workspace when credentials are not persisted on server", async () => {
+    // Verifies that typing a Client ID locally does NOT enable Install —
+    // only server-side oauthConfigured makes the button clickable.
+    // This prevents confusing 400 errors when the user hasn't saved yet.
+    render(<LinearSettingsPage />);
+    await screen.findByText("Linear Agent App");
+
+    // Type a client ID locally — but settings.linearOAuthConfigured is false
+    fireEvent.change(screen.getByLabelText("Client ID"), {
+      target: { value: "my-client-id" },
+    });
+
+    // Install button should still be disabled because credentials aren't persisted
+    const installBtn = screen.getByRole("button", { name: "Install to Workspace" });
+    expect(installBtn).toBeDisabled();
+  });
 });

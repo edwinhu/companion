@@ -109,13 +109,16 @@ async function checkNeedsOperatorMode(binary: string): Promise<boolean> {
 }
 
 /**
- * Check if a hostname resolves via public DNS.
- * Used to detect if Funnel's public DNS records are actually set up.
+ * Check if a hostname resolves via public DNS (Google 8.8.8.8).
+ * We explicitly use a public resolver to avoid Tailscale's MagicDNS
+ * returning private CGNAT addresses (100.64.x.x) for .ts.net hostnames.
  */
 async function checkFunnelDnsResolves(hostname: string): Promise<boolean> {
   try {
-    const { resolve4 } = await import("node:dns/promises");
-    const addresses = await resolve4(hostname);
+    const { Resolver } = await import("node:dns/promises");
+    const resolver = new Resolver();
+    resolver.setServers(["8.8.8.8"]);
+    const addresses = await resolver.resolve4(hostname);
     return addresses.length > 0;
   } catch {
     return false;
@@ -297,7 +300,7 @@ export async function startFunnel(port: number): Promise<TailscaleStatus> {
     await execAsync(binary, ["funnel", "--bg", String(port)]);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    const isPermissionError = /permission|sudo|access denied/i.test(message);
+    const isPermissionError = process.platform === "linux" && /permission|sudo|access denied/i.test(message);
     return {
       installed: true, binaryPath: binary, connected: true, dnsName,
       funnelActive: false, funnelUrl: null,
@@ -311,10 +314,9 @@ export async function startFunnel(port: number): Promise<TailscaleStatus> {
   // Verify it's running and get the URL
   const { active, funnelUrl } = await parseFunnelStatus(binary, port);
 
-  // Check if the hostname resolves publicly (non-blocking warning)
-  const dnsWarning = dnsName && !(await checkFunnelDnsResolves(dnsName))
-    ? "DNS for this hostname is not resolving publicly. Ensure Funnel is enabled in your Tailscale admin console (admin.tailscale.com \u2192 Access Controls \u2192 nodeAttrs). DNS propagation can take up to 10 minutes on first use."
-    : undefined;
+  // DNS reachability is NOT checked here — it takes seconds to minutes for
+  // Tailscale to provision public DNS records after first enablement.
+  // The check runs in getTailscaleStatus() on subsequent polls instead.
 
   if (!active || !funnelUrl) {
     // Funnel command succeeded but we can't detect it yet — construct URL from DNS name
@@ -322,7 +324,7 @@ export async function startFunnel(port: number): Promise<TailscaleStatus> {
     if (constructedUrl) {
       updateSettings({ publicUrl: constructedUrl });
       persistState({ wasActive: true, port, funnelUrl: constructedUrl, activatedAt: Date.now() });
-      return { installed: true, binaryPath: binary, connected: true, dnsName, funnelActive: true, funnelUrl: constructedUrl, error: null, ...(dnsWarning && { warning: dnsWarning }) };
+      return { installed: true, binaryPath: binary, connected: true, dnsName, funnelActive: true, funnelUrl: constructedUrl, error: null };
     }
     return { installed: true, binaryPath: binary, connected: true, dnsName, funnelActive: false, funnelUrl: null, error: "Funnel started but could not determine URL" };
   }
@@ -331,7 +333,7 @@ export async function startFunnel(port: number): Promise<TailscaleStatus> {
   persistState({ wasActive: true, port, funnelUrl, activatedAt: Date.now() });
   console.log(`[tailscale] Funnel started: ${funnelUrl} → localhost:${port}`);
 
-  return { installed: true, binaryPath: binary, connected: true, dnsName, funnelActive: true, funnelUrl, error: null, ...(dnsWarning && { warning: dnsWarning }) };
+  return { installed: true, binaryPath: binary, connected: true, dnsName, funnelActive: true, funnelUrl, error: null };
 }
 
 /**

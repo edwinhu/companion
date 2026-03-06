@@ -488,6 +488,44 @@ describe("TailscalePage", () => {
     });
   });
 
+  // publicUrl is not set in store when warning is present
+  it("does not set publicUrl when DNS warning is present", async () => {
+    const user = userEvent.setup();
+
+    mockApi.getTailscaleStatus.mockResolvedValue({
+      installed: true,
+      binaryPath: "/usr/bin/tailscale",
+      connected: true,
+      dnsName: "my-machine.ts.net",
+      funnelActive: false,
+      funnelUrl: null,
+      error: null,
+    });
+
+    mockApi.startTailscaleFunnel.mockResolvedValue({
+      installed: true,
+      binaryPath: "/usr/bin/tailscale",
+      connected: true,
+      dnsName: "my-machine.ts.net",
+      funnelActive: true,
+      funnelUrl: "https://my-machine.ts.net",
+      error: null,
+      warning: "DNS for this hostname is not resolving publicly.",
+    });
+
+    render(<TailscalePage embedded />);
+
+    const enableBtn = await screen.findByRole("button", { name: /enable https/i });
+    await user.click(enableBtn);
+
+    await waitFor(() => {
+      expect(mockApi.startTailscaleFunnel).toHaveBeenCalledTimes(1);
+    });
+
+    // publicUrl should NOT be set when there's a DNS warning
+    expect(mockSetPublicUrl).not.toHaveBeenCalled();
+  });
+
   // DNS warning shows when funnel is active but hostname doesn't resolve
   it("shows DNS warning panel when status has a warning", async () => {
     mockApi.getTailscaleStatus.mockResolvedValue({

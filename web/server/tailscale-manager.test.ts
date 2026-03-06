@@ -1,10 +1,13 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 
-// Mock dns/promises for checkFunnelDnsResolves
+// Mock dns/promises for checkFunnelDnsResolves (uses Resolver with public DNS)
 const mockResolve4 = vi.fn();
 vi.mock("node:dns/promises", () => ({
-  resolve4: (...args: unknown[]) => mockResolve4(...args),
+  Resolver: class {
+    setServers() { /* no-op */ }
+    resolve4(...args: unknown[]) { return mockResolve4(...args); }
+  },
 }));
 
 // ── Mocks ───────────────────────────────────────────────────────────────────
@@ -335,7 +338,11 @@ describe("startFunnel", () => {
     expect(mockUpdateSettings).toHaveBeenCalledWith({ publicUrl: "https://my-machine.tail1234.ts.net" });
   });
 
-  it("returns needsOperatorMode and clean message on permission failure", async () => {
+  it("returns needsOperatorMode and clean message on permission failure (Linux)", async () => {
+    // Reactive permission detection is Linux-only to avoid false positives on macOS
+    const origPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+
     mockResolveBinary.mockReturnValue("/usr/bin/tailscale");
     enqueueSpawnSuccess(CONNECTED_STATUS_JSON);
     // funnel command fails with permission error
@@ -346,20 +353,41 @@ describe("startFunnel", () => {
     expect(result.error).toBe("Tailscale requires operator mode on Linux to manage Funnel.");
     expect(result.needsOperatorMode).toBe(true);
     expect(result.funnelActive).toBe(false);
+
+    Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
   });
 
-  it("includes DNS warning when hostname does not resolve after start", async () => {
+  it("does not set needsOperatorMode on permission failure on macOS", async () => {
+    // On macOS, permission errors are not operator mode related
+    const origPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
+
+    mockResolveBinary.mockReturnValue("/usr/bin/tailscale");
+    enqueueSpawnSuccess(CONNECTED_STATUS_JSON);
+    enqueueSpawnFailure("access denied: permission required");
+
+    const result = await startFunnel(3456);
+
+    expect(result.error).toContain("Failed to start Funnel");
+    expect(result.needsOperatorMode).toBeUndefined();
+    expect(result.funnelActive).toBe(false);
+
+    Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
+  });
+
+  it("does not check DNS immediately after start (deferred to status polls)", async () => {
+    // DNS check is deferred to getTailscaleStatus() to avoid false warnings
+    // during DNS propagation after first enablement.
     mockResolveBinary.mockReturnValue("/usr/bin/tailscale");
     enqueueSpawnSuccess(CONNECTED_STATUS_JSON);
     enqueueSpawnSuccess(""); // funnel command succeeds
     enqueueSpawnSuccess(FUNNEL_ACTIVE_JSON);
-    mockResolve4.mockRejectedValueOnce(new Error("NXDOMAIN"));
 
     const result = await startFunnel(3456);
 
     expect(result.funnelActive).toBe(true);
     expect(result.funnelUrl).toBe("https://my-machine.tail1234.ts.net");
-    expect(result.warning).toContain("not resolving publicly");
+    expect(result.warning).toBeUndefined();
   });
 
   it("constructs URL from DNS name when serve status is empty", async () => {

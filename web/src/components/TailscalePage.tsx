@@ -31,7 +31,7 @@ export function TailscalePage({ embedded = false }: TailscalePageProps) {
     try {
       const result = await api.startTailscaleFunnel();
       setStatus(result);
-      if (result.funnelUrl && !result.error) {
+      if (result.funnelUrl && !result.error && !result.warning) {
         useStore.getState().setPublicUrl(result.funnelUrl);
       }
     } catch (err: unknown) {

@@ -38,7 +38,10 @@ export function IntegrationsPage({ embedded = false }: IntegrationsPageProps) {
 
   useEffect(() => {
     // Load Tailscale status (non-blocking)
-    api.getTailscaleStatus().then(setTailscaleStatus).catch(() => {});
+    api.getTailscaleStatus().then(setTailscaleStatus).catch(() => setTailscaleStatus({
+      installed: false, binaryPath: null, connected: false, dnsName: null,
+      funnelActive: false, funnelUrl: null, error: "Could not reach Tailscale status endpoint",
+    }));
 
     // Load Linear integration status
     api.getSettings()

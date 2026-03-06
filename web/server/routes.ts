@@ -1609,7 +1609,7 @@ export function createRoutes(
 
   // ─── Tailscale ──────────────────────────────────────────────────────
 
-  if (port) registerTailscaleRoutes(api, port);
+  if (port !== undefined) registerTailscaleRoutes(api, port);
 
   // ─── Linear ────────────────────────────────────────────────────────
 

@@ -296,7 +296,10 @@ export async function stopFunnel(port: number): Promise<TailscaleStatus> {
     await execAsync(binary, ["funnel", String(port), "off"]);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    return { installed: true, binaryPath: binary, connected: true, dnsName: null, funnelActive: false, funnelUrl: null, error: `Failed to stop Funnel: ${message}` };
+    // Re-query actual state — funnel is likely still running after a failed stop
+    const { connected, dnsName } = await parseConnectionStatus(binary).catch(() => ({ connected: true, dnsName: null as string | null }));
+    const { active, funnelUrl } = await parseFunnelStatus(binary, port).catch(() => ({ active: true, funnelUrl: null as string | null }));
+    return { installed: true, binaryPath: binary, connected, dnsName, funnelActive: active, funnelUrl, error: `Failed to stop Funnel: ${message}` };
   }
 
   clearPersistedState();

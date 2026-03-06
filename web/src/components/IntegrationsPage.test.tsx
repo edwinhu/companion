@@ -313,6 +313,17 @@ describe("IntegrationsPage", () => {
     expect(screen.getByText("HTTPS access in one click")).toBeInTheDocument();
   });
 
+  it("shows fallback status when getTailscaleStatus fails", async () => {
+    mockApi.getTailscaleStatus.mockRejectedValue(new Error("Network error"));
+
+    render(<IntegrationsPage />);
+
+    await screen.findByText("Linear");
+
+    // Should show "Not installed" (fallback status) instead of staying on "Checking..."
+    await screen.findByText("Not installed");
+  });
+
   it("navigates to Tailscale settings page when gear button is clicked", async () => {
     render(<IntegrationsPage />);
 

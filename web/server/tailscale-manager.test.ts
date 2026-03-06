@@ -332,14 +332,21 @@ describe("stopFunnel", () => {
     expect(mockUpdateSettings).not.toHaveBeenCalled();
   });
 
-  it("returns error when stop command fails", async () => {
+  it("returns error and re-queries actual state when stop command fails", async () => {
     mockResolveBinary.mockReturnValue("/usr/bin/tailscale");
     mockExistsSync.mockReturnValue(false);
     enqueueSpawnFailure("stop failed");
+    // After failure, stopFunnel re-queries connection + funnel status
+    enqueueSpawnSuccess(CONNECTED_STATUS_JSON);
+    enqueueSpawnSuccess(FUNNEL_ACTIVE_JSON);
 
     const result = await stopFunnel(3456);
 
     expect(result.error).toContain("Failed to stop Funnel");
+    // Should reflect actual state from re-query, not hardcoded values
+    expect(result.funnelActive).toBe(true);
+    expect(result.connected).toBe(true);
+    expect(result.dnsName).toBe("my-machine.tail1234.ts.net");
   });
 });
 

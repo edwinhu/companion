@@ -471,9 +471,12 @@ export class WsBridge {
     }
     session.cliSocket = null;
 
-    // Debounce: delay disconnect notification by 5s.
-    // CLI cycles its WebSocket every ~30s (close code 1000). Broadcasting
-    // cli_disconnected immediately causes browser UI flapping and spurious relaunches.
+    // Debounce: delay disconnect notification by 15s.
+    // CLI cycles its WebSocket every ~30s (close code 1000) and uses exponential
+    // backoff (1s → 2s → 4s → 8s → …) on reconnect. After rapid successive
+    // disconnects, the backoff can exceed 5s, so we use 15s to cover the worst
+    // case (8s backoff + connection overhead).
+    const DISCONNECT_DEBOUNCE_MS = Number(process.env.COMPANION_DISCONNECT_DEBOUNCE_MS || "15000");
     const existing = this.disconnectTimers.get(sessionId);
     if (existing) clearTimeout(existing);
     this.disconnectTimers.set(sessionId, setTimeout(() => {
@@ -485,7 +488,7 @@ export class WsBridge {
         this.broadcastToBrowsers(session, { type: "permission_cancelled", request_id: reqId });
       }
       session.pendingPermissions.clear();
-    }, 5000));
+    }, DISCONNECT_DEBOUNCE_MS));
   }
 
   // ── Browser WebSocket handlers ──────────────────────────────────────────

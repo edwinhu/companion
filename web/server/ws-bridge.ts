@@ -62,6 +62,8 @@ import { getEffectiveAiValidation } from "./ai-validation-settings.js";
 export class WsBridge {
   private static readonly EVENT_BUFFER_LIMIT = 600;
   private static readonly PROCESSED_CLIENT_MSG_ID_LIMIT = 1000;
+  private static readonly CLI_DEDUP_WINDOW = 200; // track last N CLI message hashes
+  private disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private static readonly IDEMPOTENT_BROWSER_MESSAGE_TYPES = new Set<string>([
     "user_message",
     "permission_response",
@@ -207,6 +209,8 @@ export class WsBridge {
         processedClientMessageIdSet: new Set(
           Array.isArray(p.processedClientMessageIds) ? p.processedClientMessageIds : [],
         ),
+        recentCLIMessageHashes: [],
+        recentCLIMessageHashSet: new Set(),
       };
       session.state.backend_type = session.backendType;
       // Resolve git info for restored sessions (may have been persisted without it)
@@ -307,6 +311,8 @@ export class WsBridge {
         lastAckSeq: 0,
         processedClientMessageIds: [],
         processedClientMessageIdSet: new Set(),
+        recentCLIMessageHashes: [],
+        recentCLIMessageHashSet: new Set(),
       };
       this.sessions.set(sessionId, session);
     } else if (backendType) {
@@ -410,7 +416,14 @@ export class WsBridge {
   handleCLIOpen(ws: ServerWebSocket<SocketData>, sessionId: string) {
     const session = this.getOrCreateSession(sessionId);
     session.cliSocket = ws;
-    console.log(`[ws-bridge] CLI connected for session ${sessionId}`);
+    // Cancel any pending disconnect debounce timer — CLI reconnected in time
+    if (this.disconnectTimers.has(sessionId)) {
+      clearTimeout(this.disconnectTimers.get(sessionId)!);
+      this.disconnectTimers.delete(sessionId);
+      console.log(`[ws-bridge] CLI reconnected for ${sessionId} (disconnect debounce cancelled)`);
+    } else {
+      console.log(`[ws-bridge] CLI connected for session ${sessionId}`);
+    }
     this.broadcastToBrowsers(session, { type: "cli_connected" });
 
     // Flush any messages queued while waiting for the CLI WebSocket.
@@ -446,6 +459,24 @@ export class WsBridge {
         console.warn(`[ws-bridge] Failed to parse CLI message: ${line.substring(0, 200)}`);
         continue;
       }
+
+      // Deduplicate CLI messages: on WS reconnect, CLI replays in-flight messages.
+      // Use a rolling hash set (like browser-side processedClientMessageIds).
+      // Only dedup history-backed types that would cause duplicate entries.
+      if (msg.type === "assistant" || msg.type === "result" || msg.type === "system") {
+        const hash = Bun.hash(line).toString(36);
+        if (session.recentCLIMessageHashSet.has(hash)) {
+          continue; // skip duplicate
+        }
+        session.recentCLIMessageHashes.push(hash);
+        session.recentCLIMessageHashSet.add(hash);
+        // Evict oldest entries beyond window
+        while (session.recentCLIMessageHashes.length > WsBridge.CLI_DEDUP_WINDOW) {
+          const old = session.recentCLIMessageHashes.shift()!;
+          session.recentCLIMessageHashSet.delete(old);
+        }
+      }
+
       this.routeCLIMessage(session, msg);
     }
   }
@@ -455,15 +486,28 @@ export class WsBridge {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    session.cliSocket = null;
-    console.log(`[ws-bridge] CLI disconnected for session ${sessionId}`);
-    this.broadcastToBrowsers(session, { type: "cli_disconnected" });
-
-    // Cancel any pending permission requests
-    for (const [reqId] of session.pendingPermissions) {
-      this.broadcastToBrowsers(session, { type: "permission_cancelled", request_id: reqId });
+    // Guard: ignore close events from stale sockets (new WS opened before old closed)
+    if (session.cliSocket !== ws) {
+      console.log(`[ws-bridge] Stale CLI WS closed for ${sessionId}, ignoring`);
+      return;
     }
-    session.pendingPermissions.clear();
+    session.cliSocket = null;
+
+    // Debounce: delay disconnect notification by 5s.
+    // CLI cycles its WebSocket every ~30s (close code 1000). Broadcasting
+    // cli_disconnected immediately causes browser UI flapping and spurious relaunches.
+    const existing = this.disconnectTimers.get(sessionId);
+    if (existing) clearTimeout(existing);
+    this.disconnectTimers.set(sessionId, setTimeout(() => {
+      this.disconnectTimers.delete(sessionId);
+      if (session.cliSocket) return; // CLI reconnected during grace period
+      console.log(`[ws-bridge] CLI disconnect confirmed for ${sessionId}`);
+      this.broadcastToBrowsers(session, { type: "cli_disconnected" });
+      for (const [reqId] of session.pendingPermissions) {
+        this.broadcastToBrowsers(session, { type: "permission_cancelled", request_id: reqId });
+      }
+      session.pendingPermissions.clear();
+    }, 5000));
   }
 
   // ── Browser WebSocket handlers ──────────────────────────────────────────

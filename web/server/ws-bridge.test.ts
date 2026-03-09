@@ -1,5 +1,21 @@
 import { vi } from "vitest";
 
+// Stub Bun global for vitest (runs under Node, not Bun).
+// Bun.hash is used for CLI message deduplication in ws-bridge.ts.
+// A simple string hash is sufficient for test determinism.
+if (typeof globalThis.Bun === "undefined") {
+  (globalThis as any).Bun = {
+    hash(input: string | Uint8Array): number {
+      const s = typeof input === "string" ? input : new TextDecoder().decode(input);
+      let h = 0;
+      for (let i = 0; i < s.length; i++) {
+        h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+      }
+      return h >>> 0; // unsigned 32-bit
+    },
+  };
+}
+
 const mockExecSync = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", () => ({ execSync: mockExecSync }));
 vi.mock("node:crypto", () => ({ randomUUID: () => "test-uuid" }));
@@ -3552,5 +3568,74 @@ describe("sendToCLI error path", () => {
     );
 
     spy.mockRestore();
+  });
+});
+
+// ─── CLI message deduplication (Bun.hash-based) ─────────────────────────────
+
+describe("CLI message deduplication", () => {
+  function setupSession() {
+    const cli = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg());
+    browser.send.mockClear();
+    return { cli, browser };
+  }
+
+  it("filters duplicate assistant messages (same content replayed on reconnect)", () => {
+    const { cli, browser } = setupSession();
+    const msg = JSON.stringify({ type: "assistant", message: { content: "hello world" } });
+
+    // First send — should forward to browser
+    bridge.handleCLIMessage(cli, msg);
+    expect(browser.send).toHaveBeenCalledTimes(1);
+
+    // Same message again (simulates CLI replay on WS reconnect) — should be filtered
+    browser.send.mockClear();
+    bridge.handleCLIMessage(cli, msg);
+    expect(browser.send).not.toHaveBeenCalled();
+  });
+
+  it("forwards non-duplicate assistant messages normally", () => {
+    const { cli, browser } = setupSession();
+    const msg1 = JSON.stringify({ type: "assistant", message: { content: "first" } });
+    const msg2 = JSON.stringify({ type: "assistant", message: { content: "second" } });
+
+    bridge.handleCLIMessage(cli, msg1);
+    bridge.handleCLIMessage(cli, msg2);
+
+    expect(browser.send).toHaveBeenCalledTimes(2);
+  });
+
+  it("evicts oldest hashes when window is exceeded", () => {
+    const { cli, browser } = setupSession();
+
+    // Send CLI_DEDUP_WINDOW + 1 unique messages to push the first one out
+    const WINDOW = 200; // matches WsBridge.CLI_DEDUP_WINDOW
+    for (let i = 0; i <= WINDOW; i++) {
+      bridge.handleCLIMessage(
+        cli,
+        JSON.stringify({ type: "assistant", message: { content: `msg-${i}` } }),
+      );
+    }
+
+    // The first message's hash should have been evicted — resending it should work
+    browser.send.mockClear();
+    const firstMsg = JSON.stringify({ type: "assistant", message: { content: "msg-0" } });
+    bridge.handleCLIMessage(cli, firstMsg);
+    expect(browser.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not deduplicate non-history types (stream_event always forwarded)", () => {
+    const { cli, browser } = setupSession();
+    const msg = JSON.stringify({ type: "stream_event", event: "content_block_delta", delta: { text: "hi" } });
+
+    bridge.handleCLIMessage(cli, msg);
+    bridge.handleCLIMessage(cli, msg);
+
+    // Both should be forwarded — stream_event is not subject to dedup
+    expect(browser.send).toHaveBeenCalledTimes(2);
   });
 });

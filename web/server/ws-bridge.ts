@@ -347,6 +347,8 @@ export class WsBridge {
   }
 
   removeSession(sessionId: string) {
+    const timer = this.disconnectTimers.get(sessionId);
+    if (timer) { clearTimeout(timer); this.disconnectTimers.delete(sessionId); }
     this.sessions.delete(sessionId);
     this.autoNamingAttempted.delete(sessionId);
     this.assistantMessageListeners.delete(sessionId);
@@ -358,6 +360,8 @@ export class WsBridge {
    * Close all sockets (CLI + browsers) for a session and remove it.
    */
   closeSession(sessionId: string) {
+    const timer = this.disconnectTimers.get(sessionId);
+    if (timer) { clearTimeout(timer); this.disconnectTimers.delete(sessionId); }
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
@@ -554,7 +558,9 @@ export class WsBridge {
       ? !!session.codexAdapter
       : !!session.cliSocket;
 
-    if (!backendConnected) {
+    if (!backendConnected && !this.disconnectTimers.has(sessionId)) {
+      // Only signal disconnection if we're not within the debounce window
+      // (CLI may be mid-reconnect — avoid UI flap and spurious relaunch)
       this.sendToBrowser(ws, { type: "cli_disconnected" });
       if (this.onCLIRelaunchNeeded) {
         console.log(`[ws-bridge] Browser connected but backend is dead for session ${sessionId}, requesting relaunch`);

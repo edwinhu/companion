@@ -738,6 +738,83 @@ describe("CLI handlers", () => {
     expect(cancelMsg).toBeDefined();
     expect(cancelMsg.request_id).toBe("req-1");
   });
+
+  it("handleCLIClose: ignores stale socket close (new WS opened before old closed)", () => {
+    const cli1 = makeCliSocket("s1");
+    const cli2 = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+
+    bridge.handleCLIOpen(cli1, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+
+    // CLI reconnects — new socket opens before old one closes
+    bridge.handleCLIOpen(cli2, "s1");
+    browser.send.mockClear();
+
+    // Stale close event fires from cli1
+    bridge.handleCLIClose(cli1);
+
+    // cliSocket should still be cli2, not null
+    const session = bridge.getSession("s1")!;
+    expect(session.cliSocket).toBe(cli2);
+    expect(bridge.isCliConnected("s1")).toBe(true);
+
+    // No cli_disconnected should be broadcast
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    expect(calls.find((c: any) => c.type === "cli_disconnected")).toBeUndefined();
+  });
+
+  it("handleCLIClose: debounces disconnect notification", () => {
+    vi.useFakeTimers();
+    const cli = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleCLIClose(cli);
+
+    // Immediately after close: no cli_disconnected broadcast yet
+    const immediateCalls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    expect(immediateCalls.find((c: any) => c.type === "cli_disconnected")).toBeUndefined();
+
+    // After debounce period: cli_disconnected should be broadcast
+    vi.advanceTimersByTime(16_000);
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    expect(calls).toContainEqual(expect.objectContaining({ type: "cli_disconnected" }));
+
+    vi.useRealTimers();
+  });
+
+  it("handleCLIClose: debounce cancelled by reconnect", () => {
+    vi.useFakeTimers();
+    const cli1 = makeCliSocket("s1");
+    const cli2 = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+
+    bridge.handleCLIOpen(cli1, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    // CLI disconnects
+    bridge.handleCLIClose(cli1);
+
+    // CLI reconnects within debounce window
+    vi.advanceTimersByTime(5_000);
+    bridge.handleCLIOpen(cli2, "s1");
+    browser.send.mockClear();
+
+    // Debounce timer fires — should NOT broadcast disconnect
+    vi.advanceTimersByTime(16_000);
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    expect(calls.find((c: any) => c.type === "cli_disconnected")).toBeUndefined();
+    expect(bridge.isCliConnected("s1")).toBe(true);
+
+    vi.useRealTimers();
+  });
 });
 
 // ─── Browser handlers ────────────────────────────────────────────────────────

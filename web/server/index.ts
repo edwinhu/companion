@@ -156,6 +156,14 @@ wsBridge.onCLIRelaunchNeededCallback(async (sessionId) => {
   }
 });
 
+// Kill CLI when idle with no browsers for 20 minutes
+wsBridge.onIdleKillCallback(async (sessionId) => {
+  const info = launcher.getSession(sessionId);
+  if (!info || info.archived) return;
+  console.log(`[server] Idle-killing CLI for session ${sessionId} (no browsers, no activity)`);
+  await launcher.kill(sessionId);
+});
+
 // Auto-generate session title after first turn completes
 wsBridge.onFirstTurnCompletedCallback(async (sessionId, firstUserMessage) => {
   // Don't overwrite a name that was already set (manual rename or prior auto-name)

@@ -63,6 +63,9 @@ export class WsBridge {
   private static readonly EVENT_BUFFER_LIMIT = 600;
   private static readonly PROCESSED_CLIENT_MSG_ID_LIMIT = 1000;
   private static readonly CLI_DEDUP_WINDOW = 200; // track last N CLI message hashes
+  private static readonly DISCONNECT_DEBOUNCE_MS = Number(
+    process.env.COMPANION_DISCONNECT_DEBOUNCE_MS || "15000",
+  );
   private disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private idleKillTimers = new Map<string, ReturnType<typeof setInterval>>();
   private static readonly IDEMPOTENT_BROWSER_MESSAGE_TYPES = new Set<string>([
@@ -356,8 +359,7 @@ export class WsBridge {
   }
 
   removeSession(sessionId: string) {
-    const timer = this.disconnectTimers.get(sessionId);
-    if (timer) { clearTimeout(timer); this.disconnectTimers.delete(sessionId); }
+    this.cancelDisconnectTimer(sessionId);
     this.stopIdleKillWatchdog(sessionId);
     this.sessions.delete(sessionId);
     this.autoNamingAttempted.delete(sessionId);
@@ -370,8 +372,7 @@ export class WsBridge {
    * Close all sockets (CLI + browsers) for a session and remove it.
    */
   closeSession(sessionId: string) {
-    const timer = this.disconnectTimers.get(sessionId);
-    if (timer) { clearTimeout(timer); this.disconnectTimers.delete(sessionId); }
+    this.cancelDisconnectTimer(sessionId);
     this.stopIdleKillWatchdog(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -426,15 +427,22 @@ export class WsBridge {
     });
   }
 
+  /** Cancel a pending disconnect debounce timer for a session, if any. */
+  private cancelDisconnectTimer(sessionId: string): boolean {
+    const timer = this.disconnectTimers.get(sessionId);
+    if (!timer) return false;
+    clearTimeout(timer);
+    this.disconnectTimers.delete(sessionId);
+    return true;
+  }
+
   // ── CLI WebSocket handlers ──────────────────────────────────────────────
 
   handleCLIOpen(ws: ServerWebSocket<SocketData>, sessionId: string) {
     const session = this.getOrCreateSession(sessionId);
     session.cliSocket = ws;
     // Cancel any pending disconnect debounce timer — CLI reconnected in time
-    if (this.disconnectTimers.has(sessionId)) {
-      clearTimeout(this.disconnectTimers.get(sessionId)!);
-      this.disconnectTimers.delete(sessionId);
+    if (this.cancelDisconnectTimer(sessionId)) {
       console.log(`[ws-bridge] CLI reconnected for ${sessionId} (disconnect debounce cancelled)`);
     } else {
       console.log(`[ws-bridge] CLI connected for session ${sessionId}`);
@@ -513,7 +521,6 @@ export class WsBridge {
     // backoff (1s → 2s → 4s → 8s → …) on reconnect. After rapid successive
     // disconnects, the backoff can exceed 5s, so we use 15s to cover the worst
     // case (8s backoff + connection overhead).
-    const DISCONNECT_DEBOUNCE_MS = Number(process.env.COMPANION_DISCONNECT_DEBOUNCE_MS || "15000");
     const existing = this.disconnectTimers.get(sessionId);
     if (existing) clearTimeout(existing);
     this.disconnectTimers.set(sessionId, setTimeout(() => {
@@ -525,7 +532,7 @@ export class WsBridge {
         this.broadcastToBrowsers(session, { type: "permission_cancelled", request_id: reqId });
       }
       session.pendingPermissions.clear();
-    }, DISCONNECT_DEBOUNCE_MS));
+    }, WsBridge.DISCONNECT_DEBOUNCE_MS));
   }
 
   // ── Browser WebSocket handlers ──────────────────────────────────────────

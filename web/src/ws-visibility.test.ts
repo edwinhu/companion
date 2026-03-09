@@ -15,7 +15,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 // Mock WebSocket globally before ws.ts is imported
 const mockWsSend = vi.fn();
 const mockWsClose = vi.fn();
-let wsInstances: Array<{ onopen?: () => void; onclose?: () => void; onerror?: () => void; onmessage?: (e: any) => void }> = [];
+let wsInstances: Array<{ onopen?: (() => void) | null; onclose?: (() => void) | null; onerror?: (() => void) | null; onmessage?: ((e: any) => void) | null }> = [];
 
 class MockWebSocket {
   send = mockWsSend;

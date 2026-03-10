@@ -61,6 +61,7 @@ import { getEffectiveAiValidation } from "./ai-validation-settings.js";
 
 export class WsBridge {
   private static readonly EVENT_BUFFER_LIMIT = 600;
+  private static readonly MESSAGE_HISTORY_LIMIT = 2000; // cap conversation history per session
   private static readonly PROCESSED_CLIENT_MSG_ID_LIMIT = 1000;
   private static readonly CLI_DEDUP_WINDOW = 200; // track last N CLI message hashes
   private static readonly DISCONNECT_DEBOUNCE_MS = Number(
@@ -342,6 +343,17 @@ export class WsBridge {
 
   getAllSessions(): SessionState[] {
     return Array.from(this.sessions.values()).map((s) => s.state);
+  }
+
+  /** Return per-session memory stats for diagnostics. */
+  getSessionMemoryStats(): { id: string; browsers: number; historyLen: number; eventBufferLen: number; pendingMsgs: number }[] {
+    return Array.from(this.sessions.values()).map((s) => ({
+      id: s.id,
+      browsers: s.browserSockets.size,
+      historyLen: s.messageHistory.length,
+      eventBufferLen: s.eventBuffer.length,
+      pendingMsgs: s.pendingMessages.length,
+    }));
   }
 
   getCodexRateLimits(sessionId: string) {
@@ -917,6 +929,14 @@ export class WsBridge {
     // Unknown system subtypes are intentionally ignored until we map them.
   }
 
+  /** Append to messageHistory with cap to prevent unbounded memory growth. */
+  private appendHistory(session: Session, msg: BrowserIncomingMessage) {
+    session.messageHistory.push(msg);
+    if (session.messageHistory.length > WsBridge.MESSAGE_HISTORY_LIMIT) {
+      session.messageHistory.splice(0, session.messageHistory.length - WsBridge.MESSAGE_HISTORY_LIMIT);
+    }
+  }
+
   private forwardSystemEvent(
     session: Session,
     event: Extract<BrowserIncomingMessage, { type: "system_event" }>["event"],
@@ -929,7 +949,7 @@ export class WsBridge {
     };
 
     if (options.persistInHistory !== false) {
-      session.messageHistory.push(browserMsg);
+      this.appendHistory(session, browserMsg);
       this.persistSession(session);
     }
 
@@ -943,7 +963,7 @@ export class WsBridge {
       parent_tool_use_id: msg.parent_tool_use_id,
       timestamp: Date.now(),
     };
-    session.messageHistory.push(browserMsg);
+    this.appendHistory(session, browserMsg);
     this.broadcastToBrowsers(session, browserMsg);
     this.assistantMessageListeners.get(session.id)?.forEach((cb) => {
       try { cb(browserMsg); } catch (err) { console.error("[ws-bridge] Assistant listener error:", err); }
@@ -983,7 +1003,7 @@ export class WsBridge {
       type: "result",
       data: msg,
     };
-    session.messageHistory.push(browserMsg);
+    this.appendHistory(session, browserMsg);
     this.broadcastToBrowsers(session, browserMsg);
     this.resultListeners.get(session.id)?.forEach((cb) => {
       try {
@@ -1175,7 +1195,7 @@ export class WsBridge {
       // Store user messages in history for replay with stable ID for dedup on reconnect
       if (msg.type === "user_message") {
         const ts = Date.now();
-        session.messageHistory.push({
+        this.appendHistory(session, {
           type: "user_message",
           content: msg.content,
           timestamp: ts,
@@ -1291,7 +1311,7 @@ export class WsBridge {
   ) {
     // Store user message in history for replay with stable ID for dedup on reconnect
     const ts = Date.now();
-    session.messageHistory.push({
+    this.appendHistory(session, {
       type: "user_message",
       content: msg.content,
       timestamp: ts,

@@ -366,6 +366,24 @@ if (isRunningAsService()) {
   console.log("[server] Running as background service (auto-update available)");
 }
 
+// ── Memory diagnostics ───────────────────────────────────────────────────────
+const MEMORY_LOG_INTERVAL_MS = 5 * 60_000; // every 5 minutes
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const mb = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
+  const sessionStats = wsBridge.getSessionMemoryStats();
+  const totalHistory = sessionStats.reduce((sum, s) => sum + s.historyLen, 0);
+  const topSessions = sessionStats
+    .sort((a, b) => b.historyLen - a.historyLen)
+    .slice(0, 3)
+    .map((s) => `${s.id.slice(0, 8)}(h=${s.historyLen},b=${s.browsers})`)
+    .join(", ");
+  console.log(
+    `[mem] rss=${mb(mem.rss)}MB heap=${mb(mem.heapUsed)}/${mb(mem.heapTotal)}MB ` +
+    `ext=${mb(mem.external)}MB | ${sessionStats.length} sessions, ${totalHistory} history msgs | top: ${topSessions || "none"}`,
+  );
+}, MEMORY_LOG_INTERVAL_MS);
+
 // ── Graceful shutdown — persist container state ──────────────────────────────
 function gracefulShutdown() {
   console.log("[server] Persisting container state before shutdown...");

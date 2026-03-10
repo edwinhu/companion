@@ -63,7 +63,7 @@ export class WsBridge {
   private static readonly EVENT_BUFFER_LIMIT = 600;
   private static readonly MESSAGE_HISTORY_LIMIT = 2000; // cap conversation history per session
   private static readonly PROCESSED_CLIENT_MSG_ID_LIMIT = 1000;
-  private static readonly CLI_DEDUP_WINDOW = 200; // track last N CLI message hashes
+  private static readonly CLI_DEDUP_WINDOW = 2000; // track last N CLI message hashes (includes stream_events)
   private static readonly DISCONNECT_DEBOUNCE_MS = Number(
     process.env.COMPANION_DISCONNECT_DEBOUNCE_MS || "15000",
   );
@@ -497,7 +497,9 @@ export class WsBridge {
 
       // Deduplicate CLI messages: on WS reconnect, CLI replays in-flight messages.
       // Use a rolling hash set (like browser-side processedClientMessageIds).
-      // Only dedup history-backed types that would cause duplicate entries.
+      // Dedup assistant/result/system by content hash, and stream_event by uuid.
+      // stream_events are the bulk of replay traffic (~1000 per turn) and each
+      // carries a stable uuid that persists across reconnection replays.
       if (msg.type === "assistant" || msg.type === "result" || msg.type === "system") {
         const hash = Bun.hash(line).toString(36);
         if (session.recentCLIMessageHashSet.has(hash)) {
@@ -506,6 +508,16 @@ export class WsBridge {
         session.recentCLIMessageHashes.push(hash);
         session.recentCLIMessageHashSet.add(hash);
         // Evict oldest entries beyond window
+        while (session.recentCLIMessageHashes.length > WsBridge.CLI_DEDUP_WINDOW) {
+          const old = session.recentCLIMessageHashes.shift()!;
+          session.recentCLIMessageHashSet.delete(old);
+        }
+      } else if (msg.type === "stream_event" && msg.uuid) {
+        if (session.recentCLIMessageHashSet.has(msg.uuid)) {
+          continue; // skip duplicate stream_event
+        }
+        session.recentCLIMessageHashes.push(msg.uuid);
+        session.recentCLIMessageHashSet.add(msg.uuid);
         while (session.recentCLIMessageHashes.length > WsBridge.CLI_DEDUP_WINDOW) {
           const old = session.recentCLIMessageHashes.shift()!;
           session.recentCLIMessageHashSet.delete(old);

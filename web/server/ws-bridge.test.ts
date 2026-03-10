@@ -3623,7 +3623,7 @@ describe("CLI message deduplication", () => {
     const { cli, browser } = setupSession();
 
     // Send CLI_DEDUP_WINDOW + 1 unique messages to push the first one out
-    const WINDOW = 200; // matches WsBridge.CLI_DEDUP_WINDOW
+    const WINDOW = 2000; // matches WsBridge.CLI_DEDUP_WINDOW
     for (let i = 0; i <= WINDOW; i++) {
       bridge.handleCLIMessage(
         cli,
@@ -3638,14 +3638,40 @@ describe("CLI message deduplication", () => {
     expect(browser.send).toHaveBeenCalledTimes(1);
   });
 
-  it("does not deduplicate non-history types (stream_event always forwarded)", () => {
+  it("deduplicates stream_event messages with the same uuid on reconnect replay", () => {
     const { cli, browser } = setupSession();
-    const msg = JSON.stringify({ type: "stream_event", event: "content_block_delta", delta: { text: "hi" } });
+    const uuid = "cc6aeb12-1aad-4126-8ad2-03bad206e9fe";
+    const msg = JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "thinking_delta", text: "thinking..." } },
+      parent_tool_use_id: null,
+      uuid,
+      session_id: "test-cli-session",
+    });
+
+    // First send — should forward to browser
+    bridge.handleCLIMessage(cli, msg);
+    expect(browser.send).toHaveBeenCalledTimes(1);
+
+    // Same uuid again (simulates CLI replay on WS reconnect) — should be filtered
+    browser.send.mockClear();
+    bridge.handleCLIMessage(cli, msg);
+    expect(browser.send).not.toHaveBeenCalled();
+  });
+
+  it("forwards stream_event messages without uuid (no dedup possible)", () => {
+    const { cli, browser } = setupSession();
+    // stream_event without uuid — cannot dedup, must forward
+    const msg = JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "hi" } },
+      parent_tool_use_id: null,
+    });
 
     bridge.handleCLIMessage(cli, msg);
     bridge.handleCLIMessage(cli, msg);
 
-    // Both should be forwarded — stream_event is not subject to dedup
+    // Both should be forwarded — no uuid means no dedup
     expect(browser.send).toHaveBeenCalledTimes(2);
   });
 });

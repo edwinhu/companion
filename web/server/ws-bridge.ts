@@ -61,14 +61,12 @@ import { getEffectiveAiValidation } from "./ai-validation-settings.js";
 
 export class WsBridge {
   private static readonly EVENT_BUFFER_LIMIT = 600;
-  private static readonly MESSAGE_HISTORY_LIMIT = 2000; // cap conversation history per session
   private static readonly PROCESSED_CLIENT_MSG_ID_LIMIT = 1000;
   private static readonly CLI_DEDUP_WINDOW = 2000; // track last N CLI message hashes (includes stream_events)
   private static readonly DISCONNECT_DEBOUNCE_MS = Number(
     process.env.COMPANION_DISCONNECT_DEBOUNCE_MS || "15000",
   );
   private disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private idleKillTimers = new Map<string, ReturnType<typeof setInterval>>();
   private static readonly IDEMPOTENT_BROWSER_MESSAGE_TYPES = new Set<string>([
     "user_message",
     "permission_response",
@@ -87,7 +85,6 @@ export class WsBridge {
   private onCLISessionId: ((sessionId: string, cliSessionId: string) => void) | null = null;
   private onCLIRelaunchNeeded: ((sessionId: string) => void) | null = null;
   private onFirstTurnCompleted: ((sessionId: string, firstUserMessage: string) => void) | null = null;
-  private onIdleKill: ((sessionId: string) => void) | null = null;
   private autoNamingAttempted = new Set<string>();
   private userMsgCounter = 0;
   private onGitInfoReady: ((sessionId: string, cwd: string, branch: string) => void) | null = null;
@@ -115,11 +112,6 @@ export class WsBridge {
   /** Register a callback for when a session completes its first turn. */
   onFirstTurnCompletedCallback(cb: (sessionId: string, firstUserMessage: string) => void): void {
     this.onFirstTurnCompleted = cb;
-  }
-
-  /** Register a callback for when a CLI should be killed due to idle + no browsers. */
-  onIdleKillCallback(cb: (sessionId: string) => void): void {
-    this.onIdleKill = cb;
   }
 
   /** Register a callback for when git info is resolved and branch is known. */
@@ -222,7 +214,6 @@ export class WsBridge {
         ),
         recentCLIMessageHashes: [],
         recentCLIMessageHashSet: new Set(),
-        lastCliActivityTs: Date.now(),
       };
       session.state.backend_type = session.backendType;
       // Resolve git info for restored sessions (may have been persisted without it)
@@ -325,7 +316,6 @@ export class WsBridge {
         processedClientMessageIdSet: new Set(),
         recentCLIMessageHashes: [],
         recentCLIMessageHashSet: new Set(),
-        lastCliActivityTs: Date.now(),
       };
       this.sessions.set(sessionId, session);
     } else if (backendType) {
@@ -372,7 +362,6 @@ export class WsBridge {
 
   removeSession(sessionId: string) {
     this.cancelDisconnectTimer(sessionId);
-    this.stopIdleKillWatchdog(sessionId);
     this.sessions.delete(sessionId);
     this.autoNamingAttempted.delete(sessionId);
     this.assistantMessageListeners.delete(sessionId);
@@ -385,7 +374,6 @@ export class WsBridge {
    */
   closeSession(sessionId: string) {
     this.cancelDisconnectTimer(sessionId);
-    this.stopIdleKillWatchdog(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
@@ -569,9 +557,6 @@ export class WsBridge {
     session.browserSockets.add(ws);
     console.log(`[ws-bridge] Browser connected for session ${sessionId} (${session.browserSockets.size} browsers)`);
 
-    // Cancel idle kill watchdog — a browser is back
-    this.stopIdleKillWatchdog(sessionId);
-
     // Refresh git state on browser connect so branch changes made mid-session are reflected.
     this.refreshGitInfo(session, { notifyPoller: true });
 
@@ -679,79 +664,11 @@ export class WsBridge {
 
     session.browserSockets.delete(ws);
     console.log(`[ws-bridge] Browser disconnected for session ${sessionId} (${session.browserSockets.size} browsers)`);
-
-    // Start idle kill watchdog when last browser disconnects
-    if (session.browserSockets.size === 0 && !this.idleKillTimers.has(sessionId)) {
-      this.startIdleKillWatchdog(sessionId);
-    }
-  }
-
-  // ── Idle kill watchdog ─────────────────────────────────────────────────
-
-  private static readonly IDLE_KILL_THRESHOLD_MS = Number(
-    process.env.COMPANION_IDLE_KILL_MINUTES
-      ? Number(process.env.COMPANION_IDLE_KILL_MINUTES) * 60_000
-      : 20 * 60_000, // 20 minutes default
-  );
-  private static readonly IDLE_CHECK_INTERVAL_MS = 60_000; // check every 60s
-
-  private startIdleKillWatchdog(sessionId: string) {
-    // Reset activity timestamp so we measure from when browsers left, not from
-    // last CLI message (which may have been seconds ago during active work)
-    const session = this.sessions.get(sessionId);
-    if (session) {
-      session.lastCliActivityTs = Date.now();
-    }
-    console.log(`[ws-bridge] Starting idle kill watchdog for ${sessionId} (threshold: ${WsBridge.IDLE_KILL_THRESHOLD_MS / 60_000}min)`);
-    const timer = setInterval(() => {
-      this.checkIdleKill(sessionId);
-    }, WsBridge.IDLE_CHECK_INTERVAL_MS);
-    this.idleKillTimers.set(sessionId, timer);
-  }
-
-  private stopIdleKillWatchdog(sessionId: string) {
-    const timer = this.idleKillTimers.get(sessionId);
-    if (timer) {
-      clearInterval(timer);
-      this.idleKillTimers.delete(sessionId);
-      console.log(`[ws-bridge] Cancelled idle kill watchdog for ${sessionId} (browser reconnected)`);
-    }
-  }
-
-  private checkIdleKill(sessionId: string) {
-    const session = this.sessions.get(sessionId);
-    if (!session) {
-      this.stopIdleKillWatchdog(sessionId);
-      return;
-    }
-
-    // Browser reconnected — cancel
-    if (session.browserSockets.size > 0) {
-      this.stopIdleKillWatchdog(sessionId);
-      return;
-    }
-
-    const idleMs = Date.now() - session.lastCliActivityTs;
-    if (idleMs < WsBridge.IDLE_KILL_THRESHOLD_MS) {
-      return; // still active or not idle long enough
-    }
-
-    // Truly idle with no browsers — kill
-    console.log(`[ws-bridge] Idle kill triggered for ${sessionId} (idle ${Math.round(idleMs / 60_000)}min, 0 browsers)`);
-    this.stopIdleKillWatchdog(sessionId);
-    if (this.onIdleKill) {
-      this.onIdleKill(sessionId);
-    }
   }
 
   // ── CLI message routing ─────────────────────────────────────────────────
 
   private routeCLIMessage(session: Session, msg: CLIMessage) {
-    // Track activity for idle detection (skip keepalives — they don't indicate real work)
-    if (msg.type !== "keep_alive") {
-      session.lastCliActivityTs = Date.now();
-    }
-
     switch (msg.type) {
       case "system":
         this.handleSystemMessage(session, msg);
@@ -941,14 +858,6 @@ export class WsBridge {
     // Unknown system subtypes are intentionally ignored until we map them.
   }
 
-  /** Append to messageHistory with cap to prevent unbounded memory growth. */
-  private appendHistory(session: Session, msg: BrowserIncomingMessage) {
-    session.messageHistory.push(msg);
-    if (session.messageHistory.length > WsBridge.MESSAGE_HISTORY_LIMIT) {
-      session.messageHistory.splice(0, session.messageHistory.length - WsBridge.MESSAGE_HISTORY_LIMIT);
-    }
-  }
-
   private forwardSystemEvent(
     session: Session,
     event: Extract<BrowserIncomingMessage, { type: "system_event" }>["event"],
@@ -961,7 +870,7 @@ export class WsBridge {
     };
 
     if (options.persistInHistory !== false) {
-      this.appendHistory(session, browserMsg);
+      session.messageHistory.push(browserMsg);
       this.persistSession(session);
     }
 
@@ -975,7 +884,7 @@ export class WsBridge {
       parent_tool_use_id: msg.parent_tool_use_id,
       timestamp: Date.now(),
     };
-    this.appendHistory(session, browserMsg);
+    session.messageHistory.push(browserMsg);
     this.broadcastToBrowsers(session, browserMsg);
     this.assistantMessageListeners.get(session.id)?.forEach((cb) => {
       try { cb(browserMsg); } catch (err) { console.error("[ws-bridge] Assistant listener error:", err); }
@@ -1015,7 +924,7 @@ export class WsBridge {
       type: "result",
       data: msg,
     };
-    this.appendHistory(session, browserMsg);
+    session.messageHistory.push(browserMsg);
     this.broadcastToBrowsers(session, browserMsg);
     this.resultListeners.get(session.id)?.forEach((cb) => {
       try {
@@ -1207,7 +1116,7 @@ export class WsBridge {
       // Store user messages in history for replay with stable ID for dedup on reconnect
       if (msg.type === "user_message") {
         const ts = Date.now();
-        this.appendHistory(session, {
+        session.messageHistory.push({
           type: "user_message",
           content: msg.content,
           timestamp: ts,
@@ -1323,7 +1232,7 @@ export class WsBridge {
   ) {
     // Store user message in history for replay with stable ID for dedup on reconnect
     const ts = Date.now();
-    this.appendHistory(session, {
+    session.messageHistory.push({
       type: "user_message",
       content: msg.content,
       timestamp: ts,

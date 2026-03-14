@@ -1,24 +1,30 @@
 import type { Hono } from "hono";
 import { DEFAULT_ANTHROPIC_MODEL, getSettings, updateSettings, type UpdateChannel } from "../settings-manager.js";
 import { linearCache } from "../linear-cache.js";
+import { listConnections } from "../linear-connections.js";
 
 export function registerSettingsRoutes(api: Hono): void {
   api.get("/settings", (c) => {
     const settings = getSettings();
+    const connections = listConnections();
     return c.json({
       anthropicApiKeyConfigured: !!settings.anthropicApiKey.trim(),
       anthropicModel: settings.anthropicModel || DEFAULT_ANTHROPIC_MODEL,
-      linearApiKeyConfigured: !!settings.linearApiKey.trim(),
+      linearApiKeyConfigured: !!settings.linearApiKey.trim() || connections.length > 0,
+      linearConnectionCount: connections.length,
       linearAutoTransition: settings.linearAutoTransition,
       linearAutoTransitionStateName: settings.linearAutoTransitionStateName,
       linearArchiveTransition: settings.linearArchiveTransition,
       linearArchiveTransitionStateName: settings.linearArchiveTransitionStateName,
+      linearOAuthConfigured: !!(settings.linearOAuthClientId.trim() && settings.linearOAuthClientSecret.trim() && settings.linearOAuthAccessToken.trim()),
+      linearOAuthCredentialsSaved: !!(settings.linearOAuthClientId.trim() && settings.linearOAuthClientSecret.trim()),
       editorTabEnabled: settings.editorTabEnabled,
       aiValidationEnabled: settings.aiValidationEnabled,
       aiValidationAutoApprove: settings.aiValidationAutoApprove,
       aiValidationAutoDeny: settings.aiValidationAutoDeny,
       publicUrl: settings.publicUrl,
       updateChannel: settings.updateChannel,
+      dockerAutoUpdate: settings.dockerAutoUpdate,
     });
   });
 
@@ -75,16 +81,31 @@ export function registerSettingsRoutes(api: Hono): void {
     if (body.updateChannel !== undefined && body.updateChannel !== "stable" && body.updateChannel !== "prerelease") {
       return c.json({ error: "updateChannel must be 'stable' or 'prerelease'" }, 400);
     }
+    if (body.linearOAuthClientId !== undefined && typeof body.linearOAuthClientId !== "string") {
+      return c.json({ error: "linearOAuthClientId must be a string" }, 400);
+    }
+    if (body.linearOAuthClientSecret !== undefined && typeof body.linearOAuthClientSecret !== "string") {
+      return c.json({ error: "linearOAuthClientSecret must be a string" }, 400);
+    }
+    if (body.linearOAuthWebhookSecret !== undefined && typeof body.linearOAuthWebhookSecret !== "string") {
+      return c.json({ error: "linearOAuthWebhookSecret must be a string" }, 400);
+    }
+    if (body.dockerAutoUpdate !== undefined && typeof body.dockerAutoUpdate !== "boolean") {
+      return c.json({ error: "dockerAutoUpdate must be a boolean" }, 400);
+    }
     const hasAnyField = body.anthropicApiKey !== undefined || body.anthropicModel !== undefined
       || body.linearApiKey !== undefined || body.linearAutoTransition !== undefined
       || body.linearAutoTransitionStateId !== undefined || body.linearAutoTransitionStateName !== undefined
       || body.linearArchiveTransition !== undefined || body.linearArchiveTransitionStateId !== undefined
       || body.linearArchiveTransitionStateName !== undefined
+      || body.linearOAuthClientId !== undefined || body.linearOAuthClientSecret !== undefined
+      || body.linearOAuthWebhookSecret !== undefined
       || body.editorTabEnabled !== undefined
       || body.aiValidationEnabled !== undefined || body.aiValidationAutoApprove !== undefined
       || body.aiValidationAutoDeny !== undefined
       || body.publicUrl !== undefined
-      || body.updateChannel !== undefined;
+      || body.updateChannel !== undefined
+      || body.dockerAutoUpdate !== undefined;
     if (!hasAnyField) {
       return c.json({ error: "At least one settings field is required" }, 400);
     }
@@ -130,6 +151,18 @@ export function registerSettingsRoutes(api: Hono): void {
         typeof body.linearArchiveTransitionStateName === "string"
           ? body.linearArchiveTransitionStateName.trim()
           : undefined,
+      linearOAuthClientId:
+        typeof body.linearOAuthClientId === "string"
+          ? body.linearOAuthClientId.trim()
+          : undefined,
+      linearOAuthClientSecret:
+        typeof body.linearOAuthClientSecret === "string"
+          ? body.linearOAuthClientSecret.trim()
+          : undefined,
+      linearOAuthWebhookSecret:
+        typeof body.linearOAuthWebhookSecret === "string"
+          ? body.linearOAuthWebhookSecret.trim()
+          : undefined,
       editorTabEnabled:
         typeof body.editorTabEnabled === "boolean"
           ? body.editorTabEnabled
@@ -154,22 +187,31 @@ export function registerSettingsRoutes(api: Hono): void {
         body.updateChannel === "stable" || body.updateChannel === "prerelease"
           ? (body.updateChannel as UpdateChannel)
           : undefined,
+      dockerAutoUpdate:
+        typeof body.dockerAutoUpdate === "boolean"
+          ? body.dockerAutoUpdate
+          : undefined,
     });
 
+    const connectionsAfterUpdate = listConnections();
     return c.json({
       anthropicApiKeyConfigured: !!settings.anthropicApiKey.trim(),
       anthropicModel: settings.anthropicModel || DEFAULT_ANTHROPIC_MODEL,
-      linearApiKeyConfigured: !!settings.linearApiKey.trim(),
+      linearApiKeyConfigured: !!settings.linearApiKey.trim() || connectionsAfterUpdate.length > 0,
+      linearConnectionCount: connectionsAfterUpdate.length,
       linearAutoTransition: settings.linearAutoTransition,
       linearAutoTransitionStateName: settings.linearAutoTransitionStateName,
       linearArchiveTransition: settings.linearArchiveTransition,
       linearArchiveTransitionStateName: settings.linearArchiveTransitionStateName,
+      linearOAuthConfigured: !!(settings.linearOAuthClientId.trim() && settings.linearOAuthClientSecret.trim() && settings.linearOAuthAccessToken.trim()),
+      linearOAuthCredentialsSaved: !!(settings.linearOAuthClientId.trim() && settings.linearOAuthClientSecret.trim()),
       editorTabEnabled: settings.editorTabEnabled,
       aiValidationEnabled: settings.aiValidationEnabled,
       aiValidationAutoApprove: settings.aiValidationAutoApprove,
       aiValidationAutoDeny: settings.aiValidationAutoDeny,
       publicUrl: settings.publicUrl,
       updateChannel: settings.updateChannel,
+      dockerAutoUpdate: settings.dockerAutoUpdate,
     });
   });
 

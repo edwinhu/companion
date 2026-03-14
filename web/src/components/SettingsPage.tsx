@@ -24,7 +24,7 @@ type CategoryId = (typeof CATEGORIES)[number]["id"];
 
 export function SettingsPage({ embedded = false }: SettingsPageProps) {
   const [anthropicApiKey, setAnthropicApiKey] = useState("");
-  const [anthropicModel, setAnthropicModel] = useState("claude-sonnet-4.6");
+  const [anthropicModel, setAnthropicModel] = useState("claude-sonnet-4-6");
   const [editorTabEnabled, setEditorTabEnabled] = useState(false);
   const [configured, setConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -45,6 +45,7 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
   const setStoreEditorTabEnabled = useStore((s) => s.setEditorTabEnabled);
   const notificationApiAvailable = typeof Notification !== "undefined";
   const [updateChannel, setUpdateChannel] = useState<"stable" | "prerelease">("stable");
+  const [dockerAutoUpdate, setDockerAutoUpdate] = useState(false);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updatingApp, setUpdatingApp] = useState(false);
   const [updateStatus, setUpdateStatus] = useState("");
@@ -52,7 +53,7 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
   const [telemetryEnabled, setTelemetryEnabled] = useState(getTelemetryPreferenceEnabled());
   const [aiValidationEnabled, setAiValidationEnabled] = useState(false);
   const [aiValidationAutoApprove, setAiValidationAutoApprove] = useState(true);
-  const [aiValidationAutoDeny, setAiValidationAutoDeny] = useState(true);
+  const [aiValidationAutoDeny, setAiValidationAutoDeny] = useState(false);
   const [publicUrl, setPublicUrl] = useState("");
   const [activeSection, setActiveSection] = useState<CategoryId>("general");
   const [apiKeyFocused, setApiKeyFocused] = useState(false);
@@ -119,13 +120,14 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
       .getSettings()
       .then((s) => {
         setConfigured(s.anthropicApiKeyConfigured);
-        setAnthropicModel(s.anthropicModel || "claude-sonnet-4.6");
+        setAnthropicModel(s.anthropicModel || "claude-sonnet-4-6");
         setEditorTabEnabled(s.editorTabEnabled);
         setStoreEditorTabEnabled(s.editorTabEnabled);
         if (typeof s.aiValidationEnabled === "boolean") setAiValidationEnabled(s.aiValidationEnabled);
         if (typeof s.aiValidationAutoApprove === "boolean") setAiValidationAutoApprove(s.aiValidationAutoApprove);
         if (typeof s.aiValidationAutoDeny === "boolean") setAiValidationAutoDeny(s.aiValidationAutoDeny);
         if (s.updateChannel === "stable" || s.updateChannel === "prerelease") setUpdateChannel(s.updateChannel);
+        if (typeof s.dockerAutoUpdate === "boolean") setDockerAutoUpdate(s.dockerAutoUpdate);
         if (typeof s.publicUrl === "string") {
           setPublicUrl(s.publicUrl);
           useStore.getState().setPublicUrl(s.publicUrl);
@@ -146,7 +148,7 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
     try {
       const nextKey = anthropicApiKey.trim();
       const payload: { anthropicApiKey?: string; anthropicModel: string; editorTabEnabled: boolean } = {
-        anthropicModel: anthropicModel.trim() || "claude-sonnet-4.6",
+        anthropicModel: anthropicModel.trim() || "claude-sonnet-4-6",
         editorTabEnabled,
       };
       if (nextKey) {
@@ -211,10 +213,13 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
     setUpdateStatus("");
     setUpdateError("");
     try {
+      // Flag so the Docker image update dialog appears after restart
+      localStorage.setItem("companion_docker_prompt_pending", "1");
       const res = await api.triggerUpdate();
       setUpdateStatus(res.message);
       setUpdateOverlayActive(true);
     } catch (err: unknown) {
+      localStorage.removeItem("companion_docker_prompt_pending");
       setUpdateError(err instanceof Error ? err.message : String(err));
       setUpdatingApp(false);
     }
@@ -620,7 +625,7 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
                     type="text"
                     value={anthropicModel}
                     onChange={(e) => setAnthropicModel(e.target.value)}
-                    placeholder="claude-sonnet-4.6"
+                    placeholder="claude-sonnet-4-6"
                     className="w-full px-3 py-2.5 min-h-[44px] text-sm bg-cc-bg rounded-lg text-cc-fg placeholder:text-cc-muted focus:outline-none focus:ring-1 focus:ring-cc-primary/40 transition-shadow"
                   />
                 </div>
@@ -836,6 +841,38 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
                       ? "Tracking prerelease channel. You will receive preview builds from the latest main branch."
                       : "Tracking stable channel. You will only receive versioned releases."}
                   </p>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <span className="block text-sm font-medium">Auto-update Docker image</span>
+                    <p className="mt-0.5 text-xs text-cc-muted">
+                      Automatically re-pull the sandbox Docker image when updating The Companion
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={dockerAutoUpdate}
+                    onClick={async () => {
+                      const next = !dockerAutoUpdate;
+                      setDockerAutoUpdate(next);
+                      try {
+                        await api.updateSettings({ dockerAutoUpdate: next });
+                      } catch {
+                        setDockerAutoUpdate(!next);
+                      }
+                    }}
+                    className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${
+                      dockerAutoUpdate ? "bg-cc-primary" : "bg-cc-hover"
+                    }`}
+                  >
+                    <span
+                      className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-white shadow transform transition-transform ${
+                        dockerAutoUpdate ? "translate-x-5" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
                 </div>
 
                 {updateError && (

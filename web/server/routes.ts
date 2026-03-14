@@ -1,11 +1,12 @@
 import { Hono } from "hono";
-import { setCookie } from "hono/cookie";
+import { getCookie, setCookie } from "hono/cookie";
 import { streamSSE, type SSEStreamingApi } from "hono/streaming";
 import { execSync } from "node:child_process";
 import { resolveBinary } from "./path-resolver.js";
 import { resolve, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { COMPANION_HOME } from "./paths.js";
 import { existsSync, readFileSync } from "node:fs";
 import type { CliLauncher } from "./cli-launcher.js";
 import type { WsBridge } from "./ws-bridge.js";
@@ -13,6 +14,7 @@ import type { SessionStore } from "./session-store.js";
 import type { WorktreeTracker } from "./worktree-tracker.js";
 import type { TerminalManager } from "./terminal-manager.js";
 import * as envManager from "./env-manager.js";
+import * as sandboxManager from "./sandbox-manager.js";
 import * as gitUtils from "./git-utils.js";
 import * as sessionNames from "./session-names.js";
 import * as sessionLinearIssues from "./session-linear-issues.js";
@@ -24,15 +26,20 @@ import { imagePullManager } from "./image-pull-manager.js";
 import { registerFsRoutes } from "./routes/fs-routes.js";
 import { registerSkillRoutes } from "./routes/skills-routes.js";
 import { registerEnvRoutes } from "./routes/env-routes.js";
+import { registerSandboxRoutes } from "./routes/sandbox-routes.js";
 import { registerCronRoutes } from "./routes/cron-routes.js";
 import { registerAgentRoutes } from "./routes/agent-routes.js";
-import { registerChatWebhookRoutes, registerAgentChatWebhookRoutes, registerChatProtectedRoutes } from "./routes/chat-routes.js";
+import { registerLinearAgentWebhookRoute, registerLinearAgentProtectedRoutes } from "./routes/linear-agent-routes.js";
 import { registerPromptRoutes } from "./routes/prompt-routes.js";
+import { discoverCommandsAndSkills } from "./commands-discovery.js";
 import { registerSettingsRoutes } from "./routes/settings-routes.js";
 import { registerTailscaleRoutes } from "./routes/tailscale-routes.js";
 import { registerGitRoutes } from "./routes/git-routes.js";
 import { registerSystemRoutes } from "./routes/system-routes.js";
 import { registerLinearRoutes, transitionLinearIssue, fetchLinearTeamStates } from "./routes/linear-routes.js";
+import { registerLinearConnectionRoutes } from "./routes/linear-connection-routes.js";
+import { getConnection, listConnections, resolveApiKey } from "./linear-connections.js";
+import { buildLinearSystemPrompt } from "./linear-prompt-builder.js";
 import { getSettings } from "./settings-manager.js";
 import { discoverClaudeSessions } from "./claude-session-discovery.js";
 import { getClaudeSessionHistoryPage } from "./claude-session-history.js";
@@ -45,6 +52,7 @@ const WEB_DIR = dirname(ROUTES_DIR);
 const VSCODE_EDITOR_CONTAINER_PORT = 13337;
 const CODEX_APP_SERVER_CONTAINER_PORT = Number(process.env.COMPANION_CODEX_CONTAINER_WS_PORT || "4502");
 const VSCODE_EDITOR_HOST_PORT = Number(process.env.COMPANION_EDITOR_PORT || "13338");
+const NOVNC_CONTAINER_PORT = 6080;
 
 function shellEscapeArg(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
@@ -60,8 +68,9 @@ export function createRoutes(
   recorder?: import("./recorder.js").RecorderManager,
   cronScheduler?: import("./cron-scheduler.js").CronScheduler,
   agentExecutor?: import("./agent-executor.js").AgentExecutor,
-  chatBot?: import("./chat-bot.js").ChatBot,
+  linearAgentBridge?: import("./linear-agent-bridge.js").LinearAgentBridge,
   port?: number,
+  clearAutoRelaunchCount?: (sessionId: string) => void,
 ) {
   const api = new Hono();
 
@@ -137,11 +146,10 @@ export function createRoutes(
     return c.json({ ok: false });
   });
 
-  // ─── Chat SDK webhook routes (exempt from auth middleware) ────────
-  // Platform adapters handle their own signature verification (e.g., Linear HMAC).
-  if (chatBot) {
-    registerChatWebhookRoutes(api, chatBot);          // legacy global (deprecated)
-    registerAgentChatWebhookRoutes(api, chatBot);     // agent-scoped webhooks
+  // ─── Linear Agent SDK webhook route (exempt from auth middleware) ────────
+  // Uses HMAC-SHA256 signature verification, not Companion auth tokens.
+  if (linearAgentBridge) {
+    registerLinearAgentWebhookRoute(api, linearAgentBridge);
   }
 
   // ─── Auth middleware (protects all routes below) ───────────────────
@@ -159,16 +167,17 @@ export function createRoutes(
 
     const authHeader = c.req.header("Authorization");
     const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    if (!verifyToken(token)) {
+    // Also check the companion_auth cookie — iframes (browser preview) can't
+    // send Authorization headers, but browsers do forward cookies automatically.
+    const cookieToken = getCookie(c, "companion_auth") ?? null;
+    if (!verifyToken(token) && !verifyToken(cookieToken)) {
       return c.json({ error: "unauthorized" }, 401);
     }
     return next();
   });
 
-  // ─── Chat platform listing (protected, after auth middleware) ─────
-  if (chatBot) {
-    registerChatProtectedRoutes(api, chatBot);
-  }
+  // ─── Linear Agent SDK protected routes (status, authorize URL, disconnect) ─────
+  registerLinearAgentProtectedRoutes(api);
 
   // ─── Auth management (protected) ──────────────────────────────────
 
@@ -210,10 +219,30 @@ export function createRoutes(
         );
       }
 
+      // Resolve sandbox configuration
+      const sandboxEnabled = body.sandboxEnabled === true;
+      const companionSandbox = body.sandboxSlug ? sandboxManager.getSandbox(body.sandboxSlug) : null;
+      if (sandboxEnabled && body.sandboxSlug && !companionSandbox) {
+        return c.json({ error: `Sandbox "${body.sandboxSlug}" not found` }, 404);
+      }
+
+      // Inject LINEAR_API_KEY if a Linear connection is specified
+      let linearSystemPrompt: string | undefined;
+      if (body.linearConnectionId) {
+        const conn = getConnection(body.linearConnectionId);
+        if (conn?.apiKey) {
+          envVars = { ...envVars, LINEAR_API_KEY: conn.apiKey };
+          linearSystemPrompt = buildLinearSystemPrompt(conn, body.linearIssue);
+        }
+      }
+
       // Resolve Docker image early so we know whether git ops should run on host or in container
-      let effectiveImage = companionEnv
-        ? (body.envSlug ? envManager.getEffectiveImage(body.envSlug) : null)
-        : (body.container?.image || null);
+      let effectiveImage: string | null = null;
+      if (sandboxEnabled) {
+        effectiveImage = "the-companion:latest";
+      } else if (body.container?.image) {
+        effectiveImage = body.container.image;
+      }
       const isDockerSession = !!effectiveImage;
 
       let cwd = body.cwd;
@@ -316,22 +345,22 @@ export function createRoutes(
         }
 
         const tempId = crypto.randomUUID().slice(0, 8);
-        const requestedPorts = companionEnv?.ports
-          ?? (Array.isArray(body.container?.ports)
-            ? body.container.ports.map(Number).filter((n: number) => n > 0)
-            : []);
-        const containerPorts = Array.from(
-          new Set([
-            ...requestedPorts,
+        const requestedPorts = Array.isArray(body.container?.ports)
+          ? body.container.ports.map(Number).filter((n: number) => n > 0)
+          : [];
+        const containerPorts: (number | { port: number; hostIp?: string })[] = [
+          ...Array.from(new Set([
+            ...requestedPorts.filter((p: number) => p !== NOVNC_CONTAINER_PORT),
             VSCODE_EDITOR_CONTAINER_PORT,
             ...(backend === "codex" ? [CODEX_APP_SERVER_CONTAINER_PORT] : []),
-          ]),
-        );
+          ])),
+          { port: NOVNC_CONTAINER_PORT, hostIp: "127.0.0.1" },
+        ];
         const cConfig: ContainerConfig = {
           image: effectiveImage,
           ports: containerPorts,
-          volumes: companionEnv?.volumes ?? body.container?.volumes,
-          env: envVars,
+          volumes: body.container?.volumes,
+          env: { ...(envVars ?? {}), DISPLAY: ":99" },
         };
         try {
           containerInfo = containerManager.createContainer(tempId, cwd, cConfig);
@@ -379,19 +408,20 @@ export function createRoutes(
           }
         }
 
-        // Run per-environment init script if configured
-        if (companionEnv?.initScript?.trim()) {
+        // Run per-sandbox init script if configured
+        const initScript = companionSandbox?.initScript?.trim();
+        if (initScript) {
           try {
-            console.log(`[routes] Running init script for env "${companionEnv.name}" in container ${containerInfo.name}...`);
+            console.log(`[routes] Running init script for sandbox "${companionSandbox?.name || "sandbox"}" in container ${containerInfo.name}...`);
             const initTimeout = Number(process.env.COMPANION_INIT_SCRIPT_TIMEOUT) || 120_000;
             const result = await containerManager.execInContainerAsync(
               containerInfo.containerId,
-              ["sh", "-lc", companionEnv.initScript],
+              ["sh", "-lc", initScript],
               { timeout: initTimeout },
             );
             if (result.exitCode !== 0) {
               console.error(
-                `[routes] Init script failed for env "${companionEnv.name}" (exit ${result.exitCode}):\n${result.output}`,
+                `[routes] Init script failed for sandbox "${companionSandbox?.name || "sandbox"}" (exit ${result.exitCode}):\n${result.output}`,
               );
               containerManager.removeContainer(tempId);
               const truncated = result.output.length > 2000
@@ -401,7 +431,7 @@ export function createRoutes(
                 error: `Init script failed (exit ${result.exitCode}):\n${truncated}`,
               }, 503);
             }
-            console.log(`[routes] Init script completed successfully for env "${companionEnv.name}"`);
+            console.log(`[routes] Init script completed successfully for sandbox "${companionSandbox?.name || "sandbox"}"`);
           } catch (e) {
             containerManager.removeContainer(tempId);
             const reason = e instanceof Error ? e.message : String(e);
@@ -429,6 +459,8 @@ export function createRoutes(
         containerCwd: containerInfo?.containerCwd,
         resumeSessionAt,
         forkSession,
+        systemPrompt: backend === "codex" ? linearSystemPrompt : undefined,
+        sandboxSlug: sandboxEnabled ? (body.sandboxSlug || undefined) : undefined,
       });
 
       // Re-track container with real session ID and mark session as containerized
@@ -449,6 +481,16 @@ export function createRoutes(
           createdAt: Date.now(),
         });
       }
+
+      // Inject Linear context into the CLI's system prompt (must happen before first user message)
+      if (linearSystemPrompt && backend === "claude") {
+        wsBridge.injectSystemPrompt(session.sessionId, linearSystemPrompt);
+      }
+
+      // Pre-populate slash commands and skills from filesystem so the slash
+      // menu works before system.init arrives from the CLI
+      const discovered = await discoverCommandsAndSkills(cwd).catch(() => ({ slash_commands: [] as string[], skills: [] as string[] }));
+      wsBridge.prePopulateCommands(session.sessionId, discovered.slash_commands, discovered.skills);
 
       return c.json(session);
     } catch (e: unknown) {
@@ -499,10 +541,34 @@ export function createRoutes(
           envVars = { ...companionEnv.variables, ...body.env };
         }
 
+        // Resolve sandbox configuration
+        const sandboxEnabled = body.sandboxEnabled === true;
+        const companionSandbox = body.sandboxSlug ? sandboxManager.getSandbox(body.sandboxSlug) : null;
+        if (sandboxEnabled && body.sandboxSlug && !companionSandbox) {
+          await stream.writeSSE({
+            event: "error",
+            data: JSON.stringify({ error: `Sandbox "${body.sandboxSlug}" not found`, step: "resolving_env" }),
+          });
+          return;
+        }
+
+        // Inject LINEAR_API_KEY if a Linear connection is specified
+        let linearSystemPrompt: string | undefined;
+        if (body.linearConnectionId) {
+          const conn = getConnection(body.linearConnectionId);
+          if (conn?.apiKey) {
+            envVars = { ...envVars, LINEAR_API_KEY: conn.apiKey };
+            linearSystemPrompt = buildLinearSystemPrompt(conn, body.linearIssue);
+          }
+        }
+
         // Resolve Docker image early so we know whether git ops should run on host or in container
-        let effectiveImage = companionEnv
-          ? (body.envSlug ? envManager.getEffectiveImage(body.envSlug) : null)
-          : (body.container?.image || null);
+        let effectiveImage: string | null = null;
+        if (sandboxEnabled) {
+          effectiveImage = "the-companion:latest";
+        } else if (body.container?.image) {
+          effectiveImage = body.container.image;
+        }
         const isDockerSession = !!effectiveImage;
 
         await emitProgress(stream, "resolving_env", "Environment resolved", "done");
@@ -641,22 +707,22 @@ export function createRoutes(
           // --- Step: Create container ---
           await emitProgress(stream, "creating_container", "Starting container...", "in_progress");
           const tempId = crypto.randomUUID().slice(0, 8);
-          const requestedPorts = companionEnv?.ports
-            ?? (Array.isArray(body.container?.ports)
-              ? body.container.ports.map(Number).filter((n: number) => n > 0)
-              : []);
-          const containerPorts = Array.from(
-            new Set([
-              ...requestedPorts,
+          const requestedPorts = Array.isArray(body.container?.ports)
+            ? body.container.ports.map(Number).filter((n: number) => n > 0)
+            : [];
+          const containerPorts: (number | { port: number; hostIp?: string })[] = [
+            ...Array.from(new Set([
+              ...requestedPorts.filter((p: number) => p !== NOVNC_CONTAINER_PORT),
               VSCODE_EDITOR_CONTAINER_PORT,
               ...(backend === "codex" ? [CODEX_APP_SERVER_CONTAINER_PORT] : []),
-            ]),
-          );
+            ])),
+            { port: NOVNC_CONTAINER_PORT, hostIp: "127.0.0.1" },
+          ];
           const cConfig: ContainerConfig = {
             image: effectiveImage,
             ports: containerPorts,
-            volumes: companionEnv?.volumes ?? body.container?.volumes,
-            env: envVars,
+            volumes: body.container?.volumes,
+            env: { ...(envVars ?? {}), DISPLAY: ":99" },
           };
           try {
             containerInfo = containerManager.createContainer(tempId, cwd, cConfig);
@@ -734,13 +800,14 @@ export function createRoutes(
           }
 
           // --- Step: Init script ---
-          if (companionEnv?.initScript?.trim()) {
+          const initScript = companionSandbox?.initScript?.trim();
+          if (initScript) {
             await emitProgress(stream, "running_init_script", "Running init script...", "in_progress");
             try {
               const initTimeout = Number(process.env.COMPANION_INIT_SCRIPT_TIMEOUT) || 120_000;
               const result = await containerManager.execInContainerAsync(
                 containerInfo.containerId,
-                ["sh", "-lc", companionEnv.initScript],
+                ["sh", "-lc", initScript],
                 {
                   timeout: initTimeout,
                   onOutput: (line) => {
@@ -750,7 +817,7 @@ export function createRoutes(
               );
               if (result.exitCode !== 0) {
                 console.error(
-                  `[routes] Init script failed for env "${companionEnv.name}" (exit ${result.exitCode}):\n${result.output}`,
+                  `[routes] Init script failed for sandbox "${companionSandbox?.name || "sandbox"}" (exit ${result.exitCode}):\n${result.output}`,
                 );
                 containerManager.removeContainer(tempId);
                 const truncated = result.output.length > 2000
@@ -782,7 +849,7 @@ export function createRoutes(
         }
 
         // --- Step: Launch CLI ---
-        await emitProgress(stream, "launching_cli", "Launching Claude Code...", "in_progress");
+        await emitProgress(stream, "launching_cli", `Launching ${backend === "codex" ? "Codex" : "Claude Code"}...`, "in_progress");
 
         const session = launcher.launch({
           model: body.model,
@@ -801,6 +868,8 @@ export function createRoutes(
           containerCwd: containerInfo?.containerCwd,
           resumeSessionAt,
           forkSession,
+          systemPrompt: backend === "codex" ? linearSystemPrompt : undefined,
+          sandboxSlug: sandboxEnabled ? (body.sandboxSlug || undefined) : undefined,
         });
 
         // Re-track container and mark session as containerized
@@ -820,6 +889,16 @@ export function createRoutes(
             createdAt: Date.now(),
           });
         }
+
+        // Inject Linear context into the CLI's system prompt (must happen before first user message)
+        if (linearSystemPrompt && backend === "claude") {
+          wsBridge.injectSystemPrompt(session.sessionId, linearSystemPrompt);
+        }
+
+        // Pre-populate slash commands and skills from filesystem so the slash
+        // menu works before system.init arrives from the CLI
+        const discovered = await discoverCommandsAndSkills(cwd).catch(() => ({ slash_commands: [] as string[], skills: [] as string[] }));
+        wsBridge.prePopulateCommands(session.sessionId, discovered.slash_commands, discovered.skills);
 
         await emitProgress(stream, "launching_cli", "Session started", "done");
 
@@ -998,14 +1077,13 @@ export function createRoutes(
     const editorPathSuffix = `?folder=${encodeURIComponent(hostFallbackCwd)}`;
 
     try {
-      const companionDir = join(homedir(), ".companion");
-      const logFile = join(companionDir, "code-server-host.log");
+      const logFile = join(COMPANION_HOME, "code-server-host.log");
       const startCmd = [
         `if ! pgrep -f ${shellEscapeArg(`code-server.*--bind-addr 127.0.0.1:${VSCODE_EDITOR_HOST_PORT}`)} >/dev/null 2>&1; then`,
         `nohup ${shellEscapeArg(hostCodeServer)} --auth none --disable-telemetry --bind-addr 127.0.0.1:${VSCODE_EDITOR_HOST_PORT} ${shellEscapeArg(hostFallbackCwd)} >> ${shellEscapeArg(logFile)} 2>&1 &`,
         "fi",
       ].join(" ");
-      const startHostCmd = `mkdir -p ${shellEscapeArg(companionDir)} && ${startCmd}`;
+      const startHostCmd = `mkdir -p ${shellEscapeArg(COMPANION_HOME)} && ${startCmd}`;
       execSync(startHostCmd, { encoding: "utf-8", timeout: 10_000 });
 
       // Wait for code-server to be ready (up to 5s)
@@ -1037,7 +1115,311 @@ export function createRoutes(
     }
   });
 
-  api.patch("/sessions/:id/name", async (c) => {
+  // ── Browser preview ──────────────────────────────────────────────────────
+
+  api.post("/sessions/:id/browser/start", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req.json().catch(() => ({} as { url?: string }));
+    const session = launcher.getSession(id);
+    if (!session) return c.json({ error: "Session not found" }, 404);
+
+    if (!session.containerId) {
+      return c.json({
+        available: true,
+        mode: "host" as const,
+      });
+    }
+
+    const container = containerManager.getContainer(id);
+    if (!container) {
+      return c.json({
+        available: false,
+        mode: "container" as const,
+        message: "Container not found for this session.",
+      });
+    }
+
+    const alive = containerManager.isContainerAlive(container.containerId);
+    if (alive === "stopped") {
+      containerManager.startContainer(container.containerId);
+    } else if (alive === "missing") {
+      return c.json({
+        available: false,
+        mode: "container" as const,
+        message: "Session container no longer exists.",
+      });
+    }
+
+    const portMapping = container.portMappings.find(
+      (p) => p.containerPort === NOVNC_CONTAINER_PORT,
+    );
+    if (!portMapping) {
+      return c.json({
+        available: false,
+        mode: "container" as const,
+        message: "Browser preview port not mapped. Start a new session to enable browser preview.",
+      });
+    }
+
+    const hasXvfb = containerManager.hasBinaryInContainer(container.containerId, "Xvfb");
+    const hasWebsockify = containerManager.hasBinaryInContainer(container.containerId, "websockify");
+    if (!hasXvfb || !hasWebsockify) {
+      return c.json({
+        available: false,
+        mode: "container" as const,
+        message: "Browser preview requires Xvfb and noVNC in the container image. Rebuild with the latest the-companion image.",
+      });
+    }
+
+    try {
+      // Start display stack (idempotent — guarded by pgrep)
+      const startScript = [
+        "export DISPLAY=:99",
+        'if ! pgrep -f "Xvfb :99" >/dev/null 2>&1; then',
+        "  Xvfb :99 -screen 0 1280x720x24 -ac -nolisten tcp &",
+        "  sleep 0.5",
+        "  fluxbox -display :99 &>/dev/null &",
+        "  sleep 0.3",
+        "  x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -noxdamage -wait 20 &>/dev/null &",
+        "  sleep 0.3",
+        "  websockify --web /usr/share/novnc/ 6080 localhost:5900 &>/dev/null &",
+        "  sleep 1.0",
+        "fi",
+      ].join("\n");
+
+      await containerManager.execInContainerAsync(
+        container.containerId,
+        ["sh", "-c", startScript],
+        { timeout: 15_000 },
+      );
+
+      // Optionally launch Chromium to a URL (validate scheme if provided)
+      let targetUrl = "about:blank";
+      if (body.url && typeof body.url === "string") {
+        try {
+          const parsed = new URL(body.url);
+          if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+            return c.json({
+              available: false,
+              mode: "container" as const,
+              message: "Only http:// and https:// URLs are allowed.",
+            });
+          }
+          targetUrl = body.url;
+        } catch {
+          return c.json({
+            available: false,
+            mode: "container" as const,
+            message: "Invalid URL provided.",
+          });
+        }
+      }
+      const launchChrome = [
+        "export DISPLAY=:99",
+        'if ! pgrep -f "chromium.*--user-data-dir=/tmp/companion-chrome" >/dev/null 2>&1; then',
+        `  nohup chromium --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/tmp/companion-chrome --window-size=1280,720 --window-position=0,0 ${shellEscapeArg(targetUrl)} &>/dev/null &`,
+        "fi",
+      ].join("\n");
+
+      await containerManager.execInContainerAsync(
+        container.containerId,
+        ["sh", "-c", launchChrome],
+        { timeout: 10_000 },
+      );
+
+      // Wait for noVNC to be ready (up to 10s)
+      let noVncReady = false;
+      for (let i = 0; i < 50; i++) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${portMapping.hostPort}/`);
+          if (res.ok || res.status === 200) {
+            noVncReady = true;
+            break;
+          }
+        } catch {
+          // not ready yet
+        }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+
+      if (!noVncReady) {
+        return c.json({
+          available: false,
+          mode: "container" as const,
+          message: "Browser preview timed out waiting for noVNC to start.",
+        });
+      }
+
+      const proxyBase = `/api/sessions/${encodeURIComponent(id)}/browser/proxy`;
+      const noVncUrl = `${proxyBase}/vnc.html?autoconnect=true&resize=scale&path=ws/novnc/${encodeURIComponent(id)}`;
+
+      return c.json({
+        available: true,
+        mode: "container" as const,
+        url: noVncUrl,
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return c.json({
+        available: false,
+        mode: "container" as const,
+        message: `Failed to start browser preview: ${message}`,
+      });
+    }
+  });
+
+  api.post("/sessions/:id/browser/navigate", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req.json().catch(() => ({} as { url?: string }));
+    const session = launcher.getSession(id);
+    if (!session) return c.json({ error: "Session not found" }, 404);
+    if (!session.containerId) return c.json({ error: "Not a container session" }, 400);
+
+    const url = body.url;
+    if (!url || typeof url !== "string") return c.json({ error: "url is required" }, 400);
+
+    // Validate URL scheme — only allow http/https to prevent file:// access
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return c.json({ error: "Only http:// and https:// URLs are allowed" }, 400);
+      }
+    } catch {
+      return c.json({ error: "Invalid URL" }, 400);
+    }
+
+    const container = containerManager.getContainer(id);
+    if (!container) return c.json({ error: "Container not found" }, 404);
+
+    try {
+      // Use xdotool to send the URL to the existing Chromium window's address bar
+      // instead of spawning a new Chromium process each time
+      const navScript = [
+        "export DISPLAY=:99",
+        // Focus the Chromium window and navigate via keyboard shortcut
+        'xdotool search --onlyvisible --name "Chromium" windowactivate --sync key --clearmodifiers ctrl+l',
+        "sleep 0.1",
+        `xdotool type --clearmodifiers ${shellEscapeArg(url)}`,
+        "xdotool key --clearmodifiers Return",
+      ].join(" && ");
+      await containerManager.execInContainerAsync(
+        container.containerId,
+        ["sh", "-c", navScript],
+        { timeout: 10_000 },
+      );
+      return c.json({ ok: true, url });
+    } catch {
+      return c.json({ error: "Navigation failed" }, 500);
+    }
+  });
+
+  // HTTP proxy for noVNC static files — serves through the companion's port
+  api.get("/sessions/:id/browser/proxy/*", async (c) => {
+    const id = c.req.param("id");
+    const session = launcher.getSession(id);
+    if (!session) return c.json({ error: "Session not found" }, 404);
+    if (!session.containerId) return c.json({ error: "Not a container session" }, 400);
+
+    const container = containerManager.getContainer(id);
+    if (!container) return c.json({ error: "Container not found" }, 404);
+
+    const portMapping = container.portMappings.find(
+      (p) => p.containerPort === NOVNC_CONTAINER_PORT,
+    );
+    if (!portMapping) return c.json({ error: "Browser preview port not mapped" }, 400);
+
+    // Extract the wildcard path after /browser/proxy/
+    const fullPath = c.req.path;
+    const proxyPrefix = `/api/sessions/${id}/browser/proxy/`;
+    const subPath = fullPath.startsWith(proxyPrefix) ? fullPath.slice(proxyPrefix.length) : "";
+
+    // Block path traversal (defense-in-depth)
+    if (subPath.includes("..")) {
+      return c.json({ error: "Invalid path" }, 400);
+    }
+
+    const queryString = new URL(c.req.url).search;
+
+    try {
+      const targetUrl = `http://127.0.0.1:${portMapping.hostPort}/${subPath}${queryString}`;
+      const upstream = await fetch(targetUrl);
+      const headers = new Headers();
+      const ct = upstream.headers.get("content-type");
+      if (ct) headers.set("Content-Type", ct);
+      const cl = upstream.headers.get("content-length");
+      if (cl) headers.set("Content-Length", cl);
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers,
+      });
+    } catch {
+      return c.json({ error: "Proxy failed: upstream unreachable" }, 502);
+    }
+  });
+
+
+  // HTTP proxy for host browser preview — proxies localhost requests through the companion’s port
+  const HOP_BY_HOP = new Set(["connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-connection", "te", "trailer"]);
+  api.all("/sessions/:id/browser/host-proxy/:port/*", async (c) => {
+    const id = c.req.param("id");
+    const session = launcher.getSession(id);
+    if (!session) return c.json({ error: "Session not found" }, 404);
+
+    const portStr = c.req.param("port");
+    const portNum = parseInt(portStr, 10);
+    if (isNaN(portNum) || portNum < 1 || portNum > 65535) {
+      return c.json({ error: "Invalid port" }, 400);
+    }
+
+    // Block well-known sensitive service ports to limit SSRF surface area
+    const BLOCKED_PORTS = new Set([22, 23, 25, 110, 143, 3306, 5432, 6379, 27017, 11211]);
+    const serverPort = port || (process.env.NODE_ENV === "production" ? 3456 : 3457);
+    if (portNum === serverPort || BLOCKED_PORTS.has(portNum)) {
+      return c.json({ error: "Port not allowed" }, 400);
+    }
+
+    // Reconstruct path from wildcard — only take path, query comes separately
+    const fullPath = c.req.path;
+    const proxyPrefix = `/api/sessions/${id}/browser/host-proxy/${portNum}/`;
+    const subPath = fullPath.startsWith(proxyPrefix) ? fullPath.slice(proxyPrefix.length) : "";
+
+    // Block path traversal (Hono decodes %2e%2e before c.req.path)
+    if (subPath.includes("..")) {
+      return c.json({ error: "Invalid path" }, 400);
+    }
+
+    const queryString = new URL(c.req.url).search;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const targetUrl = `http://127.0.0.1:${portNum}/${subPath}${queryString}`;
+      const upstream = await fetch(targetUrl, {
+        method: c.req.method,
+        headers: { "accept": c.req.header("accept") || "*/*" },
+        body: ["GET", "HEAD"].includes(c.req.method) ? undefined : c.req.raw.body,
+        redirect: "follow",
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      // Forward response headers, stripping hop-by-hop headers
+      const headers = new Headers();
+      upstream.headers.forEach((value, key) => {
+        if (!HOP_BY_HOP.has(key.toLowerCase())) {
+          headers.set(key, value);
+        }
+      });
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers,
+      });
+    } catch {
+      clearTimeout(timeout);
+      return c.json({ error: "Proxy failed: upstream unreachable" }, 502);
+    }
+  });
+
+    api.patch("/sessions/:id/name", async (c) => {
     const id = c.req.param("id");
     const body = await c.req.json().catch(() => ({}));
     if (typeof body.name !== "string" || !body.name.trim()) {
@@ -1064,6 +1446,7 @@ export function createRoutes(
 
   api.post("/sessions/:id/relaunch", async (c) => {
     const id = c.req.param("id");
+    clearAutoRelaunchCount?.(id);
     const result = await launcher.relaunch(id);
     if (!result.ok) {
       const status = result.error?.includes("not found") || result.error?.includes("Session not found") ? 404 : 503;
@@ -1417,16 +1800,25 @@ export function createRoutes(
     }
 
     // Issue is not done — check if backlog state is available and if archive transition is configured
-    const settings = getSettings();
-    const linearApiKey = settings.linearApiKey.trim();
+    const resolved = resolveApiKey(linkedIssue.connectionId);
     let hasBacklogState = false;
-    if (linearApiKey && linkedIssue.teamId) {
-      const teams = await fetchLinearTeamStates(linearApiKey);
+    if (resolved && linkedIssue.teamId) {
+      const teams = await fetchLinearTeamStates(resolved.apiKey);
       const team = teams.find((t) => t.id === linkedIssue.teamId);
       if (team) {
         hasBacklogState = team.states.some((s) => s.type === "backlog");
       }
     }
+
+    // Use connection-level archive settings if available, fall back to global settings
+    const settings = getSettings();
+    const conn = resolved && resolved.connectionId !== "legacy" ? getConnection(resolved.connectionId) : null;
+    const archiveTransitionConfigured = conn
+      ? conn.archiveTransition && !!conn.archiveTransitionStateId.trim()
+      : settings.linearArchiveTransition && !!settings.linearArchiveTransitionStateId.trim();
+    const archiveTransitionStateName = conn
+      ? conn.archiveTransitionStateName || undefined
+      : settings.linearArchiveTransitionStateName || undefined;
 
     return c.json({
       hasLinkedIssue: true,
@@ -1439,8 +1831,8 @@ export function createRoutes(
         teamId: linkedIssue.teamId,
       },
       hasBacklogState,
-      archiveTransitionConfigured: settings.linearArchiveTransition && !!settings.linearArchiveTransitionStateId.trim(),
-      archiveTransitionStateName: settings.linearArchiveTransitionStateName || undefined,
+      archiveTransitionConfigured,
+      archiveTransitionStateName,
     });
   });
 
@@ -1455,9 +1847,12 @@ export function createRoutes(
     if (linearTransition && linearTransition !== "none") {
       const linkedIssue = sessionLinearIssues.getLinearIssue(id);
       if (linkedIssue) {
-        const settings = getSettings();
-        const linearApiKey = settings.linearApiKey.trim();
-        if (linearApiKey) {
+        const resolved = resolveApiKey(linkedIssue.connectionId);
+        if (resolved) {
+          const { apiKey: linearApiKey, connectionId: resolvedConnId } = resolved;
+          const settings = getSettings();
+          // Use connection-level archive settings if available, else fall back to global
+          const conn = resolvedConnId !== "legacy" ? getConnection(resolvedConnId) : null;
           let targetStateId = "";
 
           if (linearTransition === "backlog" && linkedIssue.teamId) {
@@ -1469,12 +1864,13 @@ export function createRoutes(
               targetStateId = backlogState.id;
             }
           } else if (linearTransition === "configured") {
-            targetStateId = settings.linearArchiveTransitionStateId.trim();
+            const archiveStateId = conn ? conn.archiveTransitionStateId : settings.linearArchiveTransitionStateId;
+            targetStateId = archiveStateId.trim();
           }
 
           if (targetStateId) {
             try {
-              linearTransitionResult = await transitionLinearIssue(linkedIssue.id, targetStateId, linearApiKey);
+              linearTransitionResult = await transitionLinearIssue(linkedIssue.id, targetStateId, linearApiKey, resolvedConnId);
             } catch {
               linearTransitionResult = { ok: false, error: "Transition failed unexpectedly" };
             }
@@ -1603,6 +1999,7 @@ export function createRoutes(
 
   registerFsRoutes(api);
   registerEnvRoutes(api, { webDir: WEB_DIR });
+  registerSandboxRoutes(api);
 
   registerPromptRoutes(api);
   registerSettingsRoutes(api);
@@ -1614,6 +2011,7 @@ export function createRoutes(
   // ─── Linear ────────────────────────────────────────────────────────
 
   registerLinearRoutes(api);
+  registerLinearConnectionRoutes(api);
 
   registerGitRoutes(api, prPoller);
   registerSystemRoutes(api, {
@@ -1625,7 +2023,7 @@ export function createRoutes(
 
   registerSkillRoutes(api);
   registerCronRoutes(api, cronScheduler);
-  registerAgentRoutes(api, agentExecutor, chatBot);
+  registerAgentRoutes(api, agentExecutor);
 
   // ─── Worktree cleanup helper ────────────────────────────────────
 

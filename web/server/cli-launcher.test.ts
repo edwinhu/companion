@@ -159,6 +159,8 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.COMPANION_CODEX_TRANSPORT;
+  delete process.env.COMPANION_CODEX_WS_CONNECT_TIMEOUT_MS;
+  delete process.env.COMPANION_CODEX_PONG_TIMEOUT_MS;
   rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -213,12 +215,18 @@ describe("launch", () => {
   });
 
   it("passes --permission-mode when provided", () => {
-    launcher.launch({ permissionMode: "bypassPermissions", cwd: "/tmp" });
+    // Allow bypassPermissions through even when tests run as root
+    process.env.COMPANION_FORCE_BYPASS_AS_ROOT = "1";
+    try {
+      launcher.launch({ permissionMode: "bypassPermissions", cwd: "/tmp" });
 
-    const [cmdAndArgs] = mockSpawn.mock.calls[0];
-    const modeIdx = cmdAndArgs.indexOf("--permission-mode");
-    expect(modeIdx).toBeGreaterThan(-1);
-    expect(cmdAndArgs[modeIdx + 1]).toBe("bypassPermissions");
+      const [cmdAndArgs] = mockSpawn.mock.calls[0];
+      const modeIdx = cmdAndArgs.indexOf("--permission-mode");
+      expect(modeIdx).toBeGreaterThan(-1);
+      expect(cmdAndArgs[modeIdx + 1]).toBe("bypassPermissions");
+    } finally {
+      delete process.env.COMPANION_FORCE_BYPASS_AS_ROOT;
+    }
   });
 
   it("downgrades bypassPermissions to acceptEdits for containerized Claude sessions", () => {
@@ -235,6 +243,31 @@ describe("launch", () => {
     expect(bashCmd).toContain("--permission-mode");
     expect(bashCmd).toContain("acceptEdits");
     expect(bashCmd).not.toContain("bypassPermissions");
+  });
+
+  it("downgrades bypassPermissions to acceptEdits when host launcher runs as root", () => {
+    const originalGetuid = process.getuid;
+    Object.defineProperty(process, "getuid", {
+      value: () => 0,
+      configurable: true,
+    });
+
+    try {
+      launcher.launch({
+        cwd: "/tmp/project",
+        permissionMode: "bypassPermissions",
+      });
+
+      const [cmdAndArgs] = mockSpawn.mock.calls[0];
+      const modeIdx = cmdAndArgs.indexOf("--permission-mode");
+      expect(modeIdx).toBeGreaterThan(-1);
+      expect(cmdAndArgs[modeIdx + 1]).toBe("acceptEdits");
+    } finally {
+      Object.defineProperty(process, "getuid", {
+        value: originalGetuid,
+        configurable: true,
+      });
+    }
   });
 
   it("uses COMPANION_CONTAINER_SDK_HOST for containerized sdk-url when set", () => {
@@ -897,13 +930,41 @@ describe("codex websocket launcher", () => {
     expect(proxyCmd[0]).toBe("node");
     expect(proxyCmd[1]).toContain("codex-ws-proxy.cjs");
     expect(proxyCmd[2]).toBe("ws://127.0.0.1:4500");
-    expect(proxyCmd[3]).toBe("10000");
+    // Default connect timeout (30s) and pong timeout (30s) passed to proxy
+    expect(proxyCmd[3]).toBe("30000");
+    expect(proxyCmd[4]).toBe("30000");
     expect(proxyOpts.stdin).toBe("pipe");
     expect(proxyOpts.stdout).toBe("pipe");
     expect(proxyOpts.stderr).toBe("pipe");
 
     expect(onAdapter).toHaveBeenCalledTimes(1);
     expect(onAdapter.mock.calls[0][0]).toBe("test-session-id");
+  });
+
+  it("passes custom connect and pong timeouts from env vars to the ws proxy", async () => {
+    // When COMPANION_CODEX_WS_CONNECT_TIMEOUT_MS and COMPANION_CODEX_PONG_TIMEOUT_MS
+    // are set, those values should be forwarded as argv[3] and argv[4] to the proxy.
+    process.env.COMPANION_CODEX_TRANSPORT = "ws";
+    process.env.COMPANION_CODEX_WS_CONNECT_TIMEOUT_MS = "60000";
+    process.env.COMPANION_CODEX_PONG_TIMEOUT_MS = "45000";
+    mockResolveBinary.mockReturnValue("/opt/fake/codex");
+
+    const codexProc = createMockProc(5001);
+    const { proc: proxyProc } = createPendingCodexWsProxyProc(5002);
+    mockSpawn.mockReturnValueOnce(codexProc).mockReturnValueOnce(proxyProc);
+
+    launcher.onCodexAdapterCreated(vi.fn());
+    launcher.launch({
+      backendType: "codex",
+      cwd: "/tmp/project",
+      codexSandbox: "workspace-write",
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    const [proxyCmd] = mockSpawn.mock.calls[1];
+    expect(proxyCmd[3]).toBe("60000");
+    expect(proxyCmd[4]).toBe("45000");
   });
 
   it("relaunch kills the old codex process and ws proxy before spawning replacements", async () => {
@@ -1220,5 +1281,40 @@ describe("getStartingSessions", () => {
 
   it("returns empty array when no sessions exist", () => {
     expect(launcher.getStartingSessions()).toEqual([]);
+  });
+});
+
+// ─── isCmdScript platform guard ───────────────────────────────────────────────
+
+describe("isCmdScript platform guard", () => {
+  const originalPlatform = process.platform;
+
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  });
+
+  it("wraps .cmd binary with cmd.exe /c on win32", () => {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    mockResolveBinary.mockReturnValue("C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd");
+
+    launcher.launch({ cwd: "/tmp" });
+
+    const [cmdAndArgs] = mockSpawn.mock.calls[0];
+    // On Windows, .cmd files should be spawned via cmd.exe /c
+    expect(cmdAndArgs[0]).toBe("cmd.exe");
+    expect(cmdAndArgs[1]).toBe("/c");
+    expect(cmdAndArgs[2]).toBe("C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd");
+  });
+
+  it("does not wrap .cmd binary with cmd.exe on non-Windows", () => {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    mockResolveBinary.mockReturnValue("/usr/local/bin/claude.cmd");
+
+    launcher.launch({ cwd: "/tmp" });
+
+    const [cmdAndArgs] = mockSpawn.mock.calls[0];
+    // On non-Windows, .cmd files should be spawned directly (no cmd.exe wrapping)
+    expect(cmdAndArgs[0]).toBe("/usr/local/bin/claude.cmd");
+    expect(cmdAndArgs[0]).not.toBe("cmd.exe");
   });
 });

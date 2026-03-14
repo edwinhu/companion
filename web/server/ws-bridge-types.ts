@@ -26,7 +26,12 @@ export interface TerminalSocketData {
   terminalId: string;
 }
 
-export type SocketData = CLISocketData | BrowserSocketData | TerminalSocketData;
+export interface NoVncSocketData {
+  kind: "novnc";
+  sessionId: string;
+}
+
+export type SocketData = CLISocketData | BrowserSocketData | TerminalSocketData | NoVncSocketData;
 
 /** Tracks a pending control_request sent to CLI that expects a control_response. */
 export interface PendingControlRequest {
@@ -53,6 +58,8 @@ export interface Session {
   /** Rolling set of recent CLI message hashes for deduplication on WS reconnect */
   recentCLIMessageHashes: string[];
   recentCLIMessageHashSet: Set<string>;
+  /** Timestamp of last non-keepalive CLI message (for idle detection) */
+  lastCliActivityTs: number;
 }
 
 export type GitSessionKey =

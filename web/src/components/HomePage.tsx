@@ -5,6 +5,7 @@ import {
   createSessionStream,
   type ClaudeDiscoveredSession,
   type CompanionEnv,
+  type CompanionSandbox,
   type GitRepoInfo,
   type GitBranchInfo,
   type BackendInfo,
@@ -110,6 +111,7 @@ export function HomePage() {
   const [dynamicModels, setDynamicModels] = useState<ModelOption[] | null>(null);
   const [linearConfigured, setLinearConfigured] = useState(false);
   const [selectedLinearIssue, setSelectedLinearIssue] = useState<LinearIssue | null>(null);
+  const [selectedLinearConnectionId, setSelectedLinearConnectionId] = useState<string | null>(null);
 
   const MODELS = dynamicModels || getModelsForBackend(backend);
   const MODES = getModesForBackend(backend);
@@ -120,9 +122,16 @@ export function HomePage() {
   const [showEnvDropdown, setShowEnvDropdown] = useState(false);
   const [showEnvManager, setShowEnvManager] = useState(false);
 
-  // Docker image readiness for selected env
-  const [envImageState, setEnvImageState] = useState<ImagePullState | null>(null);
-  const envImagePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Sandbox state
+  const [sandboxEnabled, setSandboxEnabled] = useState(() => localStorage.getItem("cc-sandbox-enabled") === "true");
+  const [sandboxes, setSandboxes] = useState<CompanionSandbox[]>([]);
+  const [selectedSandbox, setSelectedSandbox] = useState(() => localStorage.getItem("cc-selected-sandbox") || "");
+  const [showSandboxDropdown, setShowSandboxDropdown] = useState(false);
+  const sandboxDropdownRef = useRef<HTMLDivElement>(null);
+
+  // Sandbox image readiness
+  const [sandboxImageState, setSandboxImageState] = useState<ImagePullState | null>(null);
+  const sandboxImagePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -193,6 +202,7 @@ export function HomePage() {
       }
     }).catch(() => {});
     api.listEnvs().then(setEnvs).catch(() => {});
+    api.listSandboxes().then(setSandboxes).catch(() => {});
     api.getBackends().then(setBackends).catch(() => {});
     api.getSettings().then((s) => {
       setLinearConfigured(s.linearApiKeyConfigured);
@@ -237,50 +247,43 @@ export function HomePage() {
     });
   }, [backend]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // When selectedEnv changes, check its Docker image status and auto-pull if needed
+  // When sandbox is enabled, check the-companion:latest image status
   useEffect(() => {
-    // Cleanup any existing poll
-    if (envImagePollRef.current) {
-      clearInterval(envImagePollRef.current);
-      envImagePollRef.current = null;
+    if (sandboxImagePollRef.current) {
+      clearInterval(sandboxImagePollRef.current);
+      sandboxImagePollRef.current = null;
     }
-    setEnvImageState(null);
+    setSandboxImageState(null);
 
-    if (!selectedEnv) return;
-    const env = envs.find((e) => e.slug === selectedEnv);
-    if (!env) return;
-    const effectiveImage = env.imageTag || env.baseImage;
-    if (!effectiveImage) return;
+    if (!sandboxEnabled) return;
 
-    // Check image status
+    const effectiveImage = "the-companion:latest";
+
     const checkAndPull = () => {
       api.getImageStatus(effectiveImage).then((state) => {
-        setEnvImageState(state);
-        // Auto-trigger pull if image is not available
+        setSandboxImageState(state);
         if (state.status === "idle") {
           api.pullImage(effectiveImage).catch(() => {});
         }
-        // Stop polling once settled
         if (state.status === "ready" || state.status === "error") {
-          if (envImagePollRef.current) {
-            clearInterval(envImagePollRef.current);
-            envImagePollRef.current = null;
+          if (sandboxImagePollRef.current) {
+            clearInterval(sandboxImagePollRef.current);
+            sandboxImagePollRef.current = null;
           }
         }
       }).catch(() => {});
     };
 
     checkAndPull();
-    // Poll while pulling
-    envImagePollRef.current = setInterval(checkAndPull, 2000);
+    sandboxImagePollRef.current = setInterval(checkAndPull, 2000);
 
     return () => {
-      if (envImagePollRef.current) {
-        clearInterval(envImagePollRef.current);
-        envImagePollRef.current = null;
+      if (sandboxImagePollRef.current) {
+        clearInterval(sandboxImagePollRef.current);
+        sandboxImagePollRef.current = null;
       }
     };
-  }, [selectedEnv, envs]);
+  }, [sandboxEnabled]);
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -293,6 +296,9 @@ export function HomePage() {
       }
       if (envDropdownRef.current && !envDropdownRef.current.contains(e.target as Node)) {
         setShowEnvDropdown(false);
+      }
+      if (sandboxDropdownRef.current && !sandboxDropdownRef.current.contains(e.target as Node)) {
+        setShowSandboxDropdown(false);
       }
     }
     document.addEventListener("pointerdown", handleClick);
@@ -622,6 +628,8 @@ export function HomePage() {
           permissionMode: mode,
           cwd: effectiveCwd || undefined,
           envSlug: selectedEnv || undefined,
+          sandboxEnabled: sandboxEnabled ? true : undefined,
+          sandboxSlug: sandboxEnabled && selectedSandbox ? selectedSandbox : undefined,
           branch: effectiveBranch,
           createBranch: effectiveCreateBranch ? true : undefined,
           useWorktree: effectiveUseWorktree ? true : undefined,
@@ -629,6 +637,14 @@ export function HomePage() {
           codexInternetAccess: backend === "codex" ? true : undefined,
           resumeSessionAt: effectiveResumeSessionAt,
           forkSession: effectiveForkSession,
+          linearConnectionId: selectedLinearIssue ? (selectedLinearConnectionId || undefined) : undefined,
+          linearIssue: selectedLinearIssue ? {
+            identifier: selectedLinearIssue.identifier,
+            title: selectedLinearIssue.title,
+            stateName: selectedLinearIssue.stateName,
+            teamName: selectedLinearIssue.teamName,
+            url: selectedLinearIssue.url,
+          } : undefined,
         },
         (progress) => {
           useStore.getState().addCreationProgress(progress);
@@ -699,11 +715,11 @@ export function HomePage() {
 
       // Auto-link Linear issue if one was selected
       if (selectedLinearIssue) {
-        api.linkLinearIssue(sessionId, selectedLinearIssue)
+        api.linkLinearIssue(sessionId, selectedLinearIssue, selectedLinearConnectionId || undefined)
           .then(() => useStore.getState().setLinkedLinearIssue(sessionId, selectedLinearIssue))
           .catch(() => { /* fire-and-forget: linking is best-effort */ });
         // Fire-and-forget: transition Linear issue to configured status
-        api.transitionLinearIssue(selectedLinearIssue.id).catch(() => {
+        api.transitionLinearIssue(selectedLinearIssue.id, selectedLinearConnectionId || undefined).catch(() => {
           /* fire-and-forget: status transition is best-effort */
         });
       }
@@ -1047,25 +1063,6 @@ export function HomePage() {
               <span className="max-w-[120px] truncate">
                 {selectedEnv ? envs.find((e) => e.slug === selectedEnv)?.name || "Env" : "No env"}
               </span>
-              {/* Image readiness dot */}
-              {selectedEnv && envImageState && envImageState.status !== "idle" && (
-                <span
-                  className={`w-1.5 h-1.5 rounded-full ${
-                    envImageState.status === "ready"
-                      ? "bg-green-500"
-                      : envImageState.status === "pulling"
-                        ? "bg-amber-500 animate-pulse"
-                        : "bg-cc-error"
-                  }`}
-                  title={
-                    envImageState.status === "ready"
-                      ? "Docker image ready"
-                      : envImageState.status === "pulling"
-                        ? "Pulling Docker image..."
-                        : `Image error: ${envImageState.error || "unknown"}`
-                  }
-                />
-              )}
               <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3 opacity-50">
                 <path d="M4 6l4 4 4-4" />
               </svg>
@@ -1112,6 +1109,112 @@ export function HomePage() {
                   >
                     Manage environments...
                   </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Sandbox selector */}
+          <div className="relative" ref={sandboxDropdownRef}>
+            <button
+              onClick={() => {
+                if (!showSandboxDropdown) {
+                  api.listSandboxes().then(setSandboxes).catch(() => {});
+                }
+                setShowSandboxDropdown(!showSandboxDropdown);
+              }}
+              aria-expanded={showSandboxDropdown}
+              className={`flex items-center gap-1.5 px-2.5 py-2 text-xs rounded-md transition-colors cursor-pointer ${
+                sandboxEnabled
+                  ? "text-cc-primary bg-cc-primary/10 hover:bg-cc-primary/15"
+                  : "text-cc-muted hover:text-cc-fg hover:bg-cc-hover"
+              }`}
+            >
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5 opacity-70">
+                <rect x="2" y="4" width="12" height="10" rx="1.5" />
+                <path d="M5 4V2.5A1.5 1.5 0 016.5 1h3A1.5 1.5 0 0111 2.5V4" />
+              </svg>
+              <span className="max-w-[120px] truncate">
+                {sandboxEnabled
+                  ? (selectedSandbox ? sandboxes.find((s) => s.slug === selectedSandbox)?.name || "Sandbox" : "Sandbox")
+                  : "Sandbox"}
+              </span>
+              {sandboxEnabled && sandboxImageState && sandboxImageState.status !== "idle" && (
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    sandboxImageState.status === "ready"
+                      ? "bg-green-500"
+                      : sandboxImageState.status === "pulling"
+                        ? "bg-amber-500 animate-pulse"
+                        : "bg-cc-error"
+                  }`}
+                  title={
+                    sandboxImageState.status === "ready"
+                      ? "Docker image ready"
+                      : sandboxImageState.status === "pulling"
+                        ? "Pulling Docker image..."
+                        : `Image error: ${sandboxImageState.error || "unknown"}`
+                  }
+                />
+              )}
+              <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3 opacity-50">
+                <path d="M4 6l4 4 4-4" />
+              </svg>
+            </button>
+            {showSandboxDropdown && (
+              <div className="absolute left-0 bottom-full mb-1 w-56 bg-cc-card border border-cc-border rounded-[10px] shadow-lg z-10 py-1 overflow-hidden">
+                <button
+                  onClick={() => {
+                    setSandboxEnabled(false);
+                    localStorage.setItem("cc-sandbox-enabled", "false");
+                    setShowSandboxDropdown(false);
+                  }}
+                  className={`w-full px-3 py-2 text-xs text-left hover:bg-cc-hover transition-colors cursor-pointer ${
+                    !sandboxEnabled ? "text-cc-primary font-medium" : "text-cc-fg"
+                  }`}
+                >
+                  Off
+                </button>
+                <div className="border-t border-cc-border my-0.5" />
+                <button
+                  onClick={() => {
+                    setSandboxEnabled(true);
+                    localStorage.setItem("cc-sandbox-enabled", "true");
+                    setSelectedSandbox("");
+                    localStorage.setItem("cc-selected-sandbox", "");
+                    setShowSandboxDropdown(false);
+                  }}
+                  className={`w-full px-3 py-2 text-xs text-left hover:bg-cc-hover transition-colors cursor-pointer ${
+                    sandboxEnabled && !selectedSandbox ? "text-cc-primary font-medium" : "text-cc-fg"
+                  }`}
+                >
+                  Default (the-companion:latest)
+                </button>
+                {sandboxes.map((sb) => (
+                  <button
+                    key={sb.slug}
+                    onClick={() => {
+                      setSandboxEnabled(true);
+                      localStorage.setItem("cc-sandbox-enabled", "true");
+                      setSelectedSandbox(sb.slug);
+                      localStorage.setItem("cc-selected-sandbox", sb.slug);
+                      setShowSandboxDropdown(false);
+                    }}
+                    className={`w-full px-3 py-2 text-xs text-left hover:bg-cc-hover transition-colors cursor-pointer flex items-center gap-1 ${
+                      sandboxEnabled && sb.slug === selectedSandbox ? "text-cc-primary font-medium" : "text-cc-fg"
+                    }`}
+                  >
+                    <span className="truncate">{sb.name}</span>
+                  </button>
+                ))}
+                <div className="border-t border-cc-border mt-1 pt-1">
+                  <a
+                    href="#/sandboxes"
+                    className="block w-full px-3 py-2 text-xs text-left text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer"
+                    onClick={() => setShowSandboxDropdown(false)}
+                  >
+                    Manage sandboxes...
+                  </a>
                 </div>
               </div>
             )}
@@ -1366,6 +1469,7 @@ export function HomePage() {
             selectedLinearIssue={selectedLinearIssue}
             onIssueSelect={handleIssueSelect}
             onBranchFromIssue={handleBranchFromIssue}
+            onConnectionSelect={setSelectedLinearConnectionId}
           />
         </div>
 

@@ -109,6 +109,7 @@ interface AppState {
   updateInfo: UpdateInfo | null;
   updateDismissedVersion: string | null;
   updateOverlayActive: boolean;
+  dockerUpdateDialogOpen: boolean;
 
   // Session creation progress (SSE streaming)
   creationProgress: CreationProgressEvent[] | null;
@@ -131,7 +132,7 @@ interface AppState {
   homeResetKey: number;
   publicUrl: string;
   editorTabEnabled: boolean;
-  activeTab: "chat" | "diff" | "terminal" | "processes" | "editor";
+  activeTab: "chat" | "diff" | "terminal" | "processes" | "editor" | "browser";
   chatTabReentryTickBySession: Map<string, number>;
   diffPanelSelectedFile: Map<string, string>;
 
@@ -174,6 +175,7 @@ interface AppState {
   addPermission: (sessionId: string, perm: PermissionRequest) => void;
   removePermission: (sessionId: string, requestId: string) => void;
   addAiResolvedPermission: (sessionId: string, entry: { request: PermissionRequest; behavior: "allow" | "deny"; reason: string; timestamp: number }) => void;
+  clearAiResolvedPermissions: (sessionId: string) => void;
   setSessionAiValidation: (sessionId: string, settings: { aiValidationEnabled?: boolean | null; aiValidationAutoApprove?: boolean | null; aiValidationAutoDeny?: boolean | null }) => void;
 
   // Task actions
@@ -223,10 +225,11 @@ interface AppState {
   setUpdateInfo: (info: UpdateInfo | null) => void;
   dismissUpdate: (version: string) => void;
   setUpdateOverlayActive: (active: boolean) => void;
+  setDockerUpdateDialogOpen: (open: boolean) => void;
   setEditorTabEnabled: (enabled: boolean) => void;
 
   // Diff panel actions
-  setActiveTab: (tab: "chat" | "diff" | "terminal" | "processes" | "editor") => void;
+  setActiveTab: (tab: "chat" | "diff" | "terminal" | "processes" | "editor" | "browser") => void;
   markChatTabReentry: (sessionId: string) => void;
   setDiffPanelSelectedFile: (sessionId: string, filePath: string | null) => void;
 
@@ -368,6 +371,7 @@ export const useStore = create<AppState>((set) => ({
   updateInfo: null,
   updateDismissedVersion: getInitialDismissedVersion(),
   updateOverlayActive: false,
+  dockerUpdateDialogOpen: false,
   darkMode: getInitialDarkMode(),
   notificationSound: getInitialNotificationSound(),
   notificationDesktop: getInitialNotificationDesktop(),
@@ -641,6 +645,13 @@ export const useStore = create<AppState>((set) => ({
       return { aiResolvedPermissions };
     }),
 
+  clearAiResolvedPermissions: (sessionId) =>
+    set((s) => {
+      const aiResolvedPermissions = new Map(s.aiResolvedPermissions);
+      aiResolvedPermissions.delete(sessionId);
+      return { aiResolvedPermissions };
+    }),
+
   setSessionAiValidation: (sessionId, settings) =>
     set((s) => {
       const sessions = new Map(s.sessions);
@@ -844,6 +855,7 @@ export const useStore = create<AppState>((set) => ({
     set({ updateDismissedVersion: version });
   },
   setUpdateOverlayActive: (active) => set({ updateOverlayActive: active }),
+  setDockerUpdateDialogOpen: (open) => set({ dockerUpdateDialogOpen: open }),
   setEditorTabEnabled: (enabled) => set({ editorTabEnabled: enabled }),
 
   setActiveTab: (tab) => set({ activeTab: tab }),

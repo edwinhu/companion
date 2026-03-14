@@ -12,10 +12,18 @@ vi.mock("./auth-manager.js", () => ({
 vi.mock("./env-manager.js", () => ({
   listEnvs: vi.fn(() => []),
   getEnv: vi.fn(() => null),
-  getEffectiveImage: vi.fn(() => null),
   createEnv: vi.fn(),
   updateEnv: vi.fn(),
   deleteEnv: vi.fn(),
+}));
+
+// Mock sandbox-manager — sandboxes now own Docker/container config (separated from envs)
+vi.mock("./sandbox-manager.js", () => ({
+  listSandboxes: vi.fn(() => []),
+  getSandbox: vi.fn(() => null),
+  createSandbox: vi.fn(),
+  updateSandbox: vi.fn(),
+  deleteSandbox: vi.fn(() => false),
 }));
 
 vi.mock("./prompt-manager.js", () => ({
@@ -67,10 +75,10 @@ vi.mock("./session-names.js", () => ({
 }));
 
 vi.mock("./settings-manager.js", () => ({
-  DEFAULT_ANTHROPIC_MODEL: "claude-sonnet-4.6",
+  DEFAULT_ANTHROPIC_MODEL: "claude-sonnet-4-6",
   getSettings: vi.fn(() => ({
     anthropicApiKey: "",
-    anthropicModel: "claude-sonnet-4.6",
+    anthropicModel: "claude-sonnet-4-6",
     linearApiKey: "",
     linearAutoTransition: false,
     linearAutoTransitionStateId: "",
@@ -78,17 +86,23 @@ vi.mock("./settings-manager.js", () => ({
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+    linearOAuthClientId: "",
+    linearOAuthClientSecret: "",
+    linearOAuthWebhookSecret: "",
+    linearOAuthAccessToken: "",
+    linearOAuthRefreshToken: "",
     editorTabEnabled: false,
     aiValidationEnabled: false,
     aiValidationAutoApprove: true,
-    aiValidationAutoDeny: true,
+    aiValidationAutoDeny: false,
     publicUrl: "",
     updateChannel: "stable",
+    dockerAutoUpdate: false,
     updatedAt: 0,
   })),
   updateSettings: vi.fn((patch) => ({
     anthropicApiKey: patch.anthropicApiKey ?? "",
-    anthropicModel: patch.anthropicModel ?? "claude-sonnet-4.6",
+    anthropicModel: patch.anthropicModel ?? "claude-sonnet-4-6",
     linearApiKey: patch.linearApiKey ?? "",
     linearAutoTransition: patch.linearAutoTransition ?? false,
     linearAutoTransitionStateId: patch.linearAutoTransitionStateId ?? "",
@@ -96,12 +110,18 @@ vi.mock("./settings-manager.js", () => ({
     linearArchiveTransition: patch.linearArchiveTransition ?? false,
     linearArchiveTransitionStateId: patch.linearArchiveTransitionStateId ?? "",
     linearArchiveTransitionStateName: patch.linearArchiveTransitionStateName ?? "",
+    linearOAuthClientId: patch.linearOAuthClientId ?? "",
+    linearOAuthClientSecret: patch.linearOAuthClientSecret ?? "",
+    linearOAuthWebhookSecret: patch.linearOAuthWebhookSecret ?? "",
+    linearOAuthAccessToken: patch.linearOAuthAccessToken ?? "",
+    linearOAuthRefreshToken: patch.linearOAuthRefreshToken ?? "",
     editorTabEnabled: patch.editorTabEnabled ?? false,
     aiValidationEnabled: patch.aiValidationEnabled ?? false,
     aiValidationAutoApprove: patch.aiValidationAutoApprove ?? true,
-    aiValidationAutoDeny: patch.aiValidationAutoDeny ?? true,
+    aiValidationAutoDeny: patch.aiValidationAutoDeny ?? false,
     publicUrl: patch.publicUrl ?? "",
     updateChannel: patch.updateChannel ?? "stable",
+    dockerAutoUpdate: patch.dockerAutoUpdate ?? false,
     updatedAt: Date.now(),
   })),
 }));
@@ -142,6 +162,20 @@ vi.mock("./linear-project-manager.js", () => ({
     updatedAt: Date.now(),
   })),
   removeMapping: vi.fn(() => false),
+  _resetForTest: vi.fn(),
+}));
+
+// Mock linear-connections to isolate from the file-based connection store.
+// resolveApiKey returns a valid key by default; tests that need "no key"
+// override it to return null.
+vi.mock("./linear-connections.js", () => ({
+  listConnections: vi.fn(() => []),
+  getConnection: vi.fn(() => null),
+  getDefaultConnection: vi.fn(() => null),
+  createConnection: vi.fn(),
+  updateConnection: vi.fn(),
+  deleteConnection: vi.fn(),
+  resolveApiKey: vi.fn(() => ({ apiKey: "lin_api_123", connectionId: "test-conn" })),
   _resetForTest: vi.fn(),
 }));
 
@@ -236,11 +270,13 @@ import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createRoutes } from "./routes.js";
 import * as envManager from "./env-manager.js";
+import * as sandboxManager from "./sandbox-manager.js";
 import * as promptManager from "./prompt-manager.js";
 import * as gitUtils from "./git-utils.js";
 import * as sessionNames from "./session-names.js";
 import * as settingsManager from "./settings-manager.js";
 import * as linearProjectManager from "./linear-project-manager.js";
+import { resolveApiKey } from "./linear-connections.js";
 import { containerManager } from "./container-manager.js";
 
 // ─── Mock factories ──────────────────────────────────────────────────────────
@@ -269,7 +305,9 @@ function createMockBridge() {
     getAllSessions: vi.fn(() => []),
     getCodexRateLimits: vi.fn(() => null),
     markContainerized: vi.fn(),
+    prePopulateCommands: vi.fn(),
     broadcastNameUpdate: vi.fn(),
+    injectSystemPrompt: vi.fn(),
   } as any;
 }
 
@@ -299,6 +337,8 @@ let terminalManager: { getInfo: ReturnType<typeof vi.fn>; spawn: ReturnType<type
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Re-establish default return value for resolveApiKey after clearAllMocks
+  vi.mocked(resolveApiKey).mockReturnValue({ apiKey: "lin_api_123", connectionId: "test-conn" });
   mockDiscoverClaudeSessions.mockReturnValue([]);
   mockGetClaudeSessionHistoryPage.mockReturnValue(null);
   mockUpdateCheckerState.currentVersion = "0.22.1";
@@ -595,16 +635,21 @@ describe("POST /api/sessions/create", () => {
     );
   });
 
-  it("returns 503 when env has Docker image but container startup fails", async () => {
+  it("returns 503 when sandbox has Docker image but container startup fails", async () => {
     vi.mocked(envManager.getEnv).mockReturnValue({
       name: "Companion",
       slug: "companion",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Companion",
+      slug: "companion",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "imageExists").mockReturnValueOnce(true);
     vi.spyOn(containerManager, "createContainer").mockImplementationOnce(() => {
       throw new Error("docker daemon timeout");
@@ -613,7 +658,7 @@ describe("POST /api/sessions/create", () => {
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "companion" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "companion", sandboxEnabled: true, sandboxSlug: "companion" }),
     });
 
     expect(res.status).toBe(503);
@@ -630,16 +675,21 @@ describe("POST /api/sessions/create", () => {
       name: "Codex Docker",
       slug: "codex-docker",
       variables: {},
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Codex Docker",
+      slug: "codex-docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
 
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "codex-docker", backend: "codex" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "codex-docker", sandboxEnabled: true, sandboxSlug: "codex-docker", backend: "codex" }),
     });
 
     expect(res.status).toBe(400);
@@ -654,11 +704,16 @@ describe("POST /api/sessions/create", () => {
       name: "Codex Docker",
       slug: "codex-docker",
       variables: { OPENAI_API_KEY: "sk-test" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Codex Docker",
+      slug: "codex-docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "imageExists").mockReturnValueOnce(true);
     const createSpy = vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-codex",
@@ -674,7 +729,7 @@ describe("POST /api/sessions/create", () => {
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "codex-docker", backend: "codex" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "codex-docker", sandboxEnabled: true, sandboxSlug: "codex-docker", backend: "codex" }),
     });
 
     expect(res.status).toBe(200);
@@ -694,12 +749,16 @@ describe("POST /api/sessions/create", () => {
       name: "Companion",
       slug: "companion",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
-      ports: [3000],
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Companion",
+      slug: "companion",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     const createSpy = vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-vscode",
       name: "companion-vscode",
@@ -714,7 +773,7 @@ describe("POST /api/sessions/create", () => {
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "companion" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "companion", sandboxEnabled: true, sandboxSlug: "companion", container: { ports: [3000] } }),
     });
 
     expect(res.status).toBe(200);
@@ -730,11 +789,16 @@ describe("POST /api/sessions/create", () => {
       name: "Companion",
       slug: "companion",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Companion",
+      slug: "companion",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     mockImagePullIsReady.mockReturnValue(false);
     mockImagePullGetState.mockReturnValue({
       image: "the-companion:latest",
@@ -756,7 +820,7 @@ describe("POST /api/sessions/create", () => {
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "companion" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "companion", sandboxEnabled: true, sandboxSlug: "companion" }),
     });
 
     expect(res.status).toBe(200);
@@ -765,18 +829,23 @@ describe("POST /api/sessions/create", () => {
     expect(launcher.launch).toHaveBeenCalled();
   });
 
-  it("runs init script before launching CLI when env has initScript", async () => {
-    // Environment with initScript and Docker image
+  it("runs init script before launching CLI when sandbox has initScript", async () => {
+    // Sandbox with initScript and Docker image
     vi.mocked(envManager.getEnv).mockReturnValue({
       name: "WithInit",
       slug: "with-init",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
-      initScript: "bun install && pip install -r requirements.txt",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "WithInit",
+      slug: "with-init",
+      initScript: "bun install && pip install -r requirements.txt",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "imageExists").mockReturnValueOnce(true);
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-init",
@@ -794,7 +863,7 @@ describe("POST /api/sessions/create", () => {
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "with-init" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "with-init", sandboxEnabled: true, sandboxSlug: "with-init" }),
     });
 
     expect(res.status).toBe(200);
@@ -813,12 +882,17 @@ describe("POST /api/sessions/create", () => {
       name: "FailInit",
       slug: "fail-init",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
-      initScript: "exit 1",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "FailInit",
+      slug: "fail-init",
+      initScript: "exit 1",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "imageExists").mockReturnValueOnce(true);
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-fail",
@@ -836,7 +910,7 @@ describe("POST /api/sessions/create", () => {
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "fail-init" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "fail-init", sandboxEnabled: true, sandboxSlug: "fail-init" }),
     });
 
     expect(res.status).toBe(503);
@@ -861,11 +935,16 @@ describe("POST /api/sessions/create", () => {
       name: "Docker",
       slug: "docker",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Docker",
+      slug: "docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-git",
       name: "companion-git",
@@ -886,7 +965,7 @@ describe("POST /api/sessions/create", () => {
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/repo", branch: "feat/new", envSlug: "docker" }),
+      body: JSON.stringify({ cwd: "/repo", branch: "feat/new", envSlug: "docker", sandboxEnabled: true, sandboxSlug: "docker" }),
     });
 
     expect(res.status).toBe(200);
@@ -907,11 +986,16 @@ describe("POST /api/sessions/create", () => {
       name: "Docker",
       slug: "docker",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Docker",
+      slug: "docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-nobranch",
       name: "companion-nobranch",
@@ -927,7 +1011,7 @@ describe("POST /api/sessions/create", () => {
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "docker" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "docker", sandboxEnabled: true, sandboxSlug: "docker" }),
     });
 
     expect(res.status).toBe(200);
@@ -947,11 +1031,16 @@ describe("POST /api/sessions/create", () => {
       name: "Docker",
       slug: "docker",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Docker",
+      slug: "docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-failcheckout",
       name: "companion-failcheckout",
@@ -972,7 +1061,7 @@ describe("POST /api/sessions/create", () => {
     const res = await app.request("/api/sessions/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/repo", branch: "nonexistent", envSlug: "docker" }),
+      body: JSON.stringify({ cwd: "/repo", branch: "nonexistent", envSlug: "docker", sandboxEnabled: true, sandboxSlug: "docker" }),
     });
 
     expect(res.status).toBe(400);
@@ -1019,6 +1108,48 @@ describe("POST /api/sessions/create", () => {
         forkSession: false,
       }),
     );
+  });
+
+  it("uses the-companion:latest when sandboxEnabled is true but no sandboxSlug is provided", async () => {
+    // Validates the default image fallback path: when sandboxEnabled is true
+    // but no sandboxSlug is given, the route should use "the-companion:latest"
+    // as the effectiveImage without calling sandboxManager.getSandbox or
+    // since there is no sandbox to look up.
+    vi.mocked(envManager.getEnv).mockReturnValue({
+      name: "my-env",
+      slug: "my-env",
+      variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
+      createdAt: 1000,
+      updatedAt: 1000,
+    } as any);
+    vi.spyOn(containerManager, "imageExists").mockReturnValueOnce(true);
+    vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
+      containerId: "cid-default",
+      name: "companion-default",
+      image: "the-companion:latest",
+      portMappings: [],
+      hostCwd: "/test",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+    vi.spyOn(containerManager, "retrack").mockImplementation(() => {});
+
+    const res = await app.request("/api/sessions/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/test", envSlug: "my-env", sandboxEnabled: true }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(launcher.launch).toHaveBeenCalled();
+
+    // sandboxManager.getSandbox should NOT be called because no sandboxSlug was provided.
+    // The route only calls getSandbox when body.sandboxSlug is truthy.
+    expect(sandboxManager.getSandbox).not.toHaveBeenCalled();
+
+    // The container should have been created with the default base image
+    const createContainerCall = vi.mocked(containerManager.createContainer).mock.calls[0];
+    expect(createContainerCall[2].image).toBe("the-companion:latest");
   });
 });
 
@@ -1564,7 +1695,7 @@ describe("POST /api/sessions/:id/archive — Linear transition", () => {
     mockGetLinearIssue.mockReturnValue(linkedIssue);
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_test_key",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -1572,12 +1703,18 @@ describe("POST /api/sessions/:id/archive — Linear transition", () => {
       linearArchiveTransition: false,
       linearArchiveTransitionStateId: "",
       linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
     const res = await app.request("/api/sessions/s1/archive", {
@@ -1588,9 +1725,9 @@ describe("POST /api/sessions/:id/archive — Linear transition", () => {
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json.ok).toBe(true);
-    // Should have resolved backlog state from team states
-    expect(mockFetchLinearTeamStates).toHaveBeenCalledWith("lin_test_key");
-    expect(mockTransitionLinearIssue).toHaveBeenCalledWith("issue-1", "state-backlog", "lin_test_key");
+    // Should have resolved backlog state from team states (uses resolveApiKey)
+    expect(mockFetchLinearTeamStates).toHaveBeenCalledWith("lin_api_123");
+    expect(mockTransitionLinearIssue).toHaveBeenCalledWith("issue-1", "state-backlog", "lin_api_123", "test-conn");
     expect(json.linearTransition).toBeDefined();
     expect(json.linearTransition.ok).toBe(true);
     // Session should still be archived
@@ -1601,7 +1738,7 @@ describe("POST /api/sessions/:id/archive — Linear transition", () => {
     mockGetLinearIssue.mockReturnValue(linkedIssue);
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_test_key",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -1609,12 +1746,18 @@ describe("POST /api/sessions/:id/archive — Linear transition", () => {
       linearArchiveTransition: true,
       linearArchiveTransitionStateId: "state-custom",
       linearArchiveTransitionStateName: "Review",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
     const res = await app.request("/api/sessions/s1/archive", {
@@ -1623,7 +1766,7 @@ describe("POST /api/sessions/:id/archive — Linear transition", () => {
       body: JSON.stringify({ linearTransition: "configured" }),
     });
     expect(res.status).toBe(200);
-    expect(mockTransitionLinearIssue).toHaveBeenCalledWith("issue-1", "state-custom", "lin_test_key");
+    expect(mockTransitionLinearIssue).toHaveBeenCalledWith("issue-1", "state-custom", "lin_api_123", "test-conn");
   });
 
   it("archives successfully even when transition fails", async () => {
@@ -1631,7 +1774,7 @@ describe("POST /api/sessions/:id/archive — Linear transition", () => {
     mockTransitionLinearIssue.mockResolvedValue({ ok: false, error: "Linear API error" });
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_test_key",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -1639,12 +1782,18 @@ describe("POST /api/sessions/:id/archive — Linear transition", () => {
       linearArchiveTransition: false,
       linearArchiveTransitionStateId: "",
       linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
     const res = await app.request("/api/sessions/s1/archive", {
@@ -1709,7 +1858,7 @@ describe("GET /api/sessions/:id/archive-info", () => {
     });
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_test_key",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -1717,12 +1866,18 @@ describe("GET /api/sessions/:id/archive-info", () => {
       linearArchiveTransition: true,
       linearArchiveTransitionStateId: "state-custom",
       linearArchiveTransitionStateName: "Review",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
     const res = await app.request("/api/sessions/s1/archive-info", { method: "GET" });
@@ -1789,12 +1944,6 @@ describe("POST /api/envs", () => {
     expect(envManager.createEnv).toHaveBeenCalledWith(
       "Staging",
       { HOST: "staging.example.com" },
-      {
-        dockerfile: undefined,
-        baseImage: undefined,
-        ports: undefined,
-        volumes: undefined,
-      },
     );
   });
 
@@ -2076,7 +2225,7 @@ describe("GET /api/settings", () => {
   it("returns settings status without exposing the key", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "or-secret",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2084,12 +2233,18 @@ describe("GET /api/settings", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 123,
     });
 
@@ -2099,18 +2254,22 @@ describe("GET /api/settings", () => {
     const json = await res.json();
     expect(json).toEqual({
       anthropicApiKeyConfigured: true,
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKeyConfigured: false,
+      linearConnectionCount: 0,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
     linearArchiveTransition: false,
     linearArchiveTransitionStateName: "",
+      linearOAuthConfigured: false,
+      linearOAuthCredentialsSaved: false,
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
     });
   });
 
@@ -2125,12 +2284,18 @@ describe("GET /api/settings", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 123,
     });
 
@@ -2142,16 +2307,20 @@ describe("GET /api/settings", () => {
       anthropicApiKeyConfigured: false,
       anthropicModel: "openai/gpt-4o-mini",
       linearApiKeyConfigured: true,
+      linearConnectionCount: 0,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
     linearArchiveTransition: false,
     linearArchiveTransitionStateName: "",
+      linearOAuthConfigured: false,
+      linearOAuthCredentialsSaved: false,
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
     });
   });
 
@@ -2159,7 +2328,7 @@ describe("GET /api/settings", () => {
   it("includes publicUrl in response when configured", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2167,12 +2336,18 @@ describe("GET /api/settings", () => {
       linearArchiveTransition: false,
       linearArchiveTransitionStateId: "",
       linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "https://example.com",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 100,
     });
 
@@ -2188,7 +2363,7 @@ describe("PUT /api/settings", () => {
   it("updates settings", async () => {
     vi.mocked(settingsManager.updateSettings).mockReturnValue({
       anthropicApiKey: "new-key",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2196,12 +2371,18 @@ describe("PUT /api/settings", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 456,
     });
 
@@ -2222,6 +2403,9 @@ describe("PUT /api/settings", () => {
       linearArchiveTransition: undefined,
       linearArchiveTransitionStateId: undefined,
       linearArchiveTransitionStateName: undefined,
+      linearOAuthClientId: undefined,
+      linearOAuthClientSecret: undefined,
+      linearOAuthWebhookSecret: undefined,
       editorTabEnabled: undefined,
       aiValidationEnabled: undefined,
       aiValidationAutoApprove: undefined,
@@ -2231,25 +2415,29 @@ describe("PUT /api/settings", () => {
     const json = await res.json();
     expect(json).toEqual({
       anthropicApiKeyConfigured: true,
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKeyConfigured: false,
+      linearConnectionCount: 0,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
     linearArchiveTransition: false,
     linearArchiveTransitionStateName: "",
+      linearOAuthConfigured: false,
+      linearOAuthCredentialsSaved: false,
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
     });
   });
 
   it("trims key and falls back to default model for blank value", async () => {
     vi.mocked(settingsManager.updateSettings).mockReturnValue({
       anthropicApiKey: "trimmed-key",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_trimmed",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2257,12 +2445,18 @@ describe("PUT /api/settings", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 789,
     });
 
@@ -2275,7 +2469,7 @@ describe("PUT /api/settings", () => {
     expect(res.status).toBe(200);
     expect(settingsManager.updateSettings).toHaveBeenCalledWith({
       anthropicApiKey: "trimmed-key",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_trimmed",
       linearAutoTransition: undefined,
       linearAutoTransitionStateId: undefined,
@@ -2295,12 +2489,18 @@ describe("PUT /api/settings", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 999,
     });
 
@@ -2388,7 +2588,7 @@ describe("PUT /api/settings", () => {
   it("accepts and saves publicUrl string", async () => {
     vi.mocked(settingsManager.updateSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2396,12 +2596,18 @@ describe("PUT /api/settings", () => {
       linearArchiveTransition: false,
       linearArchiveTransitionStateId: "",
       linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "https://my-server.com",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 500,
     });
 
@@ -2558,7 +2764,7 @@ describe("GET /api/linear/issues", () => {
   it("returns 400 when linear key is not configured", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2566,25 +2772,32 @@ describe("GET /api/linear/issues", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
+    vi.mocked(resolveApiKey).mockReturnValue(null);
 
     const res = await app.request("/api/linear/issues?query=auth", { method: "GET" });
     expect(res.status).toBe(400);
     const json = await res.json();
-    expect(json).toEqual({ error: "Linear API key is not configured" });
+    expect(json).toEqual({ error: "No Linear connection configured" });
   });
 
   it("proxies Linear issue search results with branchName", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2592,12 +2805,18 @@ describe("GET /api/linear/issues", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -2664,7 +2883,7 @@ describe("GET /api/linear/issues", () => {
     // items before currently started ones.
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2672,12 +2891,18 @@ describe("GET /api/linear/issues", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -2751,7 +2976,7 @@ describe("GET /api/linear/issues", () => {
     // the response maps it to an empty string so the frontend can generate a slug
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2759,12 +2984,18 @@ describe("GET /api/linear/issues", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -2803,7 +3034,7 @@ describe("GET /api/linear/connection", () => {
   it("returns 400 when linear key is not configured", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2811,25 +3042,32 @@ describe("GET /api/linear/connection", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
+    vi.mocked(resolveApiKey).mockReturnValue(null);
 
     const res = await app.request("/api/linear/connection", { method: "GET" });
     expect(res.status).toBe(400);
     const json = await res.json();
-    expect(json).toEqual({ error: "Linear API key is not configured" });
+    expect(json).toEqual({ error: "No Linear connection configured" });
   });
 
   it("returns viewer/team info when connection works", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -2837,12 +3075,18 @@ describe("GET /api/linear/connection", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -2878,7 +3122,7 @@ describe("POST /api/linear/issues/:id/transition", () => {
   it("skips when auto-transition is disabled", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "state-123",
@@ -2886,12 +3130,18 @@ describe("POST /api/linear/issues/:id/transition", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -2909,7 +3159,7 @@ describe("POST /api/linear/issues/:id/transition", () => {
   it("skips when no target state is configured", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: true,
       linearAutoTransitionStateId: "",
@@ -2917,12 +3167,18 @@ describe("POST /api/linear/issues/:id/transition", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -2939,7 +3195,7 @@ describe("POST /api/linear/issues/:id/transition", () => {
   it("returns 400 when linear key is not configured", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: true,
       linearAutoTransitionStateId: "state-123",
@@ -2947,14 +3203,21 @@ describe("POST /api/linear/issues/:id/transition", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
+    vi.mocked(resolveApiKey).mockReturnValue(null);
 
     const res = await app.request("/api/linear/issues/issue-123/transition", {
       method: "POST",
@@ -2963,14 +3226,14 @@ describe("POST /api/linear/issues/:id/transition", () => {
     });
     expect(res.status).toBe(400);
     const json = await res.json();
-    expect(json).toEqual({ error: "Linear API key is not configured" });
+    expect(json).toEqual({ error: "No Linear connection configured" });
   });
 
   // Happy path: uses configured stateId to update the issue directly
   it("transitions issue to configured state", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: true,
       linearAutoTransitionStateId: "state-doing",
@@ -2978,12 +3241,18 @@ describe("POST /api/linear/issues/:id/transition", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -3036,7 +3305,7 @@ describe("POST /api/linear/issues/:id/transition", () => {
   it("returns 502 when issue update fails", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: true,
       linearAutoTransitionStateId: "state-doing",
@@ -3044,12 +3313,18 @@ describe("POST /api/linear/issues/:id/transition", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -3081,7 +3356,7 @@ describe("GET /api/linear/projects", () => {
   it("returns 400 when linear key is not configured", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -3089,25 +3364,32 @@ describe("GET /api/linear/projects", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
+    vi.mocked(resolveApiKey).mockReturnValue(null);
 
     const res = await app.request("/api/linear/projects", { method: "GET" });
     expect(res.status).toBe(400);
     const json = await res.json();
-    expect(json).toEqual({ error: "Linear API key is not configured" });
+    expect(json).toEqual({ error: "No Linear connection configured" });
   });
 
   it("returns project list from Linear API", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -3115,12 +3397,18 @@ describe("GET /api/linear/projects", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -3164,7 +3452,7 @@ describe("GET /api/linear/project-issues", () => {
   it("returns 400 when linear key is not configured", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -3172,25 +3460,32 @@ describe("GET /api/linear/project-issues", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
+    vi.mocked(resolveApiKey).mockReturnValue(null);
 
     const res = await app.request("/api/linear/project-issues?projectId=p1", { method: "GET" });
     expect(res.status).toBe(400);
     const json = await res.json();
-    expect(json).toEqual({ error: "Linear API key is not configured" });
+    expect(json).toEqual({ error: "No Linear connection configured" });
   });
 
   it("returns recent non-done issues for a project", async () => {
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -3198,12 +3493,18 @@ describe("GET /api/linear/project-issues", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -3262,7 +3563,7 @@ describe("GET /api/linear/project-issues", () => {
     // UI issue lists should present queued/backlog work first, followed by started work.
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "lin_api_123",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -3270,12 +3571,18 @@ describe("GET /api/linear/project-issues", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
 
@@ -4146,6 +4453,44 @@ describe("POST /api/sessions/create-stream", () => {
     expect(doneData.cwd).toBe("/test");
   });
 
+  it("emits 'Launching Codex...' label for codex backend", async () => {
+    // The SSE progress label should reflect the backend type
+    const res = await app.request("/api/sessions/create-stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/test", backend: "codex" }),
+    });
+
+    expect(res.status).toBe(200);
+    const events = await parseSSE(res);
+    const launchingEvent = events
+      .filter((e) => e.event === "progress")
+      .map((e) => JSON.parse(e.data))
+      .find((d) => d.step === "launching_cli" && d.status === "in_progress");
+
+    expect(launchingEvent).toBeDefined();
+    expect(launchingEvent!.label).toBe("Launching Codex...");
+  });
+
+  it("emits 'Launching Claude Code...' label for claude backend", async () => {
+    // Default backend (claude) should show Claude Code in the label
+    const res = await app.request("/api/sessions/create-stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: "/test" }),
+    });
+
+    expect(res.status).toBe(200);
+    const events = await parseSSE(res);
+    const launchingEvent = events
+      .filter((e) => e.event === "progress")
+      .map((e) => JSON.parse(e.data))
+      .find((d) => d.step === "launching_cli" && d.status === "in_progress");
+
+    expect(launchingEvent).toBeDefined();
+    expect(launchingEvent!.label).toBe("Launching Claude Code...");
+  });
+
   it("passes launch branching controls through to launcher", async () => {
     const res = await app.request("/api/sessions/create-stream", {
       method: "POST",
@@ -4324,16 +4669,21 @@ describe("POST /api/sessions/create-stream", () => {
   });
 
   it("emits container progress events for containerized session", async () => {
-    // Env with Docker image — image already exists
+    // Sandbox with Docker image — image already exists
     vi.mocked(envManager.getEnv).mockReturnValue({
       name: "Docker",
       slug: "docker",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Docker",
+      slug: "docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "imageExists").mockReturnValueOnce(true);
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-stream",
@@ -4349,7 +4699,7 @@ describe("POST /api/sessions/create-stream", () => {
     const res = await app.request("/api/sessions/create-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "docker" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "docker", sandboxEnabled: true, sandboxSlug: "docker" }),
     });
 
     expect(res.status).toBe(200);
@@ -4374,16 +4724,21 @@ describe("POST /api/sessions/create-stream", () => {
   });
 
   it("emits pulling_image step when image is not ready and waits for background pull", async () => {
-    // Env with Docker image that is not available yet — pull manager handles it
+    // Sandbox with Docker image that is not available yet — pull manager handles it
     vi.mocked(envManager.getEnv).mockReturnValue({
       name: "Docker",
       slug: "docker",
       variables: { ANTHROPIC_API_KEY: "key" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Docker",
+      slug: "docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     // Image not ready initially — pull manager will handle it
     mockImagePullIsReady.mockReturnValue(false);
     mockImagePullGetState.mockReturnValue({
@@ -4406,7 +4761,7 @@ describe("POST /api/sessions/create-stream", () => {
     const res = await app.request("/api/sessions/create-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "docker" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "docker", sandboxEnabled: true, sandboxSlug: "docker" }),
     });
 
     expect(res.status).toBe(200);
@@ -4432,11 +4787,16 @@ describe("POST /api/sessions/create-stream", () => {
       name: "Docker",
       slug: "docker",
       variables: { ANTHROPIC_API_KEY: "key" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Docker",
+      slug: "docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     mockImagePullIsReady.mockReturnValue(false);
     mockImagePullGetState.mockReturnValue({
       image: "the-companion:latest",
@@ -4449,7 +4809,7 @@ describe("POST /api/sessions/create-stream", () => {
     const res = await app.request("/api/sessions/create-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "docker" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "docker", sandboxEnabled: true, sandboxSlug: "docker" }),
     });
 
     expect(res.status).toBe(200);
@@ -4459,17 +4819,22 @@ describe("POST /api/sessions/create-stream", () => {
     expect(JSON.parse(errorEvent!.data).error).toContain("Pull and build both failed");
   });
 
-  it("emits init script progress events when env has initScript", async () => {
+  it("emits init script progress events when sandbox has initScript", async () => {
     vi.mocked(envManager.getEnv).mockReturnValue({
       name: "WithInit",
       slug: "with-init",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
-      initScript: "npm install",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "WithInit",
+      slug: "with-init",
+      initScript: "npm install",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "imageExists").mockReturnValueOnce(true);
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-init-stream",
@@ -4487,7 +4852,7 @@ describe("POST /api/sessions/create-stream", () => {
     const res = await app.request("/api/sessions/create-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "with-init" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "with-init", sandboxEnabled: true, sandboxSlug: "with-init" }),
     });
 
     expect(res.status).toBe(200);
@@ -4509,12 +4874,17 @@ describe("POST /api/sessions/create-stream", () => {
       name: "FailInit",
       slug: "fail-init",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
-      initScript: "exit 1",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "FailInit",
+      slug: "fail-init",
+      initScript: "exit 1",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "imageExists").mockReturnValueOnce(true);
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-fail-stream",
@@ -4532,7 +4902,7 @@ describe("POST /api/sessions/create-stream", () => {
     const res = await app.request("/api/sessions/create-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/test", envSlug: "fail-init" }),
+      body: JSON.stringify({ cwd: "/test", envSlug: "fail-init", sandboxEnabled: true, sandboxSlug: "fail-init" }),
     });
 
     expect(res.status).toBe(200);
@@ -4568,11 +4938,16 @@ describe("POST /api/sessions/create-stream", () => {
       name: "Docker",
       slug: "docker",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Docker",
+      slug: "docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-git-stream",
       name: "companion-git-stream",
@@ -4593,7 +4968,7 @@ describe("POST /api/sessions/create-stream", () => {
     const res = await app.request("/api/sessions/create-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/repo", branch: "feat/new", envSlug: "docker" }),
+      body: JSON.stringify({ cwd: "/repo", branch: "feat/new", envSlug: "docker", sandboxEnabled: true, sandboxSlug: "docker" }),
     });
 
     expect(res.status).toBe(200);
@@ -4639,11 +5014,16 @@ describe("POST /api/sessions/create-stream", () => {
       name: "Docker",
       slug: "docker",
       variables: { CLAUDE_CODE_OAUTH_TOKEN: "token" },
-      baseImage: "the-companion:latest",
       createdAt: 1000,
       updatedAt: 1000,
     } as any);
-    vi.mocked(envManager.getEffectiveImage).mockReturnValue("the-companion:latest");
+    vi.mocked(sandboxManager.getSandbox).mockReturnValue({
+      name: "Docker",
+      slug: "docker",
+      createdAt: 1000,
+      updatedAt: 1000,
+    });
+
     vi.spyOn(containerManager, "createContainer").mockReturnValueOnce({
       containerId: "cid-fail-git",
       name: "companion-fail-git",
@@ -4664,7 +5044,7 @@ describe("POST /api/sessions/create-stream", () => {
     const res = await app.request("/api/sessions/create-stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: "/repo", branch: "nonexistent", envSlug: "docker" }),
+      body: JSON.stringify({ cwd: "/repo", branch: "nonexistent", envSlug: "docker", sandboxEnabled: true, sandboxSlug: "docker" }),
     });
 
     expect(res.status).toBe(200);
@@ -4979,5 +5359,474 @@ describe("POST /api/sessions/:id/processes/system/:pid/kill", () => {
     expect(data.ok).toBe(true);
 
     killSpy.mockRestore();
+  });
+});
+
+// ── Browser preview endpoints ─────────────────────────────────────────────────
+
+describe("POST /api/sessions/:id/browser/start", () => {
+  it("returns host mode for non-container sessions", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+
+    const res = await app.request("/api/sessions/s1/browser/start", { method: "POST" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({
+      available: true,
+      mode: "host",
+    });
+  });
+
+  it("returns unavailable when container is missing", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+      containerId: "cid-1",
+    });
+    vi.spyOn(containerManager, "getContainer").mockReturnValue(undefined);
+
+    const res = await app.request("/api/sessions/s1/browser/start", { method: "POST" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({
+      available: false,
+      mode: "container",
+    });
+    expect(json.message).toContain("Container not found");
+  });
+
+  it("returns unavailable when Xvfb binary is missing", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+      containerId: "cid-1",
+    });
+    vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "cid-1",
+      name: "companion-s1",
+      image: "the-companion:latest",
+      portMappings: [{ containerPort: 6080, hostPort: 49200 }],
+      hostCwd: "/repo",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+    vi.spyOn(containerManager, "isContainerAlive").mockReturnValue("running");
+    // Xvfb not found, websockify found
+    vi.spyOn(containerManager, "hasBinaryInContainer").mockImplementation(
+      (_cid: string, bin: string) => bin !== "Xvfb",
+    );
+
+    const res = await app.request("/api/sessions/s1/browser/start", { method: "POST" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({
+      available: false,
+      mode: "container",
+    });
+    expect(json.message).toContain("Xvfb and noVNC");
+  });
+
+  it("starts display stack and returns proxied URL for container session", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+      containerId: "cid-1",
+    });
+    vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "cid-1",
+      name: "companion-s1",
+      image: "the-companion:latest",
+      portMappings: [{ containerPort: 6080, hostPort: 49200 }],
+      hostCwd: "/repo",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+    vi.spyOn(containerManager, "hasBinaryInContainer").mockReturnValue(true);
+    vi.spyOn(containerManager, "isContainerAlive").mockReturnValue("running");
+    const execSpy = vi.spyOn(containerManager, "execInContainerAsync").mockResolvedValue({ exitCode: 0, output: "" });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok", { status: 200 }));
+
+    const res = await app.request("/api/sessions/s1/browser/start", { method: "POST" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({
+      available: true,
+      mode: "container",
+    });
+    // URL should be a proxied path through the companion server
+    expect(json.url).toContain("/api/sessions/s1/browser/proxy/vnc.html");
+    expect(json.url).toContain("autoconnect=true");
+    expect(json.url).toContain("path=ws/novnc/s1");
+    // Should have called execInContainerAsync for the display stack and Chrome
+    expect(execSpy).toHaveBeenCalledTimes(2);
+    fetchSpy.mockRestore();
+  });
+
+  it("returns unavailable when noVNC polling times out", { timeout: 25_000 }, async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+      containerId: "cid-1",
+    });
+    vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "cid-1",
+      name: "companion-s1",
+      image: "the-companion:latest",
+      portMappings: [{ containerPort: 6080, hostPort: 49200 }],
+      hostCwd: "/repo",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+    vi.spyOn(containerManager, "hasBinaryInContainer").mockReturnValue(true);
+    vi.spyOn(containerManager, "isContainerAlive").mockReturnValue("running");
+    vi.spyOn(containerManager, "execInContainerAsync").mockResolvedValue({ exitCode: 0, output: "" });
+    // Simulate noVNC never becoming ready — all fetches throw
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("connection refused"));
+
+    const res = await app.request("/api/sessions/s1/browser/start", { method: "POST" });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({
+      available: false,
+      mode: "container",
+    });
+    expect(json.message).toContain("timed out");
+    fetchSpy.mockRestore();
+  });
+
+  it("rejects file:// URL scheme in browser/start", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+      containerId: "cid-1",
+    });
+    vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "cid-1",
+      name: "companion-s1",
+      image: "the-companion:latest",
+      portMappings: [{ containerPort: 6080, hostPort: 49200 }],
+      hostCwd: "/repo",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+    vi.spyOn(containerManager, "hasBinaryInContainer").mockReturnValue(true);
+    vi.spyOn(containerManager, "isContainerAlive").mockReturnValue("running");
+    vi.spyOn(containerManager, "execInContainerAsync").mockResolvedValue({ exitCode: 0, output: "" });
+
+    const res = await app.request("/api/sessions/s1/browser/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "file:///etc/passwd" }),
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({ available: false });
+    expect(json.message).toContain("http://");
+  });
+});
+
+describe("POST /api/sessions/:id/browser/navigate", () => {
+  it("returns 404 when session not found", async () => {
+    launcher.getSession.mockReturnValue(undefined);
+
+    const res = await app.request("/api/sessions/s1/browser/navigate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "http://localhost:3000" }),
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 400 for non-container session", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+
+    const res = await app.request("/api/sessions/s1/browser/navigate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "http://localhost:3000" }),
+    });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects file:// URL scheme", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+      containerId: "cid-1",
+    });
+
+    const res = await app.request("/api/sessions/s1/browser/navigate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "file:///etc/passwd" }),
+    });
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toContain("http://");
+  });
+
+  it("navigates Chrome to the given URL", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+      containerId: "cid-1",
+    });
+    vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "cid-1",
+      name: "companion-s1",
+      image: "the-companion:latest",
+      portMappings: [],
+      hostCwd: "/repo",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+    const execSpy = vi.spyOn(containerManager, "execInContainerAsync").mockResolvedValue({ exitCode: 0, output: "" });
+
+    const res = await app.request("/api/sessions/s1/browser/navigate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "http://localhost:3000" }),
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({ ok: true, url: "http://localhost:3000" });
+    expect(execSpy).toHaveBeenCalledWith(
+      "cid-1",
+      expect.arrayContaining(["sh", "-c"]),
+      { timeout: 10_000 },
+    );
+  });
+});
+
+describe("GET /api/sessions/:id/browser/proxy/*", () => {
+  it("returns 404 when session not found", async () => {
+    launcher.getSession.mockReturnValue(undefined);
+
+    const res = await app.request("/api/sessions/s1/browser/proxy/vnc.html");
+
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 400 for non-container session", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+
+    const res = await app.request("/api/sessions/s1/browser/proxy/vnc.html");
+
+    expect(res.status).toBe(400);
+  });
+
+  it("proxies request to container noVNC server", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+      containerId: "cid-1",
+    });
+    vi.spyOn(containerManager, "getContainer").mockReturnValue({
+      containerId: "cid-1",
+      name: "companion-s1",
+      image: "the-companion:latest",
+      portMappings: [{ containerPort: 6080, hostPort: 49200 }],
+      hostCwd: "/repo",
+      containerCwd: "/workspace",
+      state: "running",
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("<html>noVNC</html>", {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      }),
+    );
+
+    const res = await app.request("/api/sessions/s1/browser/proxy/vnc.html?autoconnect=true");
+
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toBe("<html>noVNC</html>");
+    // fetch should have been called with the container's mapped port
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining("http://127.0.0.1:49200/vnc.html"),
+    );
+    fetchSpy.mockRestore();
+  });
+});
+
+describe("GET /api/sessions/:id/browser/host-proxy/:port/*", () => {
+  it("returns 404 when session not found", async () => {
+    launcher.getSession.mockReturnValue(undefined);
+
+    const res = await app.request("/api/sessions/s1/browser/host-proxy/3000/index.html");
+
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 400 for invalid port", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+
+    const res = await app.request("/api/sessions/s1/browser/host-proxy/99999/index.html");
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toContain("Invalid port");
+  });
+
+  it("returns 400 for non-numeric port", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+
+    const res = await app.request("/api/sessions/s1/browser/host-proxy/abc/index.html");
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toContain("Invalid port");
+  });
+
+  // Security: Hono's router resolves literal ".." and "%2e%2e" before matching,
+  // returning 404 automatically. Our handler adds a defense-in-depth check for
+  // real HTTP servers where encoded traversal may bypass router normalization.
+  it("Hono blocks path traversal at router level (returns 404 not route match)", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+
+    // Both literal and encoded ".." are resolved by Hono's router before matching
+    const res = await app.request("/api/sessions/s1/browser/host-proxy/3000/%2e%2e/%2e%2e/etc/passwd");
+    expect(res.status).toBe(404);
+  });
+
+  // Security: block proxying to the companion server itself (would bypass remote auth)
+  it("rejects proxying to the companion server port", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+
+    // Default dev port is 3457
+    const res = await app.request("/api/sessions/s1/browser/host-proxy/3457/api/sessions");
+
+    expect(res.status).toBe(400);
+    const json = await res.json();
+    expect(json.error).toContain("Port not allowed");
+  });
+
+  it("blocks well-known sensitive service ports", async () => {
+    // Sensitive ports (databases, caches, mail) should be blocked to limit SSRF
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+
+    for (const blockedPort of [5432, 3306, 6379, 27017]) {
+      const res = await app.request(`/api/sessions/s1/browser/host-proxy/${blockedPort}/`);
+      expect(res.status).toBe(400);
+      const json = await res.json();
+      expect(json.error).toContain("Port not allowed");
+    }
+  });
+
+  it("proxies request to localhost on the given port", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("<html>App</html>", {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      }),
+    );
+
+    const res = await app.request("/api/sessions/s1/browser/host-proxy/3000/index.html");
+
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toBe("<html>App</html>");
+    // fetch should target 127.0.0.1 with the specified port and sub-path
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "http://127.0.0.1:3000/index.html",
+      expect.objectContaining({ redirect: "follow" }),
+    );
+    fetchSpy.mockRestore();
+  });
+
+  it("forwards query string to upstream", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("ok", { status: 200 }),
+    );
+
+    const res = await app.request("/api/sessions/s1/browser/host-proxy/5173/assets/main.js?v=123");
+
+    expect(res.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "http://127.0.0.1:5173/assets/main.js?v=123",
+      expect.objectContaining({ redirect: "follow" }),
+    );
+    fetchSpy.mockRestore();
+  });
+
+  // Error message should be generic to avoid leaking internal network info
+  it("returns generic 502 when upstream is unreachable", async () => {
+    launcher.getSession.mockReturnValue({
+      sessionId: "s1",
+      state: "running",
+      cwd: "/repo",
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      new Error("Connection refused"),
+    );
+
+    const res = await app.request("/api/sessions/s1/browser/host-proxy/9999/");
+
+    expect(res.status).toBe(502);
+    const json = await res.json();
+    // Should NOT leak the raw error message (e.g. "Connection refused 127.0.0.1:9999")
+    expect(json.error).toBe("Proxy failed: upstream unreachable");
+    fetchSpy.mockRestore();
   });
 });

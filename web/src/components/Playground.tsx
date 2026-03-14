@@ -40,6 +40,7 @@ import { LinearLogo } from "./LinearLogo.js";
 import { SessionCreationProgress } from "./SessionCreationProgress.js";
 import { SessionLaunchOverlay } from "./SessionLaunchOverlay.js";
 import { PlaygroundUpdateOverlay } from "./UpdateOverlay.js";
+import { PlaygroundDockerUpdateDialog } from "./DockerUpdateDialog.js";
 import { SessionItem } from "./SessionItem.js";
 import type { CreationProgressEvent } from "../types.js";
 import type { SessionItem as SessionItemType } from "../utils/project-grouping.js";
@@ -937,8 +938,8 @@ export function Playground() {
             <Card label="Per-session toggle (enabled)">
               <PlaygroundAiValidationToggle enabled={true} />
             </Card>
-            <Card label="Auto-resolved badges">
-              <div className="border border-cc-border rounded-xl overflow-hidden bg-cc-card divide-y divide-cc-border">
+            <Card label="Auto-resolved badge (with dismiss)">
+              <div className="border border-cc-border rounded-xl overflow-hidden bg-cc-card">
                 <AiValidationBadge
                   entry={{
                     request: mockPermission({
@@ -949,7 +950,12 @@ export function Playground() {
                     reason: "Read is a read-only tool",
                     timestamp: Date.now(),
                   }}
+                  onDismiss={() => alert("Dismissed!")}
                 />
+              </div>
+            </Card>
+            <Card label="Auto-resolved badge (denied, with dismiss)">
+              <div className="border border-cc-border rounded-xl overflow-hidden bg-cc-card">
                 <AiValidationBadge
                   entry={{
                     request: mockPermission({
@@ -960,7 +966,12 @@ export function Playground() {
                     reason: "Recursive delete of root directory",
                     timestamp: Date.now(),
                   }}
+                  onDismiss={() => alert("Dismissed!")}
                 />
+              </div>
+            </Card>
+            <Card label="Auto-resolved badge (no dismiss)">
+              <div className="border border-cc-border rounded-xl overflow-hidden bg-cc-card">
                 <AiValidationBadge
                   entry={{
                     request: mockPermission({
@@ -2525,6 +2536,26 @@ export function Playground() {
             </Card>
           </div>
         </Section>
+        {/* ─── Docker Update Dialog ─────────────────────────── */}
+        <Section
+          title="Docker Update Dialog"
+          description="Post-update dialog asking whether to also update the sandbox Docker image"
+        >
+          <div className="space-y-4">
+            <Card label="Prompt phase">
+              <PlaygroundDockerUpdateDialog phase="prompt" />
+            </Card>
+            <Card label="Pulling phase">
+              <PlaygroundDockerUpdateDialog phase="pulling" />
+            </Card>
+            <Card label="Done phase">
+              <PlaygroundDockerUpdateDialog phase="done" />
+            </Card>
+            <Card label="Error phase">
+              <PlaygroundDockerUpdateDialog phase="error" />
+            </Card>
+          </div>
+        </Section>
         {/* ─── CLAUDE.md Editor ──────────────────────────────── */}
         <Section
           title="CLAUDE.md Editor"
@@ -2545,6 +2576,91 @@ export function Playground() {
           description="Sidebar session rows — status dot, backend badge, Docker indicator, archive on hover"
         >
           <PlaygroundSessionItems />
+        </Section>
+        {/* ─── Browser Preview States ────────────────────────────── */}
+        <Section
+          title="Browser Preview"
+          description="Browser preview panel — host mode (HTTP proxy) and container mode (noVNC) — loading, error, and active states"
+        >
+          <div className="space-y-4 max-w-3xl">
+            <Card label="Loading state">
+              <div className="h-48 flex flex-col items-center justify-center gap-3 p-4 bg-cc-bg rounded border border-cc-border">
+                <div className="w-5 h-5 border-2 border-cc-primary border-t-transparent rounded-full animate-spin" />
+                <div className="text-sm text-cc-muted">Starting browser preview...</div>
+              </div>
+            </Card>
+            <Card label="Error state">
+              <div className="h-48 flex items-center justify-center p-4 bg-cc-bg rounded border border-cc-border">
+                <div className="px-4 py-3 rounded-lg bg-cc-error/10 border border-cc-error/30 text-sm text-cc-error max-w-md text-center">
+                  Browser preview unavailable.
+                </div>
+              </div>
+            </Card>
+            <Card label="Host mode (proxy — before navigation)">
+              <div className="h-48 flex flex-col bg-cc-bg rounded border border-cc-border overflow-hidden">
+                <div className="shrink-0 px-3 py-2 border-b border-cc-border flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="flex items-center justify-center w-7 h-7 rounded text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer"
+                    aria-label="Reload browser"
+                    title="Reload"
+                  >
+                    <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                      <path d="M13.65 2.35a1 1 0 0 0-1.3 0L11 3.7A5.99 5.99 0 0 0 2 8a1 1 0 1 0 2 0 4 4 0 0 1 6.29-3.29L8.65 6.35a1 1 0 0 0 .7 1.7H13a1 1 0 0 0 1-1V3.4a1 1 0 0 0-.35-.7z M14 8a1 1 0 1 0-2 0 4 4 0 0 1-6.29 3.29l1.64-1.64a1 1 0 0 0-.7-1.7H3.05a1 1 0 0 0-1 1v3.65a1 1 0 0 0 1.7.7L5 11.7A5.99 5.99 0 0 0 14 8z" />
+                    </svg>
+                  </button>
+                  <input
+                    type="text"
+                    defaultValue="http://localhost:3000"
+                    className="flex-1 px-2 py-1 text-xs rounded bg-cc-bg border border-cc-border text-cc-fg placeholder:text-cc-muted focus:outline-none focus:border-cc-primary"
+                    aria-label="Navigate URL"
+                    readOnly
+                  />
+                  <button
+                    type="button"
+                    className="px-3 py-1 rounded text-xs font-medium bg-cc-primary text-white hover:bg-cc-primary-hover transition-colors cursor-pointer"
+                  >
+                    Go
+                  </button>
+                </div>
+                <div className="flex-1 flex items-center justify-center text-xs text-cc-muted">
+                  Enter a URL and click Go to preview.
+                </div>
+              </div>
+            </Card>
+            <Card label="Container mode (noVNC — active)">
+              <div className="h-48 flex flex-col bg-cc-bg rounded border border-cc-border overflow-hidden">
+                <div className="shrink-0 px-3 py-2 border-b border-cc-border flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="flex items-center justify-center w-7 h-7 rounded text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer"
+                    aria-label="Reload browser"
+                    title="Reload"
+                  >
+                    <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                      <path d="M13.65 2.35a1 1 0 0 0-1.3 0L11 3.7A5.99 5.99 0 0 0 2 8a1 1 0 1 0 2 0 4 4 0 0 1 6.29-3.29L8.65 6.35a1 1 0 0 0 .7 1.7H13a1 1 0 0 0 1-1V3.4a1 1 0 0 0-.35-.7z M14 8a1 1 0 1 0-2 0 4 4 0 0 1-6.29 3.29l1.64-1.64a1 1 0 0 0-.7-1.7H3.05a1 1 0 0 0-1 1v3.65a1 1 0 0 0 1.7.7L5 11.7A5.99 5.99 0 0 0 14 8z" />
+                    </svg>
+                  </button>
+                  <input
+                    type="text"
+                    defaultValue="http://localhost:3000"
+                    className="flex-1 px-2 py-1 text-xs rounded bg-cc-bg border border-cc-border text-cc-fg placeholder:text-cc-muted focus:outline-none focus:border-cc-primary"
+                    aria-label="Navigate URL"
+                    readOnly
+                  />
+                  <button
+                    type="button"
+                    className="px-3 py-1 rounded text-xs font-medium bg-cc-primary text-white hover:bg-cc-primary-hover transition-colors cursor-pointer"
+                  >
+                    Go
+                  </button>
+                </div>
+                <div className="flex-1 flex items-center justify-center text-xs text-cc-muted">
+                  noVNC iframe would render here
+                </div>
+              </div>
+            </Card>
+          </div>
         </Section>
       </div>
     </div>
@@ -3478,7 +3594,7 @@ function PlaygroundAiValidationToggle({ enabled }: { enabled: boolean }) {
       total_lines_removed: 0,
       aiValidationEnabled: enabled,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       ...prev,
     });
     return () => {

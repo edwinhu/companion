@@ -34,12 +34,18 @@ describe("settings-manager", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
   });
@@ -81,12 +87,18 @@ describe("settings-manager", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 123,
     });
   });
@@ -96,6 +108,23 @@ describe("settings-manager", () => {
     _resetForTest(settingsPath);
 
     expect(getSettings().anthropicModel).toBe(DEFAULT_ANTHROPIC_MODEL);
+  });
+
+  // Migration: existing users with the old dot-form model ID should be auto-corrected
+  it("migrates persisted claude-sonnet-4.6 (dot) to claude-sonnet-4-6 (hyphen)", () => {
+    writeFileSync(
+      settingsPath,
+      JSON.stringify({
+        anthropicApiKey: "sk-ant-existing",
+        anthropicModel: "claude-sonnet-4.6",
+      }),
+      "utf-8",
+    );
+    _resetForTest(settingsPath);
+
+    const settings = getSettings();
+    expect(settings.anthropicModel).toBe(DEFAULT_ANTHROPIC_MODEL);
+    expect(settings.anthropicApiKey).toBe("sk-ant-existing");
   });
 
   it("updates only model while preserving existing key", () => {
@@ -135,22 +164,28 @@ describe("settings-manager", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
       editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
   });
 
   it("updates linear key without touching anthropic settings", () => {
-    updateSettings({ anthropicApiKey: "sk-ant-key", anthropicModel: "claude-sonnet-4.6" });
+    updateSettings({ anthropicApiKey: "sk-ant-key", anthropicModel: "claude-sonnet-4-6" });
     const updated = updateSettings({ linearApiKey: "lin_api_123" });
 
     expect(updated.anthropicApiKey).toBe("sk-ant-key");
-    expect(updated.anthropicModel).toBe("claude-sonnet-4.6");
+    expect(updated.anthropicModel).toBe("claude-sonnet-4-6");
     expect(updated.linearApiKey).toBe("lin_api_123");
   });
 
@@ -221,7 +256,7 @@ describe("settings-manager", () => {
       settingsPath,
       JSON.stringify({
         anthropicApiKey: "key",
-        anthropicModel: "claude-sonnet-4.6",
+        anthropicModel: "claude-sonnet-4-6",
       }),
       "utf-8",
     );

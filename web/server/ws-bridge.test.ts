@@ -1,5 +1,21 @@
 import { vi } from "vitest";
 
+// Stub Bun global for vitest (runs under Node, not Bun).
+// Bun.hash is used for CLI message deduplication in ws-bridge.ts.
+// A simple string hash is sufficient for test determinism.
+if (typeof globalThis.Bun === "undefined") {
+  (globalThis as any).Bun = {
+    hash(input: string | Uint8Array): number {
+      const s = typeof input === "string" ? input : new TextDecoder().decode(input);
+      let h = 0;
+      for (let i = 0; i < s.length; i++) {
+        h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+      }
+      return h >>> 0; // unsigned 32-bit
+    },
+  };
+}
+
 const mockExecSync = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", () => ({ execSync: mockExecSync }));
 vi.mock("node:crypto", () => ({ randomUUID: () => "test-uuid" }));
@@ -38,10 +54,31 @@ beforeEach(() => {
   bridge = new WsBridge();
   bridge.setStore(store);
   mockExecSync.mockReset();
+  // Suppress console output to prevent Vitest EnvironmentTeardownError.
+  // ws-bridge.ts and session-store.ts log via console.log/warn/error;
+  // when the Vitest worker tears down while a console relay RPC is still
+  // in-flight, it causes "Closing rpc while onUserConsoleLog was pending".
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
 afterEach(() => {
+  // Cancel pending debounce timers from SessionStore before removing
+  // the temp directory. Without this, debounced writes fire after rmSync
+  // and produce console.error calls that race with Vitest worker teardown.
+  store.dispose();
   rmSync(tempDir, { recursive: true, force: true });
+  vi.restoreAllMocks();
+});
+
+// Re-suppress console after the last test to prevent "Closing rpc while
+// onUserConsoleLog was pending" during Vitest worker teardown.
+afterAll(() => {
+  const noop = () => {};
+  console.log = noop;
+  console.warn = noop;
+  console.error = noop;
 });
 
 // ─── Helper: build a system.init NDJSON string ────────────────────────────────
@@ -176,6 +213,129 @@ describe("Session management", () => {
     expect(browser1.close).toHaveBeenCalled();
     expect(browser2.close).toHaveBeenCalled();
     expect(bridge.getSession("s1")).toBeUndefined();
+  });
+});
+
+// ─── prePopulateCommands ─────────────────────────────────────────────────────
+
+describe("prePopulateCommands", () => {
+  it("populates empty session state with commands and skills", () => {
+    // When a session has no commands/skills yet, prePopulateCommands should
+    // set them so the slash menu works before system.init arrives.
+    bridge.prePopulateCommands("s1", ["commit", "review-pr"], ["my-skill"]);
+    const session = bridge.getSession("s1")!;
+    expect(session.state.slash_commands).toEqual(["commit", "review-pr"]);
+    expect(session.state.skills).toEqual(["my-skill"]);
+  });
+
+  it("does not overwrite existing commands if already set", () => {
+    // If system.init already arrived and set commands, prePopulateCommands
+    // should not clobber them (guard against race condition).
+    const session = bridge.getOrCreateSession("s1");
+    session.state.slash_commands = ["existing-cmd"];
+    session.state.skills = ["existing-skill"];
+
+    bridge.prePopulateCommands("s1", ["new-cmd"], ["new-skill"]);
+
+    expect(session.state.slash_commands).toEqual(["existing-cmd"]);
+    expect(session.state.skills).toEqual(["existing-skill"]);
+  });
+
+  it("partially populates when only one field is empty", () => {
+    // If commands are already set but skills are empty, only skills
+    // should be populated.
+    const session = bridge.getOrCreateSession("s1");
+    session.state.slash_commands = ["existing-cmd"];
+    session.state.skills = [];
+
+    bridge.prePopulateCommands("s1", ["new-cmd"], ["new-skill"]);
+
+    expect(session.state.slash_commands).toEqual(["existing-cmd"]);
+    expect(session.state.skills).toEqual(["new-skill"]);
+  });
+
+  it("does nothing when provided arrays are empty", () => {
+    // Empty discovery results should not replace the (also empty) defaults.
+    bridge.prePopulateCommands("s1", [], []);
+    const session = bridge.getSession("s1")!;
+    expect(session.state.slash_commands).toEqual([]);
+    expect(session.state.skills).toEqual([]);
+  });
+
+  it("pre-populated data appears in session_init broadcast to browsers", () => {
+    // When a browser connects after prePopulateCommands, the session_init
+    // message should include the pre-populated commands/skills.
+    bridge.prePopulateCommands("s1", ["deploy"], ["prd"]);
+
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+
+    // The session_init message sent to the browser should contain the pre-populated data
+    expect(browser.send).toHaveBeenCalled();
+    const sentData = JSON.parse(browser.send.mock.calls[0][0]);
+    expect(sentData.type).toBe("session_init");
+    expect(sentData.session.slash_commands).toEqual(["deploy"]);
+    expect(sentData.session.skills).toEqual(["prd"]);
+  });
+
+  it("broadcasts session_init to already-connected browsers when state changes", () => {
+    // If a browser is already connected when prePopulateCommands runs
+    // (e.g. discovery resolved after browser connected), the browser should
+    // receive a session_init with the updated commands/skills.
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.prePopulateCommands("s1", ["deploy"], ["prd"]);
+
+    expect(browser.send).toHaveBeenCalledTimes(1);
+    const sentData = JSON.parse(browser.send.mock.calls[0][0]);
+    expect(sentData.type).toBe("session_init");
+    expect(sentData.session.slash_commands).toEqual(["deploy"]);
+    expect(sentData.session.skills).toEqual(["prd"]);
+  });
+
+  it("does not broadcast when no browsers are connected", () => {
+    // When no browsers are subscribed, prePopulateCommands should not
+    // attempt to broadcast (no-op beyond state mutation).
+    bridge.prePopulateCommands("s1", ["deploy"], ["prd"]);
+    const session = bridge.getSession("s1")!;
+    // State should still be updated
+    expect(session.state.slash_commands).toEqual(["deploy"]);
+    expect(session.state.skills).toEqual(["prd"]);
+    // No browser sockets to verify send wasn't called -- just ensure no throw
+  });
+
+  it("does not broadcast when state did not change", () => {
+    // When provided arrays are empty, no state change occurs and no
+    // broadcast should be sent even if browsers are connected.
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.prePopulateCommands("s1", [], []);
+
+    expect(browser.send).not.toHaveBeenCalled();
+  });
+
+  it("system.init overwrites pre-populated data with authoritative list", () => {
+    // After prePopulateCommands, when CLI sends system.init, the CLI's
+    // authoritative list should replace the pre-populated data.
+    bridge.prePopulateCommands("s1", ["pre-cmd"], ["pre-skill"]);
+
+    const cli = makeCliSocket("s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(
+      cli,
+      makeInitMsg({
+        slash_commands: ["cli-cmd-1", "cli-cmd-2"],
+        skills: ["cli-skill"],
+      }),
+    );
+
+    const session = bridge.getSession("s1")!;
+    expect(session.state.slash_commands).toEqual(["cli-cmd-1", "cli-cmd-2"]);
+    expect(session.state.skills).toEqual(["cli-skill"]);
   });
 });
 
@@ -569,6 +729,7 @@ describe("CLI handlers", () => {
   });
 
   it("handleCLIClose: nulls cliSocket and broadcasts cli_disconnected", () => {
+    vi.useFakeTimers();
     const cli = makeCliSocket("s1");
     const browser = makeBrowserSocket("s1");
     bridge.handleCLIOpen(cli, "s1");
@@ -581,11 +742,16 @@ describe("CLI handlers", () => {
     expect(session.cliSocket).toBeNull();
     expect(bridge.isCliConnected("s1")).toBe(false);
 
+    // Advance past disconnect debounce (15s)
+    vi.advanceTimersByTime(16_000);
+
     const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
     expect(calls).toContainEqual(expect.objectContaining({ type: "cli_disconnected" }));
+    vi.useRealTimers();
   });
 
   it("handleCLIClose: cancels pending permissions", () => {
+    vi.useFakeTimers();
     const cli = makeCliSocket("s1");
     const browser = makeBrowserSocket("s1");
     bridge.handleCLIOpen(cli, "s1");
@@ -607,6 +773,9 @@ describe("CLI handlers", () => {
 
     bridge.handleCLIClose(cli);
 
+    // Advance past disconnect debounce (15s)
+    vi.advanceTimersByTime(16_000);
+
     const session = bridge.getSession("s1")!;
     expect(session.pendingPermissions.size).toBe(0);
 
@@ -614,6 +783,84 @@ describe("CLI handlers", () => {
     const cancelMsg = calls.find((c: any) => c.type === "permission_cancelled");
     expect(cancelMsg).toBeDefined();
     expect(cancelMsg.request_id).toBe("req-1");
+    vi.useRealTimers();
+  });
+
+  it("handleCLIClose: ignores stale socket close (new WS opened before old closed)", () => {
+    const cli1 = makeCliSocket("s1");
+    const cli2 = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+
+    bridge.handleCLIOpen(cli1, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+
+    // CLI reconnects — new socket opens before old one closes
+    bridge.handleCLIOpen(cli2, "s1");
+    browser.send.mockClear();
+
+    // Stale close event fires from cli1
+    bridge.handleCLIClose(cli1);
+
+    // cliSocket should still be cli2, not null
+    const session = bridge.getSession("s1")!;
+    expect(session.cliSocket).toBe(cli2);
+    expect(bridge.isCliConnected("s1")).toBe(true);
+
+    // No cli_disconnected should be broadcast
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    expect(calls.find((c: any) => c.type === "cli_disconnected")).toBeUndefined();
+  });
+
+  it("handleCLIClose: debounces disconnect notification", () => {
+    vi.useFakeTimers();
+    const cli = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    bridge.handleCLIClose(cli);
+
+    // Immediately after close: no cli_disconnected broadcast yet
+    const immediateCalls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    expect(immediateCalls.find((c: any) => c.type === "cli_disconnected")).toBeUndefined();
+
+    // After debounce period: cli_disconnected should be broadcast
+    vi.advanceTimersByTime(16_000);
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    expect(calls).toContainEqual(expect.objectContaining({ type: "cli_disconnected" }));
+
+    vi.useRealTimers();
+  });
+
+  it("handleCLIClose: debounce cancelled by reconnect", () => {
+    vi.useFakeTimers();
+    const cli1 = makeCliSocket("s1");
+    const cli2 = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+
+    bridge.handleCLIOpen(cli1, "s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    // CLI disconnects
+    bridge.handleCLIClose(cli1);
+
+    // CLI reconnects within debounce window
+    vi.advanceTimersByTime(5_000);
+    bridge.handleCLIOpen(cli2, "s1");
+    browser.send.mockClear();
+
+    // Debounce timer fires — should NOT broadcast disconnect
+    vi.advanceTimersByTime(16_000);
+
+    const calls = browser.send.mock.calls.map(([arg]: [string]) => JSON.parse(arg));
+    expect(calls.find((c: any) => c.type === "cli_disconnected")).toBeUndefined();
+    expect(bridge.isCliConnected("s1")).toBe(true);
+
+    vi.useRealTimers();
   });
 
   it("handleCLIClose: ignores stale socket close (new WS opened before old closed)", () => {
@@ -3429,5 +3676,100 @@ describe("sendToCLI error path", () => {
     );
 
     spy.mockRestore();
+  });
+});
+
+// ─── CLI message deduplication (Bun.hash-based) ─────────────────────────────
+
+describe("CLI message deduplication", () => {
+  function setupSession() {
+    const cli = makeCliSocket("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.handleCLIOpen(cli, "s1");
+    bridge.handleCLIMessage(cli, makeInitMsg());
+    browser.send.mockClear();
+    return { cli, browser };
+  }
+
+  it("filters duplicate assistant messages (same content replayed on reconnect)", () => {
+    const { cli, browser } = setupSession();
+    const msg = JSON.stringify({ type: "assistant", message: { content: "hello world" } });
+
+    // First send — should forward to browser
+    bridge.handleCLIMessage(cli, msg);
+    expect(browser.send).toHaveBeenCalledTimes(1);
+
+    // Same message again (simulates CLI replay on WS reconnect) — should be filtered
+    browser.send.mockClear();
+    bridge.handleCLIMessage(cli, msg);
+    expect(browser.send).not.toHaveBeenCalled();
+  });
+
+  it("forwards non-duplicate assistant messages normally", () => {
+    const { cli, browser } = setupSession();
+    const msg1 = JSON.stringify({ type: "assistant", message: { content: "first" } });
+    const msg2 = JSON.stringify({ type: "assistant", message: { content: "second" } });
+
+    bridge.handleCLIMessage(cli, msg1);
+    bridge.handleCLIMessage(cli, msg2);
+
+    expect(browser.send).toHaveBeenCalledTimes(2);
+  });
+
+  it("evicts oldest hashes when window is exceeded", () => {
+    const { cli, browser } = setupSession();
+
+    // Send CLI_DEDUP_WINDOW + 1 unique messages to push the first one out
+    const WINDOW = 2000; // matches WsBridge.CLI_DEDUP_WINDOW
+    for (let i = 0; i <= WINDOW; i++) {
+      bridge.handleCLIMessage(
+        cli,
+        JSON.stringify({ type: "assistant", message: { content: `msg-${i}` } }),
+      );
+    }
+
+    // The first message's hash should have been evicted — resending it should work
+    browser.send.mockClear();
+    const firstMsg = JSON.stringify({ type: "assistant", message: { content: "msg-0" } });
+    bridge.handleCLIMessage(cli, firstMsg);
+    expect(browser.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates stream_event messages with the same uuid on reconnect replay", () => {
+    const { cli, browser } = setupSession();
+    const uuid = "cc6aeb12-1aad-4126-8ad2-03bad206e9fe";
+    const msg = JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "thinking_delta", text: "thinking..." } },
+      parent_tool_use_id: null,
+      uuid,
+      session_id: "test-cli-session",
+    });
+
+    // First send — should forward to browser
+    bridge.handleCLIMessage(cli, msg);
+    expect(browser.send).toHaveBeenCalledTimes(1);
+
+    // Same uuid again (simulates CLI replay on WS reconnect) — should be filtered
+    browser.send.mockClear();
+    bridge.handleCLIMessage(cli, msg);
+    expect(browser.send).not.toHaveBeenCalled();
+  });
+
+  it("forwards stream_event messages without uuid (no dedup possible)", () => {
+    const { cli, browser } = setupSession();
+    // stream_event without uuid — cannot dedup, must forward
+    const msg = JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "hi" } },
+      parent_tool_use_id: null,
+    });
+
+    bridge.handleCLIMessage(cli, msg);
+    bridge.handleCLIMessage(cli, msg);
+
+    // Both should be forwarded — no uuid means no dedup
+    expect(browser.send).toHaveBeenCalledTimes(2);
   });
 });

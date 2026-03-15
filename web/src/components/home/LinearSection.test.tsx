@@ -421,6 +421,10 @@ describe("LinearSection", () => {
 
   it("filters issues by search query in issue browser", async () => {
     // Verifies the inline search filters the displayed issues.
+    // Uses waitFor with increased timeout because the component re-fetches issues
+    // when selectedConnectionId changes (after connections load), which can cause
+    // a brief "Loading recent issues..." state between the two fetches.
+    // On slower CI runners (e.g. Ubuntu), this race is more likely to surface.
     const issues = [
       { ...sampleIssue, id: "i1", identifier: "ENG-1", title: "Fix login" },
       { ...sampleIssue, id: "i2", identifier: "ENG-2", title: "Add dashboard" },
@@ -440,10 +444,12 @@ describe("LinearSection", () => {
       />,
     );
 
+    // Wait for both ENG-1 and ENG-2 to appear together in the same waitFor
+    // to ensure the final re-fetch (after connectionId is set) has completed.
     await waitFor(() => {
       expect(screen.getByText("ENG-1")).toBeInTheDocument();
-    });
-    expect(screen.getByText("ENG-2")).toBeInTheDocument();
+      expect(screen.getByText("ENG-2")).toBeInTheDocument();
+    }, { timeout: 3000 });
 
     // Filter by "login"
     const searchInput = screen.getByPlaceholderText("Filter issues...");
@@ -656,8 +662,10 @@ describe("LinearSection", () => {
     // Toggle search all projects
     fireEvent.click(screen.getByText("Search all projects"));
 
-    // Should show the "type 2 characters" prompt
-    expect(screen.getByText("Type at least 2 characters to search all projects...")).toBeInTheDocument();
+    // Should show the "type 2 characters" prompt (may need a re-render cycle)
+    await waitFor(() => {
+      expect(screen.getByText("Type at least 2 characters to search all projects...")).toBeInTheDocument();
+    });
   });
 
   it("removes selected issue when remove button is clicked in issue badge", async () => {

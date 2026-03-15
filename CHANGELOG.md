@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.82.0](https://github.com/The-Vibe-Company/companion/compare/the-companion-v0.81.1...the-companion-v0.82.0) (2026-03-14)
+
+
+### Features
+
+* **server:** formalize session state machine and transitions ([#541](https://github.com/The-Vibe-Company/companion/issues/541)) ([0cc85c1](https://github.com/The-Vibe-Company/companion/commit/0cc85c1703220d949ce0ca6f8f56d876ed59387d))
+
+## [0.81.1](https://github.com/The-Vibe-Company/companion/compare/the-companion-v0.81.0...the-companion-v0.81.1) (2026-03-14)
+
+
+### Bug Fixes
+
+* **server:** support usage limits on Linux and Docker ([#540](https://github.com/The-Vibe-Company/companion/issues/540)) ([70e5d4e](https://github.com/The-Vibe-Company/companion/commit/70e5d4e51ad699a45cae89c1288d7f6101889b17))
+
+
+### Code Refactoring
+
+* **ui:** redesign sidebar session list for better visual hierarchy ([#539](https://github.com/The-Vibe-Company/companion/issues/539)) ([728702e](https://github.com/The-Vibe-Company/companion/commit/728702ec791aa3ff0d0b14879a3b68c8c952144d))
+
+## [0.81.0](https://github.com/The-Vibe-Company/companion/compare/the-companion-v0.80.1...the-companion-v0.81.0) (2026-03-14)
+
+
+### Features
+
+* **server:** implement typed internal event bus ([#536](https://github.com/The-Vibe-Company/companion/issues/536)) ([d8fa90b](https://github.com/The-Vibe-Company/companion/commit/d8fa90b7a38892267f1676187dece78ee272d308))
+* **skills:** add new skills for design enhancement and adaptation ([a1643c4](https://github.com/The-Vibe-Company/companion/commit/a1643c4d4713168375c4dc4360be91d3903766ad))
+
+## [0.80.1](https://github.com/The-Vibe-Company/companion/compare/the-companion-v0.80.0...the-companion-v0.80.1) (2026-03-14)
+
+
+### Code Refactoring
+
+* **server:** decompose ws-bridge into event pipeline ([#535](https://github.com/The-Vibe-Company/companion/issues/535)) ([5059845](https://github.com/The-Vibe-Company/companion/commit/5059845e73f9c2bff63ac9c4c8358fbccc5be06e))
+* **server:** extract SessionOrchestrator for unified session lifecycle ([#533](https://github.com/The-Vibe-Company/companion/issues/533)) ([945b596](https://github.com/The-Vibe-Company/companion/commit/945b596423695c13e15d9fd0ff117a25d43a69a1))
+* **store:** migrate frontend store to domain-based slice architecture ([#534](https://github.com/The-Vibe-Company/companion/issues/534)) ([08739a8](https://github.com/The-Vibe-Company/companion/commit/08739a8df1593c553ae958727d81a7df92acd43e))
+
+## [0.80.0](https://github.com/The-Vibe-Company/companion/compare/the-companion-v0.79.0...the-companion-v0.80.0) (2026-03-14)
+
+
+### Features
+
+* **linear:** add guided Linear Agent setup wizard ([#522](https://github.com/The-Vibe-Company/companion/issues/522)) ([0bf218d](https://github.com/The-Vibe-Company/companion/commit/0bf218de9fd078c5fc190224b0f620392fe71759))
+* **platform:** add hetzner provider and instance scaling ([#525](https://github.com/The-Vibe-Company/companion/issues/525)) ([4618efa](https://github.com/The-Vibe-Company/companion/commit/4618efad9fe4cf4dae634773784fe76460aa639a))
+
+
+### Bug Fixes
+
+* **codex:** handle WS reconnection and idle kill for Codex sessions ([#530](https://github.com/The-Vibe-Company/companion/issues/530)) ([f26a6b8](https://github.com/The-Vibe-Company/companion/commit/f26a6b809d4671ec1dd2716e312a007ec0da83cd))
+
 ## [0.79.0](https://github.com/The-Vibe-Company/companion/compare/the-companion-v0.78.0...the-companion-v0.79.0) (2026-03-13)
 
 

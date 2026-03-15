@@ -56,6 +56,12 @@ export function handleSessionSubscribe(
     }
     // Send ground-truth status after replay to correct stale streaming state
     sendToBrowser(ws, { type: "status_change", status: inferCliStatus(session) });
+    // Send authoritative session_phase so replayed transient phases don't leave stale cliConnected
+    sendToBrowser(ws, {
+      type: "session_phase",
+      phase: session.stateMachine.phase,
+      previousPhase: session.stateMachine.phase,
+    });
     return;
   }
 
@@ -67,6 +73,12 @@ export function handleSessionSubscribe(
   });
   // Send ground-truth status after replay to correct stale streaming state
   sendToBrowser(ws, { type: "status_change", status: inferCliStatus(session) });
+  // Send authoritative session_phase so replayed transient phases don't leave stale cliConnected
+  sendToBrowser(ws, {
+    type: "session_phase",
+    phase: session.stateMachine.phase,
+    previousPhase: session.stateMachine.phase,
+  });
 }
 
 export function handleSessionAck(
@@ -87,50 +99,3 @@ export function handleSessionAck(
   }
 }
 
-export function handlePermissionResponse(
-  session: Session,
-  msg: {
-    type: "permission_response";
-    request_id: string;
-    behavior: "allow" | "deny";
-    updated_input?: Record<string, unknown>;
-    updated_permissions?: unknown[];
-    message?: string;
-  },
-  sendToCLI: (session: Session, ndjson: string) => void,
-): void {
-  const pending = session.pendingPermissions.get(msg.request_id);
-  session.pendingPermissions.delete(msg.request_id);
-
-  if (msg.behavior === "allow") {
-    const response: Record<string, unknown> = {
-      behavior: "allow",
-      updatedInput: msg.updated_input ?? pending?.input ?? {},
-    };
-    if (msg.updated_permissions?.length) {
-      response.updatedPermissions = msg.updated_permissions;
-    }
-    const ndjson = JSON.stringify({
-      type: "control_response",
-      response: {
-        subtype: "success",
-        request_id: msg.request_id,
-        response,
-      },
-    });
-    sendToCLI(session, ndjson);
-  } else {
-    const ndjson = JSON.stringify({
-      type: "control_response",
-      response: {
-        subtype: "success",
-        request_id: msg.request_id,
-        response: {
-          behavior: "deny",
-          message: msg.message || "Denied by user",
-        },
-      },
-    });
-    sendToCLI(session, ndjson);
-  }
-}

@@ -530,7 +530,9 @@ export class CliLauncher {
     if (options.model) {
       args.push("--model", options.model);
     }
-    if (effectivePermissionMode) {
+    if (effectivePermissionMode === "bypassPermissions") {
+      args.push("--dangerously-skip-permissions");
+    } else if (effectivePermissionMode) {
       args.push("--permission-mode", effectivePermissionMode);
     }
     if (options.allowedTools) {

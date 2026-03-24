@@ -548,6 +548,25 @@ describe("launch", () => {
     expect(chIdx).toBeLessThan(pIdx);
   });
 
+  it("passes --channels flags from channels option", () => {
+    // channels field should auto-convert to --channels CLI flags
+    launcher.launch({
+      cwd: "/tmp/project",
+      channels: ["plugin:telegram@official", "plugin:slack@official"],
+    });
+
+    const [cmdAndArgs] = mockSpawn.mock.calls[0];
+    // Find all --channels flags
+    const channelIndices: number[] = [];
+    cmdAndArgs.forEach((arg: string, i: number) => {
+      if (arg === "--channels") channelIndices.push(i);
+    });
+
+    expect(channelIndices).toHaveLength(2);
+    expect(cmdAndArgs[channelIndices[0] + 1]).toBe("plugin:telegram@official");
+    expect(cmdAndArgs[channelIndices[1] + 1]).toBe("plugin:slack@official");
+  });
+
 });
 
 // ─── state management ────────────────────────────────────────────────────────

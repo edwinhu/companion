@@ -581,6 +581,11 @@ export class CliLauncher {
         args.push("--allowedTools", tool);
       }
     }
+    if (options.channels) {
+      for (const channel of options.channels) {
+        args.push("--channels", channel);
+      }
+    }
     if (options.resumeSessionAt) {
       args.push("--resume-session-at", options.resumeSessionAt);
     }

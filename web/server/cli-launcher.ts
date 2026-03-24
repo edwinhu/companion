@@ -68,6 +68,10 @@ function sanitizeSpawnArgsForLog(args: string[]): string {
         }
       }
     }
+    // Redact standalone arg values that look like secrets (e.g. from extraArgs)
+    if (secretKeyPattern.test(out[i]) && !out[i].startsWith("-") && !out[i].includes("=")) {
+      out[i] = "***";
+    }
   }
   return out.join(" ");
 }

@@ -16,6 +16,8 @@ export interface CompanionSandbox {
   slug: string;
   /** Shell script to run inside the container before the CLI session starts */
   initScript?: string;
+  /** Channel servers to pass to the CLI for sessions using this sandbox (e.g. ["plugin:telegram@claude-plugins-official"]) */
+  channels?: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -24,6 +26,8 @@ export interface CompanionSandbox {
 export interface SandboxUpdateFields {
   name?: string;
   initScript?: string;
+  /** Channel servers to enable for sessions using this sandbox */
+  channels?: string[];
 }
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
@@ -92,7 +96,7 @@ export function getSandbox(slug: string): CompanionSandbox | null {
 
 export function createSandbox(
   name: string,
-  opts?: { initScript?: string },
+  opts?: { initScript?: string; channels?: string[] },
 ): CompanionSandbox {
   if (!name || !name.trim()) throw new Error("Sandbox name is required");
   const slug = slugify(name.trim());
@@ -114,6 +118,7 @@ export function createSandbox(
   // Apply optional fields if provided
   if (opts) {
     if (opts.initScript !== undefined) sandbox.initScript = opts.initScript;
+    if (opts.channels?.length) sandbox.channels = opts.channels;
   }
 
   writeFileSync(filePath(slug), JSON.stringify(sandbox, null, 2), "utf-8");
@@ -146,6 +151,7 @@ export function updateSandbox(
 
   // Apply field updates (only override if explicitly provided)
   if (updates.initScript !== undefined) sandbox.initScript = updates.initScript;
+  if (updates.channels !== undefined) sandbox.channels = updates.channels?.length ? updates.channels : undefined;
 
   // If slug changed, delete old file
   if (newSlug !== slug) {

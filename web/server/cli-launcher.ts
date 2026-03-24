@@ -119,6 +119,8 @@ export interface SdkSessionInfo {
   agentName?: string;
   /** Sandbox profile slug used for this session */
   sandboxSlug?: string;
+  /** Channel servers enabled for this session (e.g. ["plugin:telegram@claude-plugins-official"]) */
+  channels?: string[];
 
   // Codex WebSocket transport fields
   /** Port used for Codex WebSocket transport (host mode). */
@@ -168,6 +170,8 @@ export interface LaunchOptions {
   systemPrompt?: string;
   /** Sandbox profile slug used for this session */
   sandboxSlug?: string;
+  /** Channel servers to enable (e.g. ["plugin:telegram@claude-plugins-official"]) */
+  channels?: string[];
 }
 
 /**
@@ -316,6 +320,11 @@ export class CliLauncher {
       info.sandboxSlug = options.sandboxSlug;
     }
 
+    // Store channels if provided
+    if (options.channels?.length) {
+      info.channels = options.channels;
+    }
+
     // Store container metadata if provided
     if (options.containerId) {
       info.containerId = options.containerId;
@@ -449,6 +458,7 @@ export class CliLauncher {
         containerId: info.containerId,
         containerName: info.containerName,
         containerImage: info.containerImage,
+        channels: info.channels,
         env: runtimeEnv,
       });
     }

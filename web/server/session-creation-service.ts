@@ -429,6 +429,13 @@ export async function executeSessionCreation(
       forkSession,
       systemPrompt: backend === "codex" ? linearSystemPrompt : undefined,
       sandboxSlug: sandboxEnabled ? ((body.sandboxSlug as string) || undefined) : undefined,
+      // Merge sandbox-level channels with any per-request channels; request wins if both supplied.
+      channels: (() => {
+        const requestChannels = Array.isArray(body.channels) ? (body.channels as string[]) : undefined;
+        const sandboxChannels = companionSandbox?.channels?.length ? companionSandbox.channels : undefined;
+        const merged = requestChannels ?? sandboxChannels;
+        return merged?.length ? merged : undefined;
+      })(),
     });
   } catch (err) {
     if (tempId) containerManager.removeContainer(tempId);

@@ -68,8 +68,19 @@ function sanitizeSpawnArgsForLog(args: string[]): string {
         }
       }
     }
-    // Redact standalone arg values that look like secrets (e.g. from extraArgs)
-    if (secretKeyPattern.test(out[i]) && !out[i].startsWith("-") && !out[i].includes("=")) {
+    // Redact secret-bearing flags from extraArgs in all forms:
+    //   --api-key=sk-abc  →  --api-key=***
+    //   --api-key sk-abc  →  --api-key ***
+    //   sk-abc123         →  *** (standalone value matching secret pattern)
+    if (out[i].startsWith("-") && out[i].includes("=")) {
+      const eqIdx = out[i].indexOf("=");
+      const flag = out[i].slice(0, eqIdx);
+      if (secretKeyPattern.test(flag)) {
+        out[i] = `${flag}=***`;
+      }
+    } else if (out[i].startsWith("-") && secretKeyPattern.test(out[i]) && i + 1 < out.length) {
+      out[i + 1] = "***";
+    } else if (!out[i].startsWith("-") && secretKeyPattern.test(out[i])) {
       out[i] = "***";
     }
   }

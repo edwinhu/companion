@@ -121,6 +121,12 @@ export interface SdkSessionInfo {
   sandboxSlug?: string;
   /** Channel servers enabled for this session (e.g. ["plugin:telegram@claude-plugins-official"]) */
   channels?: string[];
+  /**
+   * Arbitrary extra CLI flags appended verbatim to the Claude invocation.
+   * These are passed directly to the shell — only use trusted inputs.
+   * Example: ["--dangerously-skip-permissions"]
+   */
+  extraArgs?: string[];
 
   // Codex WebSocket transport fields
   /** Port used for Codex WebSocket transport (host mode). */
@@ -172,6 +178,12 @@ export interface LaunchOptions {
   sandboxSlug?: string;
   /** Channel servers to enable (e.g. ["plugin:telegram@claude-plugins-official"]) */
   channels?: string[];
+  /**
+   * Arbitrary extra CLI flags appended verbatim to the Claude invocation.
+   * These are passed directly to the shell — only use trusted inputs.
+   * Example: ["--dangerously-skip-permissions"]
+   */
+  extraArgs?: string[];
 }
 
 /**
@@ -325,6 +337,11 @@ export class CliLauncher {
       info.channels = options.channels;
     }
 
+    // Store extra CLI args if provided
+    if (options.extraArgs?.length) {
+      info.extraArgs = options.extraArgs;
+    }
+
     // Store container metadata if provided
     if (options.containerId) {
       info.containerId = options.containerId;
@@ -459,6 +476,7 @@ export class CliLauncher {
         containerName: info.containerName,
         containerImage: info.containerImage,
         channels: info.channels,
+        extraArgs: info.extraArgs,
         env: runtimeEnv,
       });
     }
@@ -559,6 +577,12 @@ export class CliLauncher {
     // to restore the CLI's conversation context.
     if (options.resumeSessionId) {
       args.push("--resume", options.resumeSessionId);
+    }
+
+    // Append arbitrary extra flags verbatim — caller is responsible for ensuring
+    // these are trusted values (e.g. "--dangerously-skip-permissions").
+    if (options.extraArgs?.length) {
+      args.push(...options.extraArgs);
     }
 
     args.push("-p", "");

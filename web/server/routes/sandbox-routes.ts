@@ -27,6 +27,7 @@ export function registerSandboxRoutes(
       const sandbox = sandboxManager.createSandbox(body.name, {
         initScript: body.initScript,
         channels: Array.isArray(body.channels) ? body.channels : undefined,
+        extraArgs: Array.isArray(body.extraArgs) ? body.extraArgs : undefined,
       });
       return c.json(sandbox, 201);
     } catch (e: unknown) {
@@ -42,6 +43,7 @@ export function registerSandboxRoutes(
         name: body.name,
         initScript: body.initScript,
         channels: "channels" in body ? (Array.isArray(body.channels) ? body.channels : []) : undefined,
+        extraArgs: "extraArgs" in body ? (Array.isArray(body.extraArgs) ? body.extraArgs : []) : undefined,
       });
       if (!sandbox) return c.json({ error: "Sandbox not found" }, 404);
       return c.json(sandbox);

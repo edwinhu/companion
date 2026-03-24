@@ -436,6 +436,13 @@ export async function executeSessionCreation(
         const merged = requestChannels ?? sandboxChannels;
         return merged?.length ? merged : undefined;
       })(),
+      // Merge sandbox-level extraArgs with any per-request extraArgs; request wins if both supplied.
+      extraArgs: (() => {
+        const requestExtraArgs = Array.isArray(body.extraArgs) ? (body.extraArgs as string[]) : undefined;
+        const sandboxExtraArgs = companionSandbox?.extraArgs?.length ? companionSandbox.extraArgs : undefined;
+        const merged = requestExtraArgs ?? sandboxExtraArgs;
+        return merged?.length ? merged : undefined;
+      })(),
     });
   } catch (err) {
     if (tempId) containerManager.removeContainer(tempId);

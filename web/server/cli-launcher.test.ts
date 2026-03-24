@@ -510,6 +510,44 @@ describe("launch", () => {
     expect(mockSpawn).not.toHaveBeenCalled();
   });
 
+  it("stores extraArgs on session info when provided", () => {
+    // extraArgs should be persisted in SdkSessionInfo so they survive relaunch
+    const info = launcher.launch({
+      cwd: "/tmp/project",
+      extraArgs: ["--dangerously-skip-permissions"],
+    });
+
+    expect(info.extraArgs).toEqual(["--dangerously-skip-permissions"]);
+  });
+
+  it("does not set extraArgs when not provided", () => {
+    const info = launcher.launch({ cwd: "/tmp/project" });
+
+    expect(info.extraArgs).toBeUndefined();
+  });
+
+  it("appends extraArgs to CLI spawn args before -p flag", () => {
+    // extraArgs must appear after all standard flags but before the final -p ""
+    launcher.launch({
+      cwd: "/tmp/project",
+      extraArgs: ["--dangerously-skip-permissions", "--channels", "plugin:telegram@official"],
+    });
+
+    const [cmdAndArgs] = mockSpawn.mock.calls[0];
+    const pIdx = cmdAndArgs.indexOf("-p");
+    const dspIdx = cmdAndArgs.indexOf("--dangerously-skip-permissions");
+    const chIdx = cmdAndArgs.indexOf("--channels");
+
+    // All extraArgs should be present
+    expect(dspIdx).toBeGreaterThan(-1);
+    expect(chIdx).toBeGreaterThan(-1);
+    expect(cmdAndArgs[chIdx + 1]).toBe("plugin:telegram@official");
+
+    // extraArgs should appear before -p ""
+    expect(dspIdx).toBeLessThan(pIdx);
+    expect(chIdx).toBeLessThan(pIdx);
+  });
+
 });
 
 // ─── state management ────────────────────────────────────────────────────────
@@ -889,6 +927,42 @@ describe("relaunch", () => {
     // Container validation methods should NOT have been called
     expect(mockIsContainerAlive).not.toHaveBeenCalled();
     expect(mockHasBinaryInContainer).not.toHaveBeenCalled();
+  });
+
+  it("carries extraArgs through to the relaunched CLI process", async () => {
+    // extraArgs stored in SdkSessionInfo should be passed to spawnCLI on relaunch
+    let resolveFirst: (code: number) => void;
+    const firstProc = {
+      pid: 12345,
+      kill: vi.fn(() => { resolveFirst(0); }),
+      exited: new Promise<number>((r) => { resolveFirst = r; }),
+      stdout: null,
+      stderr: null,
+    };
+    mockSpawn.mockReturnValueOnce(firstProc);
+
+    launcher.launch({
+      cwd: "/tmp/project",
+      extraArgs: ["--dangerously-skip-permissions", "--channels", "plugin:telegram@official"],
+    });
+
+    const secondProc = createMockProc(54321);
+    mockSpawn.mockReturnValueOnce(secondProc);
+
+    const result = await launcher.relaunch("test-session-id");
+    expect(result).toEqual({ ok: true });
+
+    // Verify the relaunched process includes extraArgs before -p
+    const [cmdAndArgs] = mockSpawn.mock.calls[1];
+    const pIdx = cmdAndArgs.indexOf("-p");
+    const dspIdx = cmdAndArgs.indexOf("--dangerously-skip-permissions");
+    const chIdx = cmdAndArgs.indexOf("--channels");
+
+    expect(dspIdx).toBeGreaterThan(-1);
+    expect(chIdx).toBeGreaterThan(-1);
+    expect(cmdAndArgs[chIdx + 1]).toBe("plugin:telegram@official");
+    expect(dspIdx).toBeLessThan(pIdx);
+    expect(chIdx).toBeLessThan(pIdx);
   });
 });
 

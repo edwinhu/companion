@@ -430,16 +430,22 @@ export async function executeSessionCreation(
       systemPrompt: backend === "codex" ? linearSystemPrompt : undefined,
       sandboxSlug: sandboxEnabled ? ((body.sandboxSlug as string) || undefined) : undefined,
       // Merge sandbox-level channels with any per-request channels; request wins if both supplied.
+      // Only inherit sandbox channels when sandbox mode is enabled.
       channels: (() => {
-        const requestChannels = Array.isArray(body.channels) ? (body.channels as string[]) : undefined;
-        const sandboxChannels = companionSandbox?.channels?.length ? companionSandbox.channels : undefined;
+        const requestChannels = Array.isArray(body.channels)
+          ? (body.channels as unknown[]).filter((c): c is string => typeof c === "string")
+          : undefined;
+        const sandboxChannels = sandboxEnabled && companionSandbox?.channels?.length ? companionSandbox.channels : undefined;
         const merged = requestChannels ?? sandboxChannels;
         return merged?.length ? merged : undefined;
       })(),
       // Merge sandbox-level extraArgs with any per-request extraArgs; request wins if both supplied.
+      // Only inherit sandbox extraArgs when sandbox mode is enabled.
       extraArgs: (() => {
-        const requestExtraArgs = Array.isArray(body.extraArgs) ? (body.extraArgs as string[]) : undefined;
-        const sandboxExtraArgs = companionSandbox?.extraArgs?.length ? companionSandbox.extraArgs : undefined;
+        const requestExtraArgs = Array.isArray(body.extraArgs)
+          ? (body.extraArgs as unknown[]).filter((a): a is string => typeof a === "string")
+          : undefined;
+        const sandboxExtraArgs = sandboxEnabled && companionSandbox?.extraArgs?.length ? companionSandbox.extraArgs : undefined;
         const merged = requestExtraArgs ?? sandboxExtraArgs;
         return merged?.length ? merged : undefined;
       })(),

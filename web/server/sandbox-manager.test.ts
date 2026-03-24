@@ -376,3 +376,99 @@ describe("deleteSandbox", () => {
     expect(sandboxManager.listSandboxes()).toHaveLength(1);
   });
 });
+
+// ===========================================================================
+// channels and extraArgs round-trip
+// ===========================================================================
+describe("channels and extraArgs", () => {
+  it("stores channels on creation and retrieves them", () => {
+    // Channels should persist through JSON serialization
+    const sandbox = sandboxManager.createSandbox("With Channels", {
+      channels: ["plugin:telegram@official", "plugin:slack@official"],
+    });
+
+    expect(sandbox.channels).toEqual(["plugin:telegram@official", "plugin:slack@official"]);
+
+    const retrieved = sandboxManager.getSandbox("with-channels");
+    expect(retrieved!.channels).toEqual(["plugin:telegram@official", "plugin:slack@official"]);
+  });
+
+  it("stores extraArgs on creation and retrieves them", () => {
+    // extraArgs should persist through JSON serialization
+    const sandbox = sandboxManager.createSandbox("With ExtraArgs", {
+      extraArgs: ["--dangerously-skip-permissions", "--channels", "plugin:telegram@official"],
+    });
+
+    expect(sandbox.extraArgs).toEqual(["--dangerously-skip-permissions", "--channels", "plugin:telegram@official"]);
+
+    const retrieved = sandboxManager.getSandbox("with-extraargs");
+    expect(retrieved!.extraArgs).toEqual(["--dangerously-skip-permissions", "--channels", "plugin:telegram@official"]);
+  });
+
+  it("omits channels and extraArgs when not provided", () => {
+    const sandbox = sandboxManager.createSandbox("Bare Sandbox");
+
+    expect(sandbox.channels).toBeUndefined();
+    expect(sandbox.extraArgs).toBeUndefined();
+  });
+
+  it("updates channels via updateSandbox", () => {
+    sandboxManager.createSandbox("Updatable");
+
+    const updated = sandboxManager.updateSandbox("updatable", {
+      channels: ["plugin:new@official"],
+    });
+
+    expect(updated!.channels).toEqual(["plugin:new@official"]);
+  });
+
+  it("clears channels when empty array is passed to updateSandbox", () => {
+    // Passing an empty array should remove channels from the sandbox
+    sandboxManager.createSandbox("Clearable", {
+      channels: ["plugin:old@official"],
+    });
+
+    const updated = sandboxManager.updateSandbox("clearable", {
+      channels: [],
+    });
+
+    expect(updated!.channels).toBeUndefined();
+  });
+
+  it("updates extraArgs via updateSandbox", () => {
+    sandboxManager.createSandbox("Args Sandbox");
+
+    const updated = sandboxManager.updateSandbox("args-sandbox", {
+      extraArgs: ["--dangerously-skip-permissions"],
+    });
+
+    expect(updated!.extraArgs).toEqual(["--dangerously-skip-permissions"]);
+  });
+
+  it("clears extraArgs when empty array is passed to updateSandbox", () => {
+    sandboxManager.createSandbox("Clear Args", {
+      extraArgs: ["--some-flag"],
+    });
+
+    const updated = sandboxManager.updateSandbox("clear-args", {
+      extraArgs: [],
+    });
+
+    expect(updated!.extraArgs).toBeUndefined();
+  });
+
+  it("preserves channels and extraArgs when updating other fields", () => {
+    // Updating name/initScript should not clobber channels or extraArgs
+    sandboxManager.createSandbox("Preserve", {
+      channels: ["plugin:telegram@official"],
+      extraArgs: ["--dangerously-skip-permissions"],
+    });
+
+    const updated = sandboxManager.updateSandbox("preserve", {
+      initScript: "echo hello",
+    });
+
+    expect(updated!.channels).toEqual(["plugin:telegram@official"]);
+    expect(updated!.extraArgs).toEqual(["--dangerously-skip-permissions"]);
+  });
+});

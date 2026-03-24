@@ -26,8 +26,8 @@ export function registerSandboxRoutes(
     try {
       const sandbox = sandboxManager.createSandbox(body.name, {
         initScript: body.initScript,
-        channels: Array.isArray(body.channels) ? body.channels : undefined,
-        extraArgs: Array.isArray(body.extraArgs) ? body.extraArgs : undefined,
+        channels: Array.isArray(body.channels) ? body.channels.filter((c: unknown) => typeof c === "string") as string[] : undefined,
+        extraArgs: Array.isArray(body.extraArgs) ? body.extraArgs.filter((a: unknown) => typeof a === "string") as string[] : undefined,
       });
       return c.json(sandbox, 201);
     } catch (e: unknown) {
@@ -42,8 +42,8 @@ export function registerSandboxRoutes(
       const sandbox = sandboxManager.updateSandbox(slug, {
         name: body.name,
         initScript: body.initScript,
-        channels: "channels" in body ? (Array.isArray(body.channels) ? body.channels : []) : undefined,
-        extraArgs: "extraArgs" in body ? (Array.isArray(body.extraArgs) ? body.extraArgs : []) : undefined,
+        channels: "channels" in body ? (Array.isArray(body.channels) ? body.channels.filter((c: unknown) => typeof c === "string") as string[] : []) : undefined,
+        extraArgs: "extraArgs" in body ? (Array.isArray(body.extraArgs) ? body.extraArgs.filter((a: unknown) => typeof a === "string") as string[] : []) : undefined,
       });
       if (!sandbox) return c.json({ error: "Sandbox not found" }, 404);
       return c.json(sandbox);

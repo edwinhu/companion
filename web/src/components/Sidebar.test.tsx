@@ -971,6 +971,69 @@ describe("Sidebar", () => {
     expect(screen.getByText("No sessions yet.")).toBeInTheDocument();
   });
 
+  it("poll removes client-side sessions that the server no longer knows about", async () => {
+    // Regression test for: stale sessions persist in the sidebar after being cleared
+    // server-side. The poll updates sdkSessions but must also remove entries from the
+    // client-side `sessions` Map that are absent from the server response, otherwise
+    // the sidebar's UNION(sessions.keys(), sdkSessions) still includes the ghost entry.
+    //
+    // Scenario: session "stale-id" exists in the client sessions Map (populated earlier
+    // via a WebSocket session_init), but the server no longer knows about it. The poll
+    // should call removeSession("stale-id") to evict it from the client store.
+    const staleSession = makeSession("stale-id");
+
+    mockState = createMockState({
+      // Client has a stale session from a previous WebSocket session_init
+      sessions: new Map([["stale-id", staleSession]]),
+      // Server list is empty — the session was cleared server-side
+      sdkSessions: [],
+    });
+
+    // Poll returns an empty list — the server no longer has "stale-id"
+    mockApi.listSessions.mockResolvedValueOnce([]);
+
+    render(<Sidebar />);
+
+    await vi.waitFor(() => {
+      expect(mockApi.listSessions).toHaveBeenCalled();
+    });
+
+    // The poll must call removeSession for the stale client-side session
+    await vi.waitFor(() => {
+      expect(mockState.removeSession).toHaveBeenCalledWith("stale-id");
+    });
+
+    // setSdkSessions should have been called with the empty list from the server
+    expect(mockState.setSdkSessions).toHaveBeenCalledWith([]);
+  });
+
+  it("poll does not remove sessions that still exist on the server", async () => {
+    // Verifies the inverse: poll() must NOT call removeSession for sessions
+    // that ARE present in the server response. This guards against over-aggressive
+    // pruning that would clear valid sessions.
+    const activeSession = makeSession("active-id");
+    const serverSessions = [makeSdkSession("active-id")];
+
+    mockState = createMockState({
+      sessions: new Map([["active-id", activeSession]]),
+      sdkSessions: serverSessions,
+    });
+
+    mockApi.listSessions.mockResolvedValueOnce(serverSessions);
+
+    render(<Sidebar />);
+
+    await vi.waitFor(() => {
+      expect(mockApi.listSessions).toHaveBeenCalled();
+    });
+    await vi.waitFor(() => {
+      expect(mockState.setSdkSessions).toHaveBeenCalledWith(serverSessions);
+    });
+
+    // The active session is still on the server — removeSession must NOT be called
+    expect(mockState.removeSession).not.toHaveBeenCalled();
+  });
+
   // ─── Delete session flow ──────────────────────────────────────────────────
 
   it("shows delete confirmation modal when Delete is clicked from context menu", () => {

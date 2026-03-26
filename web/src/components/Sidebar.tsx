@@ -155,11 +155,17 @@ export function Sidebar() {
       try {
         const list = await api.listSessions();
         if (active) {
-          useStore.getState().setSdkSessions(list);
+          const store = useStore.getState();
+          store.setSdkSessions(list);
+          // Remove client-side sessions the server no longer knows about
+          const serverIds = new Set(list.map((s) => s.sessionId));
+          for (const id of store.sessions.keys()) {
+            if (!serverIds.has(id)) {
+              store.removeSession(id);
+            }
+          }
           // Connect all active sessions so we receive notifications for all of them
           connectAllSessions(list);
-          // Hydrate session names from server (server is source of truth for auto-generated names)
-          const store = useStore.getState();
           for (const s of list) {
             if (s.name && (!store.sessionNames.has(s.sessionId) || /^[A-Z][a-z]+ [A-Z][a-z]+$/.test(store.sessionNames.get(s.sessionId)!))) {
               const currentStoreName = store.sessionNames.get(s.sessionId);

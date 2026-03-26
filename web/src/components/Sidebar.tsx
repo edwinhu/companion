@@ -157,11 +157,18 @@ export function Sidebar() {
         if (active) {
           const store = useStore.getState();
           store.setSdkSessions(list);
-          // Remove client-side sessions the server no longer knows about
+          // Remove client-side sessions the server no longer knows about.
+          // Re-read state AFTER setSdkSessions so we get the freshest snapshot —
+          // a session_init WebSocket message may have arrived while listSessions()
+          // was in-flight and added a new session to the store. Guard removal with
+          // a connectionStatus check: a "connected" session arrived legitimately
+          // via session_init and must not be evicted just because it was absent
+          // from the (now-stale) server snapshot.
+          const freshStore = useStore.getState();
           const serverIds = new Set(list.map((s) => s.sessionId));
-          for (const id of store.sessions.keys()) {
-            if (!serverIds.has(id)) {
-              store.removeSession(id);
+          for (const id of freshStore.sessions.keys()) {
+            if (!serverIds.has(id) && freshStore.connectionStatus.get(id) !== "connected") {
+              freshStore.removeSession(id);
             }
           }
           // Connect all active sessions so we receive notifications for all of them

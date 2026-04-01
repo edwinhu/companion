@@ -6,6 +6,7 @@ import { MessageFeed } from "./MessageFeed.js";
 import { Composer } from "./Composer.js";
 import { PermissionBanner } from "./PermissionBanner.js";
 import { AiValidationBadge } from "./AiValidationBadge.js";
+import { ActivityTray } from "./ActivityTray.js";
 
 export function ChatView({ sessionId }: { sessionId: string }) {
   const sessionPerms = useStore((s) => s.pendingPermissions.get(sessionId));
@@ -107,8 +108,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         </div>
       )}
 
-      {/* Message feed */}
-      <MessageFeed sessionId={sessionId} />
+      {/* Message feed + Activity tray */}
+      <div className="flex-1 flex flex-col min-h-0 relative">
+        <MessageFeed sessionId={sessionId} />
+        <ActivityTray sessionId={sessionId} />
+      </div>
 
       {/* AI auto-resolved notification (most recent only) */}
       {aiResolved && aiResolved.length > 0 && (

@@ -1,6 +1,6 @@
 import type { StateCreator } from "zustand";
 import type { AppState } from "./index.js";
-import type { TaskItem, ProcessItem } from "../types.js";
+import type { TaskItem, ProcessItem, BackgroundAgentItem } from "../types.js";
 
 /** A single tool invocation tracked across its lifecycle. */
 export interface ToolActivityEntry {
@@ -17,6 +17,7 @@ export interface ToolActivityEntry {
 export interface TasksSlice {
   sessionTasks: Map<string, TaskItem[]>;
   sessionProcesses: Map<string, ProcessItem[]>;
+  sessionBackgroundAgents: Map<string, BackgroundAgentItem[]>;
   changedFilesTick: Map<string, number>;
   gitChangedFilesCount: Map<string, number>;
   toolProgress: Map<string, Map<string, { toolName: string; elapsedSeconds: number }>>;
@@ -28,6 +29,8 @@ export interface TasksSlice {
   addProcess: (sessionId: string, process: ProcessItem) => void;
   updateProcess: (sessionId: string, taskId: string, updates: Partial<ProcessItem>) => void;
   updateProcessByToolUseId: (sessionId: string, toolUseId: string, updates: Partial<ProcessItem>) => void;
+  addBackgroundAgent: (sessionId: string, agent: BackgroundAgentItem) => void;
+  updateBackgroundAgent: (sessionId: string, toolUseId: string, updates: Partial<BackgroundAgentItem>) => void;
   bumpChangedFilesTick: (sessionId: string) => void;
   setGitChangedFilesCount: (sessionId: string, count: number) => void;
   setToolProgress: (sessionId: string, toolUseId: string, data: { toolName: string; elapsedSeconds: number }) => void;
@@ -40,6 +43,7 @@ export interface TasksSlice {
 export const createTasksSlice: StateCreator<AppState, [], [], TasksSlice> = (set) => ({
   sessionTasks: new Map(),
   sessionProcesses: new Map(),
+  sessionBackgroundAgents: new Map(),
   changedFilesTick: new Map(),
   gitChangedFilesCount: new Map(),
   toolProgress: new Map(),
@@ -105,6 +109,27 @@ export const createTasksSlice: StateCreator<AppState, [], [], TasksSlice> = (set
         );
       }
       return { sessionProcesses };
+    }),
+
+  addBackgroundAgent: (sessionId, agent) =>
+    set((s) => {
+      const sessionBackgroundAgents = new Map(s.sessionBackgroundAgents);
+      const agents = [...(sessionBackgroundAgents.get(sessionId) || []), agent];
+      sessionBackgroundAgents.set(sessionId, agents);
+      return { sessionBackgroundAgents };
+    }),
+
+  updateBackgroundAgent: (sessionId, toolUseId, updates) =>
+    set((s) => {
+      const sessionBackgroundAgents = new Map(s.sessionBackgroundAgents);
+      const agents = sessionBackgroundAgents.get(sessionId);
+      if (agents) {
+        sessionBackgroundAgents.set(
+          sessionId,
+          agents.map((a) => (a.toolUseId === toolUseId ? { ...a, ...updates } : a)),
+        );
+      }
+      return { sessionBackgroundAgents };
     }),
 
   bumpChangedFilesTick: (sessionId) =>

@@ -50,6 +50,12 @@ vi.mock("./AiValidationBadge.js", () => ({
   AiValidationBadge: () => <div data-testid="ai-validation-badge" />,
 }));
 
+vi.mock("./ActivityTray.js", () => ({
+  ActivityTray: ({ sessionId }: { sessionId: string }) => (
+    <div data-testid="activity-tray">{sessionId}</div>
+  ),
+}));
+
 import { ChatView } from "./ChatView.js";
 
 function setupStore(overrides: {

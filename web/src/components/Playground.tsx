@@ -2320,6 +2320,18 @@ export function Playground() {
           </div>
         </Section>
 
+        {/* ─── Activity Tray ──────────────────────────────── */}
+        <Section
+          title="Activity Tray"
+          description="Floating pill + expandable panel showing background agents and tasks — appears bottom-right of the chat area"
+        >
+          <div className="space-y-4 max-w-3xl">
+            <Card label="With running agents + tasks (interactive)">
+              <PlaygroundActivityTray />
+            </Card>
+          </div>
+        </Section>
+
         {/* ─── Diff Viewer ──────────────────────────────── */}
         <Section
           title="Diff Viewer"
@@ -3832,6 +3844,154 @@ function PlaygroundAiValidationToggle({ enabled }: { enabled: boolean }) {
     <div className="flex items-center gap-2 p-2">
       <AiValidationToggle sessionId={PLAYGROUND_AI_VALIDATION_SESSION} />
       <span className="text-xs text-cc-muted">Click to toggle</span>
+    </div>
+  );
+}
+
+// ─── Activity Tray Playground Mock ──────────────────────────────────────────
+
+/**
+ * Self-contained playground mock of the ActivityTray component.
+ * Uses local state instead of the Zustand store so it works in isolation.
+ * Simulates background agents completing over time to demonstrate the UI.
+ */
+function PlaygroundActivityTray() {
+  const [expanded, setExpanded] = useState(true);
+  const [agentStatus, setAgentStatus] = useState<"running" | "completed">("running");
+
+  const mockAgents = [
+    { name: "Explore codebase", agentType: "Explore", status: agentStatus, startedAt: Date.now() - 12000, completedAt: agentStatus === "completed" ? Date.now() : undefined },
+    { name: "Research auth patterns", agentType: "general-purpose", status: "completed" as const, startedAt: Date.now() - 45000, completedAt: Date.now() - 3000 },
+  ];
+
+  const mockTasks: TaskItem[] = [
+    { id: "1", subject: "Implement ActivityTray component", description: "", status: "completed" },
+    { id: "2", subject: "Wire into ChatView layout", description: "", status: "completed" },
+    { id: "3", subject: "Add background agent detection", description: "", status: "in_progress", activeForm: "Detecting Agent tool_use" },
+    { id: "4", subject: "Write tests", description: "", status: "pending" },
+  ];
+
+  const runningAgents = mockAgents.filter((a) => a.status === "running").length;
+  const completedTasks = mockTasks.filter((t) => t.status === "completed").length;
+  const hasRunningWork = runningAgents > 0 || mockTasks.some((t) => t.status === "in_progress");
+
+  function formatElapsed(startedAt: number, completedAt?: number): string {
+    const elapsed = Math.round(((completedAt || Date.now()) - startedAt) / 1000);
+    if (elapsed < 60) return `${elapsed}s`;
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
+  }
+
+  return (
+    <div className="relative h-48 bg-cc-bg rounded-lg border border-cc-border/30 overflow-hidden">
+      {/* Simulated chat area background */}
+      <div className="absolute inset-0 flex items-center justify-center">
+        <span className="text-[10px] text-cc-muted/20">Chat area</span>
+      </div>
+
+      {/* Toggle agent status button */}
+      <div className="absolute top-2 left-2 z-30">
+        <button
+          type="button"
+          onClick={() => setAgentStatus((s) => (s === "running" ? "completed" : "running"))}
+          className="text-[10px] px-2 py-1 rounded bg-cc-surface border border-cc-border text-cc-muted hover:text-cc-fg cursor-pointer"
+        >
+          Toggle agent: {agentStatus}
+        </button>
+      </div>
+
+      {/* Activity tray - bottom right */}
+      <div className="absolute bottom-3 right-3 z-20">
+        {expanded && (
+          <div className="mb-1.5 w-72 max-w-[calc(100vw-2rem)] max-h-52 overflow-y-auto rounded-xl border border-cc-border/60 bg-cc-surface/95 backdrop-blur-xl shadow-lg shadow-black/20 animate-[fadeSlideIn_0.2s_ease-out]">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-cc-border/40">
+              <span className="text-[11px] font-semibold text-cc-fg/70 uppercase tracking-wider" role="heading" aria-level={3}>Activity</span>
+              <button
+                type="button"
+                onClick={() => setExpanded(false)}
+                className="flex items-center justify-center w-7 h-7 -mr-1 rounded-md text-cc-muted/40 hover:text-cc-muted/70 hover:bg-cc-hover/50 transition-colors cursor-pointer"
+                aria-label="Close activity tray"
+              >
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
+                  <path d="M4.646 4.646a.5.5 0 01.708 0L8 7.293l2.646-2.647a.5.5 0 01.708.708L8.707 8l2.647 2.646a.5.5 0 01-.708.708L8 8.707l-2.646 2.647a.5.5 0 01-.708-.708L7.293 8 4.646 5.354a.5.5 0 010-.708z" />
+                </svg>
+              </button>
+            </div>
+            {/* Agents */}
+            <div className="py-1">
+              <div className="px-3 py-1" role="heading" aria-level={4}>
+                <span className="text-[9px] text-cc-muted/40 uppercase tracking-widest font-semibold">Agents</span>
+              </div>
+              {mockAgents.map((agent, i) => (
+                <div key={i} className={`flex items-center gap-2 px-2.5 min-h-[36px] transition-opacity duration-300 ${agent.status !== "running" ? "opacity-60" : ""}`}>
+                  {agent.status === "running" ? (
+                    <span className="relative flex h-1.5 w-1.5 shrink-0">
+                      <span className="absolute inline-flex h-full w-full rounded-full bg-cc-warning opacity-75 animate-ping" />
+                      <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-cc-warning" />
+                    </span>
+                  ) : (
+                    <span className="h-1.5 w-1.5 rounded-full bg-cc-success shrink-0" />
+                  )}
+                  <span className="text-[11px] text-cc-fg/80 truncate flex-1 font-medium">{agent.name}</span>
+                  <span className="text-[9px] text-cc-muted/50 uppercase tracking-wider shrink-0">{agent.agentType}</span>
+                  <span className="text-[10px] text-cc-muted/50 tabular-nums font-mono-code">{formatElapsed(agent.startedAt, agent.completedAt)}</span>
+                </div>
+              ))}
+            </div>
+            <div className="border-t border-cc-border/30 mx-2" role="separator" />
+            {/* Tasks */}
+            <div className="py-1">
+              <div className="px-3 py-1" role="heading" aria-level={4}>
+                <span className="text-[9px] text-cc-muted/40 uppercase tracking-widest font-semibold">Tasks</span>
+              </div>
+              {mockTasks.map((task) => (
+                <div key={task.id} className={`flex items-center gap-2 px-2.5 min-h-[32px] transition-opacity duration-300 ${task.status === "completed" ? "opacity-40" : ""}`}>
+                  <span className="shrink-0 flex items-center justify-center w-3.5 h-3.5">
+                    {task.status === "in_progress" ? (
+                      <svg className="w-3.5 h-3.5 text-cc-primary animate-spin" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" /></svg>
+                    ) : task.status === "completed" ? (
+                      <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 text-cc-success"><path fillRule="evenodd" d="M8 15A7 7 0 108 1a7 7 0 000 14zm3.354-9.354a.5.5 0 00-.708-.708L7 8.586 5.354 6.94a.5.5 0 10-.708.708l2 2a.5.5 0 00.708 0l4-4z" clipRule="evenodd" /></svg>
+                    ) : (
+                      <svg viewBox="0 0 16 16" fill="none" className="w-3.5 h-3.5 text-cc-muted/40"><circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5" /></svg>
+                    )}
+                  </span>
+                  <span className={`text-[11px] leading-snug flex-1 truncate ${task.status === "completed" ? "text-cc-muted line-through" : "text-cc-fg/80"}`}>{task.subject}</span>
+                  {task.status === "in_progress" && task.activeForm && (
+                    <span className="text-[10px] text-cc-muted/50 italic truncate max-w-[120px] shrink-0">{task.activeForm}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Pill */}
+        <button
+          type="button"
+          onClick={() => setExpanded(!expanded)}
+          aria-expanded={expanded}
+          className={`flex items-center gap-2 px-3 min-h-[36px] rounded-full border border-cc-border/50 bg-cc-surface/90 backdrop-blur-lg shadow-md shadow-black/15 hover:bg-cc-hover/80 hover:border-cc-border/70 transition-all duration-200 cursor-pointer ${expanded ? "ring-1 ring-cc-primary/30" : ""}`}
+        >
+          {hasRunningWork ? (
+            <span className="relative flex h-2 w-2">
+              <span className="absolute inline-flex h-full w-full rounded-full bg-cc-warning opacity-75 animate-ping" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-cc-warning" />
+            </span>
+          ) : (
+            <span className="h-2 w-2 rounded-full bg-cc-success" />
+          )}
+          {runningAgents > 0
+            ? <span className="text-[11px] text-cc-fg/70 font-medium tabular-nums">{runningAgents} agent{runningAgents !== 1 ? "s" : ""}</span>
+            : <span className="text-[11px] text-cc-fg/70 font-medium tabular-nums">{mockAgents.length} done</span>
+          }
+          <span className="w-0.5 h-0.5 rounded-full bg-cc-muted/30" />
+          <span className="text-[11px] text-cc-fg/70 tabular-nums">{completedTasks}/{mockTasks.length}</span>
+          <svg viewBox="0 0 16 16" fill="currentColor" className={`w-2.5 h-2.5 text-cc-muted/40 transition-transform duration-200 ${expanded ? "rotate-180" : ""}`} aria-hidden>
+            <path d="M4 6l4 4 4-4" />
+          </svg>
+        </button>
+      </div>
     </div>
   );
 }

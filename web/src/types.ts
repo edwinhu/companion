@@ -61,6 +61,27 @@ export interface ProcessItem {
   summary?: string;
 }
 
+export type BackgroundAgentStatus = "running" | "completed" | "failed";
+
+export interface BackgroundAgentItem {
+  /** The tool_use_id of the Agent tool call that spawned this */
+  toolUseId: string;
+  /** Agent name (from the `name` input field) */
+  name: string;
+  /** Short description (from the `description` input field) */
+  description: string;
+  /** Agent type (e.g., "Explore", "general-purpose") */
+  agentType: string;
+  /** Current status */
+  status: BackgroundAgentStatus;
+  /** Timestamp when detected */
+  startedAt: number;
+  /** Timestamp when completed/failed */
+  completedAt?: number;
+  /** Result summary from task_notification */
+  summary?: string;
+}
+
 export interface SystemProcess {
   /** OS process ID */
   pid: number;

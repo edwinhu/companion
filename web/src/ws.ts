@@ -1,5 +1,5 @@
 import { useStore } from "./store.js";
-import type { BrowserIncomingMessage, BrowserOutgoingMessage, ContentBlock, ChatMessage, TaskItem, ProcessItem, ProcessStatus, SdkSessionInfo, McpServerConfig } from "./types.js";
+import type { BrowserIncomingMessage, BrowserOutgoingMessage, ContentBlock, ChatMessage, TaskItem, ProcessItem, ProcessStatus, SdkSessionInfo, McpServerConfig, BackgroundAgentItem } from "./types.js";
 import { generateUniqueSessionName } from "./utils/names.js";
 import { playNotificationSound } from "./utils/notification-sound.js";
 import { getPreview } from "./components/ToolBlock.js";
@@ -247,6 +247,75 @@ function extractProcessesFromBlocks(sessionId: string, blocks: ContentBlock[]) {
         sessionPending.delete(toolUseId);
         if (sessionPending.size === 0) {
           pendingBackgroundBash.delete(sessionId);
+        }
+      }
+    }
+  }
+}
+
+/** Pending background Agent calls awaiting their tool_result */
+const pendingBackgroundAgents = new Map<string, Map<string, { name: string; description: string; agentType: string; startedAt: number }>>();
+/** Separate dedup set for background agents (shared processedToolUseIds is consumed by task extraction) */
+const processedAgentIds = new Map<string, Set<string>>();
+
+function extractBackgroundAgentsFromBlocks(sessionId: string, blocks: ContentBlock[]) {
+  const store = useStore.getState();
+  let agentProcessed = processedAgentIds.get(sessionId);
+  if (!agentProcessed) {
+    agentProcessed = new Set();
+    processedAgentIds.set(sessionId, agentProcessed);
+  }
+
+  for (const block of blocks) {
+    // Phase 1: Detect Agent tool_use with run_in_background
+    if (block.type === "tool_use" && block.name === "Agent") {
+      if (block.id && agentProcessed.has(block.id)) continue;
+      const input = block.input as Record<string, unknown>;
+      if (input.run_in_background === true) {
+        if (block.id) agentProcessed.add(block.id);
+        let sessionPending = pendingBackgroundAgents.get(sessionId);
+        if (!sessionPending) {
+          sessionPending = new Map();
+          pendingBackgroundAgents.set(sessionId, sessionPending);
+        }
+        const agentItem: BackgroundAgentItem = {
+          toolUseId: block.id,
+          name: (input.name as string) || (input.description as string) || "Background agent",
+          description: (input.description as string) || "",
+          agentType: (input.subagent_type as string) || "general-purpose",
+          status: "running",
+          startedAt: Date.now(),
+        };
+        sessionPending.set(block.id, {
+          name: agentItem.name,
+          description: agentItem.description,
+          agentType: agentItem.agentType,
+          startedAt: agentItem.startedAt,
+        });
+        store.addBackgroundAgent(sessionId, agentItem);
+      }
+    }
+
+    // Phase 2: Match tool_result to a pending background Agent
+    if (block.type === "tool_result") {
+      const toolUseId = block.tool_use_id;
+      const sessionPending = pendingBackgroundAgents.get(sessionId);
+      const pending = sessionPending?.get(toolUseId);
+      if (sessionPending && pending) {
+        const content = typeof block.content === "string"
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.map((b) => ("text" in b ? (b as { text: string }).text : "")).join("")
+            : "";
+        const isError = block.is_error === true;
+        store.updateBackgroundAgent(sessionId, toolUseId, {
+          status: isError ? "failed" : "completed",
+          completedAt: Date.now(),
+          summary: content.length > 200 ? content.slice(0, 200) + "..." : content,
+        });
+        sessionPending.delete(toolUseId);
+        if (sessionPending.size === 0) {
+          pendingBackgroundAgents.delete(sessionId);
         }
       }
     }
@@ -662,6 +731,7 @@ function handleParsedMessage(
         extractTasksFromBlocks(sessionId, msg.content);
         extractChangedFilesFromBlocks(sessionId, msg.content);
         extractProcessesFromBlocks(sessionId, msg.content);
+        extractBackgroundAgentsFromBlocks(sessionId, msg.content);
       }
 
       break;
@@ -724,6 +794,7 @@ function handleParsedMessage(
       // Flush processed tool IDs at end of turn — deduplication only needed
       // within a single turn. Preserves memory in long-running sessions.
       processedToolUseIds.delete(sessionId);
+      processedAgentIds.delete(sessionId);
 
       const r = data.data;
       const sessionUpdates: Partial<{ total_cost_usd: number; num_turns: number; context_used_percent: number; total_lines_added: number; total_lines_removed: number }> = {
@@ -796,6 +867,7 @@ function handleParsedMessage(
         extractTasksFromBlocks(sessionId, permBlocks);
         extractChangedFilesFromBlocks(sessionId, permBlocks);
         extractProcessesFromBlocks(sessionId, permBlocks);
+        extractBackgroundAgentsFromBlocks(sessionId, permBlocks);
       }
       break;
     }
@@ -1006,6 +1078,7 @@ function handleParsedMessage(
             extractTasksFromBlocks(sessionId, msg.content);
             extractChangedFilesFromBlocks(sessionId, msg.content);
             extractProcessesFromBlocks(sessionId, msg.content);
+            extractBackgroundAgentsFromBlocks(sessionId, msg.content);
             const baseTimestamp = histMsg.timestamp || Date.now();
             for (const block of msg.content) {
               if (block.type === "tool_use") {
@@ -1247,6 +1320,7 @@ export function disconnectSession(sessionId: string) {
   }
   useStore.getState().setConnectionStatus(sessionId, "disconnected");
   processedToolUseIds.delete(sessionId);
+  processedAgentIds.delete(sessionId);
   pendingBackgroundBash.delete(sessionId);
   taskCounters.delete(sessionId);
   streamingPhaseBySession.delete(sessionId);

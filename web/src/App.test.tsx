@@ -126,16 +126,6 @@ vi.mock("./components/SessionLaunchOverlay.js", () => ({
   SessionLaunchOverlay: () => <div data-testid="session-launch-overlay">SessionLaunchOverlay</div>,
 }));
 
-vi.mock("./components/SessionTerminalDock.js", () => ({
-  SessionTerminalDock: ({ children }: { children?: React.ReactNode }) => (
-    <div data-testid="session-terminal-dock">{children}</div>
-  ),
-}));
-
-vi.mock("./components/SessionEditorPane.js", () => ({
-  SessionEditorPane: () => <div data-testid="session-editor-pane">SessionEditorPane</div>,
-}));
-
 vi.mock("./components/UpdateOverlay.js", () => ({
   UpdateOverlay: ({ active }: { active: boolean }) => (
     <div data-testid="update-overlay" data-active={active}>UpdateOverlay</div>
@@ -177,14 +167,6 @@ vi.mock("./components/CronManager.js", () => ({
 
 vi.mock("./components/AgentsPage.js", () => ({
   AgentsPage: () => <div data-testid="agents-page">AgentsPage</div>,
-}));
-
-vi.mock("./components/TerminalPage.js", () => ({
-  TerminalPage: () => <div data-testid="terminal-page">TerminalPage</div>,
-}));
-
-vi.mock("./components/ProcessPanel.js", () => ({
-  ProcessPanel: () => <div data-testid="process-panel">ProcessPanel</div>,
 }));
 
 // ─── Import SUT after mocks ─────────────────────────────────────
@@ -268,55 +250,21 @@ describe("App", () => {
       expect(screen.getByTestId("update-overlay")).toBeInTheDocument();
     });
 
-    it("renders ChatView inside SessionTerminalDock when a session is active", () => {
-      // When currentSessionId is set and route is session, the chat tab should show
-      // ChatView wrapped in SessionTerminalDock.
+    it("renders ChatView when a session is active", () => {
       (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
       setStoreValues({ currentSessionId: "s1" });
       render(<App />);
 
-      expect(screen.getByTestId("session-terminal-dock")).toBeInTheDocument();
       expect(screen.getByTestId("chat-view")).toBeInTheDocument();
       expect(screen.getByText("ChatView:s1")).toBeInTheDocument();
     });
 
     it("renders DiffPanel when activeTab is diff", () => {
-      // With a session active and activeTab set to "diff", the DiffPanel should render
-      // inside the terminal dock instead of ChatView.
       (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
       setStoreValues({ currentSessionId: "s1", activeTab: "diff" });
       render(<App />);
 
       expect(screen.getByTestId("diff-panel")).toBeInTheDocument();
-    });
-
-    it("renders SessionEditorPane when activeTab is editor", () => {
-      // Editor tab should replace the chat view with the editor pane.
-      (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
-      setStoreValues({ currentSessionId: "s1", activeTab: "editor" });
-      render(<App />);
-
-      expect(screen.getByTestId("session-editor-pane")).toBeInTheDocument();
-    });
-
-    it("renders SessionTerminalDock in terminal-only mode when activeTab is terminal", () => {
-      // Terminal tab renders the dock without chat children.
-      (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
-      setStoreValues({ currentSessionId: "s1", activeTab: "terminal" });
-      render(<App />);
-
-      expect(screen.getByTestId("session-terminal-dock")).toBeInTheDocument();
-    });
-
-    it("renders ProcessPanel when activeTab is processes", async () => {
-      // Processes tab should render the lazy-loaded ProcessPanel.
-      (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
-      setStoreValues({ currentSessionId: "s1", activeTab: "processes" });
-      render(<App />);
-
-      await waitFor(() => {
-        expect(screen.getByTestId("process-panel")).toBeInTheDocument();
-      });
     });
 
     it("renders TaskPanel when session active and taskPanelOpen", () => {
@@ -375,14 +323,6 @@ describe("App", () => {
       render(<App />);
       await waitFor(() => {
         expect(screen.getByTestId("linear-settings-page")).toBeInTheDocument();
-      });
-    });
-
-    it("renders TerminalPage for terminal route", async () => {
-      (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "terminal" });
-      render(<App />);
-      await waitFor(() => {
-        expect(screen.getByTestId("terminal-page")).toBeInTheDocument();
       });
     });
 

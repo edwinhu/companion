@@ -62,7 +62,6 @@ interface MockStoreState {
   markRecentlyRenamed: ReturnType<typeof vi.fn>;
   clearRecentlyRenamed: ReturnType<typeof vi.fn>;
   setSdkSessions: ReturnType<typeof vi.fn>;
-  closeTerminal: ReturnType<typeof vi.fn>;
 }
 
 function makeSession(id: string, overrides: Partial<SessionState> = {}): SessionState {
@@ -129,7 +128,6 @@ function createMockState(overrides: Partial<MockStoreState> = {}): MockStoreStat
     markRecentlyRenamed: vi.fn(),
     clearRecentlyRenamed: vi.fn(),
     setSdkSessions: vi.fn(),
-    closeTerminal: vi.fn(),
     ...overrides,
   };
 }
@@ -477,12 +475,6 @@ describe("Sidebar", () => {
     expect(window.location.hash).toBe("#/prompts");
   });
 
-  it("navigates to terminal page when Terminal is clicked", () => {
-    render(<Sidebar />);
-    fireEvent.click(screen.getByTitle("Terminal"));
-    expect(window.location.hash).toBe("#/terminal");
-  });
-
   it("session name shows animate-name-appear class when recently renamed", () => {
     const session = makeSession("s1");
     const sdk = makeSdkSession("s1");
@@ -771,7 +763,6 @@ describe("Sidebar", () => {
     expect(screen.getByText("Integrations")).toBeInTheDocument();
     expect(screen.getByText("Agents")).toBeInTheDocument();
     expect(screen.getByText("Prompts")).toBeInTheDocument();
-    expect(screen.getByText("Terminal")).toBeInTheDocument();
     expect(screen.getByText("Settings")).toBeInTheDocument();
   });
 
@@ -1678,38 +1669,22 @@ describe("Sidebar", () => {
     expect(screen.getByText("agent-model")).toBeInTheDocument();
   });
 
-  // ─── Footer nav: closeTerminal behavior ────────────────────────────────────
+  // ─── Footer nav behavior ───────────────────────────────────────────────────
 
-  it("clicking a non-terminal nav item calls closeTerminal", () => {
-    // Verifies that clicking any nav item except Terminal calls closeTerminal()
-    // to dismiss the terminal overlay.
+  it("clicking a nav item updates the hash", () => {
     render(<Sidebar />);
     fireEvent.click(screen.getByTitle("Prompts"));
-    expect(mockState.closeTerminal).toHaveBeenCalled();
+    expect(window.location.hash).toBe("#/prompts");
   });
 
-  it("clicking Terminal nav item does NOT call closeTerminal", () => {
-    // Verifies that clicking the Terminal nav item does NOT call closeTerminal,
-    // since the terminal should remain open when navigating to it.
-    render(<Sidebar />);
-
-    // Reset mocks from initial poll
-    mockState.closeTerminal.mockClear();
-
-    fireEvent.click(screen.getByTitle("Terminal"));
-    expect(mockState.closeTerminal).not.toHaveBeenCalled();
-  });
-
-  it("New Session button calls closeTerminal", () => {
-    // Verifies that clicking the New Session button closes any open terminal.
+  it("New Session button routes home", () => {
     render(<Sidebar />);
     const buttons = screen.getAllByTitle("New Session");
     fireEvent.click(buttons[0]);
-    expect(mockState.closeTerminal).toHaveBeenCalled();
+    expect(window.location.hash).toBe("");
   });
 
-  it("selecting a session calls closeTerminal", () => {
-    // Verifies that clicking on a session item closes any open terminal.
+  it("selecting a session routes to that session", () => {
     const session = makeSession("s1");
     const sdk = makeSdkSession("s1");
     mockState = createMockState({
@@ -1721,7 +1696,7 @@ describe("Sidebar", () => {
     const sessionButton = screen.getByText("claude-sonnet-4-6").closest("button")!;
     fireEvent.click(sessionButton);
 
-    expect(mockState.closeTerminal).toHaveBeenCalled();
+    expect(window.location.hash).toBe("#/session/s1");
   });
 
   // ─── Footer nav: active state ──────────────────────────────────────────────

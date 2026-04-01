@@ -13,9 +13,6 @@ import { TaskPanel } from "./components/TaskPanel.js";
 import { DiffPanel } from "./components/DiffPanel.js";
 import { UpdateBanner } from "./components/UpdateBanner.js";
 import { SessionLaunchOverlay } from "./components/SessionLaunchOverlay.js";
-import { SessionTerminalDock } from "./components/SessionTerminalDock.js";
-import { SessionEditorPane } from "./components/SessionEditorPane.js";
-import { SessionBrowserPane } from "./components/SessionBrowserPane.js";
 import { UpdateOverlay } from "./components/UpdateOverlay.js";
 import { DockerUpdateDialog } from "./components/DockerUpdateDialog.js";
 import { OnboardingModal } from "./components/OnboardingModal.js";
@@ -33,8 +30,6 @@ const SandboxManager = lazy(() => import("./components/SandboxManager.js").then(
 const CronManager = lazy(() => import("./components/CronManager.js").then((m) => ({ default: m.CronManager })));
 const AgentsPage = lazy(() => import("./components/AgentsPage.js").then((m) => ({ default: m.AgentsPage })));
 const RunsPage = lazy(() => import("./components/RunsPage.js").then((m) => ({ default: m.RunsPage })));
-const TerminalPage = lazy(() => import("./components/TerminalPage.js").then((m) => ({ default: m.TerminalPage })));
-const ProcessPanel = lazy(() => import("./components/ProcessPanel.js").then((m) => ({ default: m.ProcessPanel })));
 
 
 function LazyFallback() {
@@ -60,7 +55,6 @@ export default function App() {
   const taskPanelOpen = useStore((s) => s.taskPanelOpen);
   const homeResetKey = useStore((s) => s.homeResetKey);
   const activeTab = useStore((s) => s.activeTab);
-  const setActiveTab = useStore((s) => s.setActiveTab);
   const sessionCreating = useStore((s) => s.sessionCreating);
   const sessionCreatingBackend = useStore((s) => s.sessionCreatingBackend);
   const creationProgress = useStore((s) => s.creationProgress);
@@ -74,7 +68,6 @@ export default function App() {
   const isLinearIntegrationPage = route.page === "integration-linear";
   const isLinearOAuthIntegrationPage = route.page === "integration-linear-oauth";
   const isTailscaleIntegrationPage = route.page === "integration-tailscale";
-  const isTerminalPage = route.page === "terminal";
   const isEnvironmentsPage = route.page === "environments";
   const isSandboxesPage = route.page === "sandboxes";
   const isScheduledPage = route.page === "scheduled";
@@ -89,13 +82,6 @@ export default function App() {
   useEffect(() => {
     document.documentElement.classList.toggle("dark", darkMode);
   }, [darkMode]);
-
-  // Migrate legacy "files" tab to "editor"
-  useEffect(() => {
-    if ((activeTab as string) === "files") {
-      setActiveTab("editor");
-    }
-  }, [activeTab, setActiveTab]);
 
   // Capture the localStorage-restored session ID during render (before any effects run)
   // so the mount logic can use it even if the hash-sync branch would clear it.
@@ -123,7 +109,7 @@ export default function App() {
         store.setCurrentSession(null);
       }
     }
-    // For other pages (settings, terminal, etc.), preserve currentSessionId
+    // For other pages (settings, etc.), preserve currentSessionId
   }, [route]);
 
   // Keep git changed-files count in sync for the badge regardless of which tab is active.
@@ -255,12 +241,6 @@ export default function App() {
             </div>
           )}
 
-          {isTerminalPage && (
-            <div className="absolute inset-0">
-              <Suspense fallback={<LazyFallback />}><TerminalPage /></Suspense>
-            </div>
-          )}
-
           {isEnvironmentsPage && (
             <div className="absolute inset-0">
               <Suspense fallback={<LazyFallback />}><EnvManager embedded /></Suspense>
@@ -296,27 +276,9 @@ export default function App() {
             <>
               <div className="absolute inset-0">
                 {currentSessionId ? (
-                  activeTab === "browser"
-                    ? <SessionBrowserPane sessionId={currentSessionId} />
-                    : activeTab === "terminal"
-                    ? (
-                      <SessionTerminalDock
-                        sessionId={currentSessionId}
-                        terminalOnly
-                        onClosePanel={() => useStore.getState().setActiveTab("chat")}
-                      />
-                    )
-                    : activeTab === "processes"
-                      ? <Suspense fallback={<LazyFallback />}><ProcessPanel sessionId={currentSessionId} /></Suspense>
-                      : activeTab === "editor"
-                        ? <SessionEditorPane sessionId={currentSessionId} />
-                        : (
-                        <SessionTerminalDock sessionId={currentSessionId} suppressPanel>
-                          {activeTab === "diff"
-                            ? <DiffPanel sessionId={currentSessionId} />
-                            : <ChatView sessionId={currentSessionId} />}
-                        </SessionTerminalDock>
-                      )
+                  activeTab === "diff"
+                    ? <DiffPanel sessionId={currentSessionId} />
+                    : <ChatView sessionId={currentSessionId} />
                 ) : (
                   <HomePage key={homeResetKey} />
                 )}

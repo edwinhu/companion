@@ -64,13 +64,6 @@ const NAV_ITEMS: NavItem[] = [
     iconPath: "M2.5 3A1.5 1.5 0 001 4.5v2A1.5 1.5 0 002.5 8h2A1.5 1.5 0 006 6.5v-2A1.5 1.5 0 004.5 3h-2zm0 1h2a.5.5 0 01.5.5v2a.5.5 0 01-.5.5h-2a.5.5 0 01-.5-.5v-2a.5.5 0 01.5-.5zm9 0A1.5 1.5 0 0010 5.5v2A1.5 1.5 0 0011.5 9h2A1.5 1.5 0 0015 7.5v-2A1.5 1.5 0 0013.5 4h-2zm0 1h2a.5.5 0 01.5.5v2a.5.5 0 01-.5.5h-2a.5.5 0 01-.5-.5v-2a.5.5 0 01.5-.5zM2.5 10A1.5 1.5 0 001 11.5v2A1.5 1.5 0 002.5 15h2A1.5 1.5 0 006 13.5v-2A1.5 1.5 0 004.5 10h-2zm0 1h2a.5.5 0 01.5.5v2a.5.5 0 01-.5.5h-2a.5.5 0 01-.5-.5v-2a.5.5 0 01.5-.5zM8.5 12a.5.5 0 100 1h5a.5.5 0 100-1h-5zm0-2a.5.5 0 100 1h2a.5.5 0 100-1h-2z",
   },
   {
-    id: "terminal",
-    label: "Terminal",
-    hash: "#/terminal",
-    viewBox: "0 0 16 16",
-    iconPath: "M2 3a1 1 0 011-1h10a1 1 0 011 1v10a1 1 0 01-1 1H3a1 1 0 01-1-1V3zm2 1.5l3 2.5-3 2.5V4.5zM8.5 10h3v1h-3v-1z",
-  },
-  {
     id: "environments",
     label: "Environments",
     hash: "#/environments",
@@ -113,7 +106,7 @@ const NAV_ITEMS: NavItem[] = [
 ];
 
 const NAV_SECTIONS = [
-  { id: "workbench", label: "Workbench", itemIds: ["prompts", "integrations", "terminal"] },
+  { id: "workbench", label: "Workbench", itemIds: ["prompts", "integrations"] },
   { id: "workspace", label: "Workspace", itemIds: ["environments", "sandboxes", "agents", "settings"] },
 ] as const;
 
@@ -205,7 +198,6 @@ export function Sidebar() {
   }, []);
 
   function handleSelectSession(sessionId: string) {
-    useStore.getState().closeTerminal();
     // Navigate to session hash — App.tsx hash effect handles setCurrentSession + connectSession
     navigateToSession(sessionId);
     // Close sidebar on mobile
@@ -215,7 +207,6 @@ export function Sidebar() {
   }
 
   function handleNewSession() {
-    useStore.getState().closeTerminal();
     navigateHome();
     useStore.getState().newSession();
     if (window.innerWidth < 768) {
@@ -715,9 +706,6 @@ export function Sidebar() {
                     <button
                       key={item.id}
                       onClick={() => {
-                        if (item.id !== "terminal") {
-                          useStore.getState().closeTerminal();
-                        }
                         window.location.hash = item.hash;
                         // Close sidebar on mobile so the navigated page is visible
                         if (window.innerWidth < 768) {

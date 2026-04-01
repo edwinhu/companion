@@ -415,7 +415,6 @@ export interface AppSettings {
   linearArchiveTransitionStateName: string;
   linearOAuthConfigured: boolean;
   linearOAuthCredentialsSaved: boolean;
-  editorTabEnabled: boolean;
   aiValidationEnabled: boolean;
   aiValidationAutoApprove: boolean;
   aiValidationAutoDeny: boolean;
@@ -960,7 +959,6 @@ export const api = {
     linearOAuthClientId?: string;
     linearOAuthClientSecret?: string;
     linearOAuthWebhookSecret?: string;
-    editorTabEnabled?: boolean;
     publicUrl?: string;
     updateChannel?: "stable" | "prerelease";
     dockerAutoUpdate?: boolean;

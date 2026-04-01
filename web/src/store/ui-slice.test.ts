@@ -259,17 +259,8 @@ describe("Active tab & diff panel", () => {
     useStore.getState().setActiveTab("diff");
     expect(useStore.getState().activeTab).toBe("diff");
 
-    useStore.getState().setActiveTab("terminal");
-    expect(useStore.getState().activeTab).toBe("terminal");
-
     useStore.getState().setActiveTab("chat");
     expect(useStore.getState().activeTab).toBe("chat");
-
-    useStore.getState().setActiveTab("processes");
-    expect(useStore.getState().activeTab).toBe("processes");
-
-    useStore.getState().setActiveTab("editor");
-    expect(useStore.getState().activeTab).toBe("editor");
   });
 
   it("markChatTabReentry: increments tick per session", () => {
@@ -307,17 +298,5 @@ describe("Diff base", () => {
     useStore.getState().setDiffBase("last-commit");
     expect(useStore.getState().diffBase).toBe("last-commit");
     expect(localStorage.getItem("cc-diff-base")).toBe("last-commit");
-  });
-});
-
-// ─── setEditorTabEnabled (from Update info block) ────────────────────────────
-
-describe("Editor tab enabled", () => {
-  it("setEditorTabEnabled: sets the editor tab enabled state", () => {
-    useStore.getState().setEditorTabEnabled(true);
-    expect(useStore.getState().editorTabEnabled).toBe(true);
-
-    useStore.getState().setEditorTabEnabled(false);
-    expect(useStore.getState().editorTabEnabled).toBe(false);
   });
 });

@@ -9,7 +9,6 @@ export type Route =
   | { page: "integration-linear-oauth" }
   | { page: "integration-tailscale" }
   | { page: "prompts" }
-  | { page: "terminal" }
   | { page: "environments" }
   | { page: "sandboxes" }
   | { page: "scheduled" }
@@ -40,7 +39,6 @@ export function parseHash(hash: string): Route {
   if (hash === "#/integrations/linear-oauth") return { page: "integration-linear-oauth" };
   if (hash === "#/integrations/tailscale") return { page: "integration-tailscale" };
   if (hash === "#/prompts") return { page: "prompts" };
-  if (hash === "#/terminal") return { page: "terminal" };
   if (hash === "#/environments") return { page: "environments" };
   if (hash === "#/sandboxes") return { page: "sandboxes" };
   // #/scheduled redirects to #/agents (cron absorbed into agents)

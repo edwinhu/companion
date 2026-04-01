@@ -63,7 +63,6 @@ export const useStore = create<AppState>((...args) => ({
       toolActivity: new Map(),
       // UI
       taskPanelConfigMode: false,
-      editorTabEnabled: false,
       activeTab: "chat" as const,
       chatTabReentryTickBySession: new Map(),
       diffPanelSelectedFile: new Map(),

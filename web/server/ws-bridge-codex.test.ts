@@ -129,7 +129,6 @@ describe("attachCodexAdapterHandlers", () => {
       claudeCodeOAuthToken: "",
       openaiApiKey: "",
       onboardingCompleted: false,
-      editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
       aiValidationAutoDeny: false,
@@ -1116,7 +1115,6 @@ describe("attachCodexAdapterHandlers", () => {
         claudeCodeOAuthToken: "",
         openaiApiKey: "",
         onboardingCompleted: false,
-        editorTabEnabled: false,
         aiValidationEnabled: true,
         aiValidationAutoApprove: true,
         aiValidationAutoDeny: true,
@@ -1293,7 +1291,6 @@ describe("attachCodexAdapterHandlers", () => {
         claudeCodeOAuthToken: "",
         openaiApiKey: "",
         onboardingCompleted: false,
-        editorTabEnabled: false,
         aiValidationEnabled: false,  // disabled
         aiValidationAutoApprove: true,
         aiValidationAutoDeny: true,
@@ -1340,7 +1337,6 @@ describe("attachCodexAdapterHandlers", () => {
         claudeCodeOAuthToken: "",
         openaiApiKey: "",
         onboardingCompleted: false,
-        editorTabEnabled: false,
         aiValidationEnabled: true,
         aiValidationAutoApprove: true,
         aiValidationAutoDeny: true,
@@ -1452,7 +1448,6 @@ describe("attachCodexAdapterHandlers", () => {
         claudeCodeOAuthToken: "",
         openaiApiKey: "",
         onboardingCompleted: false,
-        editorTabEnabled: false,
         aiValidationEnabled: true,
         aiValidationAutoApprove: false,  // disabled
         aiValidationAutoDeny: true,
@@ -1583,7 +1578,6 @@ describe("attachCodexAdapterHandlers", () => {
         claudeCodeOAuthToken: "",
         openaiApiKey: "",
         onboardingCompleted: false,
-        editorTabEnabled: false,
         aiValidationEnabled: true,
         aiValidationAutoApprove: true,
         aiValidationAutoDeny: false,  // disabled

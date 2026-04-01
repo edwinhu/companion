@@ -42,8 +42,7 @@ export interface UiSlice {
   taskPanelConfigMode: boolean;
   homeResetKey: number;
   publicUrl: string;
-  editorTabEnabled: boolean;
-  activeTab: "chat" | "diff" | "terminal" | "processes" | "editor" | "browser";
+  activeTab: "chat" | "diff";
   chatTabReentryTickBySession: Map<string, number>;
   diffPanelSelectedFile: Map<string, string>;
   diffBase: DiffBase;
@@ -63,8 +62,7 @@ export interface UiSlice {
   moveSectionDown: (sectionId: string) => void;
   resetTaskPanelConfig: () => void;
   newSession: () => void;
-  setEditorTabEnabled: (enabled: boolean) => void;
-  setActiveTab: (tab: "chat" | "diff" | "terminal" | "processes" | "editor" | "browser") => void;
+  setActiveTab: (tab: "chat" | "diff") => void;
   markChatTabReentry: (sessionId: string) => void;
   setDiffPanelSelectedFile: (sessionId: string, filePath: string | null) => void;
   setDiffBase: (base: DiffBase) => void;
@@ -80,7 +78,6 @@ export const createUiSlice: StateCreator<AppState, [], [], UiSlice> = (set) => (
   taskPanelConfigMode: false,
   homeResetKey: 0,
   publicUrl: "",
-  editorTabEnabled: false,
   activeTab: "chat",
   chatTabReentryTickBySession: new Map(),
   diffPanelSelectedFile: new Map(),
@@ -160,8 +157,6 @@ export const createUiSlice: StateCreator<AppState, [], [], UiSlice> = (set) => (
     // alongside the homeResetKey bump to return the user to the home page.
     set((s) => ({ currentSessionId: null, homeResetKey: s.homeResetKey + 1 }));
   },
-  setEditorTabEnabled: (enabled) => set({ editorTabEnabled: enabled }),
-
   setActiveTab: (tab) => set({ activeTab: tab }),
   markChatTabReentry: (sessionId) =>
     set((s) => {

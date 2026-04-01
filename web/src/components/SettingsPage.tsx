@@ -26,7 +26,6 @@ type CategoryId = (typeof CATEGORIES)[number]["id"];
 export function SettingsPage({ embedded = false }: SettingsPageProps) {
   const [anthropicApiKey, setAnthropicApiKey] = useState("");
   const [anthropicModel, setAnthropicModel] = useState("claude-sonnet-4-6");
-  const [editorTabEnabled, setEditorTabEnabled] = useState(false);
   const [configured, setConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -43,7 +42,6 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
   const updateInfo = useStore((s) => s.updateInfo);
   const setUpdateInfo = useStore((s) => s.setUpdateInfo);
   const setUpdateOverlayActive = useStore((s) => s.setUpdateOverlayActive);
-  const setStoreEditorTabEnabled = useStore((s) => s.setEditorTabEnabled);
   const notificationApiAvailable = typeof Notification !== "undefined";
   const [updateChannel, setUpdateChannel] = useState<"stable" | "prerelease">("stable");
   const [dockerAutoUpdate, setDockerAutoUpdate] = useState(false);
@@ -135,8 +133,6 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
         setClaudeCodeTokenConfigured(s.claudeCodeOAuthTokenConfigured);
         setOpenaiApiKeyConfigured(s.openaiApiKeyConfigured);
         setAnthropicModel(s.anthropicModel || "claude-sonnet-4-6");
-        setEditorTabEnabled(s.editorTabEnabled);
-        setStoreEditorTabEnabled(s.editorTabEnabled);
         if (typeof s.aiValidationEnabled === "boolean") setAiValidationEnabled(s.aiValidationEnabled);
         if (typeof s.aiValidationAutoApprove === "boolean") setAiValidationAutoApprove(s.aiValidationAutoApprove);
         if (typeof s.aiValidationAutoDeny === "boolean") setAiValidationAutoDeny(s.aiValidationAutoDeny);
@@ -161,9 +157,8 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
     setSaved(false);
     try {
       const nextKey = anthropicApiKey.trim();
-      const payload: { anthropicApiKey?: string; anthropicModel: string; editorTabEnabled: boolean } = {
+      const payload: { anthropicApiKey?: string; anthropicModel: string } = {
         anthropicModel: anthropicModel.trim() || "claude-sonnet-4-6",
-        editorTabEnabled,
       };
       if (nextKey) {
         payload.anthropicApiKey = nextKey;
@@ -171,8 +166,6 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
 
       const res = await api.updateSettings(payload);
       setConfigured(res.anthropicApiKeyConfigured);
-      setEditorTabEnabled(res.editorTabEnabled);
-      setStoreEditorTabEnabled(res.editorTabEnabled);
       setAnthropicApiKey("");
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
@@ -333,18 +326,6 @@ export function SettingsPage({ embedded = false }: SettingsPageProps) {
                   <span>Theme</span>
                   <span className="text-xs text-cc-muted">{darkMode ? "Dark" : "Light"}</span>
                 </button>
-
-                <button
-                  type="button"
-                  onClick={() => setEditorTabEnabled((v) => !v)}
-                  className="w-full flex items-center justify-between px-3 py-3 min-h-[44px] rounded-lg text-sm bg-cc-hover text-cc-fg hover:bg-cc-active transition-colors cursor-pointer"
-                >
-                  <span>Enable Editor tab (CodeMirror)</span>
-                  <span className="text-xs text-cc-muted">{editorTabEnabled ? "On" : "Off"}</span>
-                </button>
-                <p className="text-xs text-cc-muted px-1">
-                  Shows a simple in-app file editor in the session tabs.
-                </p>
 
                 <button
                   type="button"

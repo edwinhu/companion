@@ -32,10 +32,6 @@ describe("parseHash", () => {
     expect(parseHash("#/integrations/linear")).toEqual({ page: "integration-linear" });
   });
 
-  it("parses terminal route", () => {
-    expect(parseHash("#/terminal")).toEqual({ page: "terminal" });
-  });
-
   it("parses prompts route", () => {
     expect(parseHash("#/prompts")).toEqual({ page: "prompts" });
   });

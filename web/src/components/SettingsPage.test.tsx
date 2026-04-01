@@ -110,7 +110,6 @@ beforeEach(() => {
     linearApiKeyConfigured: false,
     linearAutoTransition: false,
     linearAutoTransitionStateName: "",
-    editorTabEnabled: false,
     updateChannel: "stable",
     publicUrl: "",
   });
@@ -120,7 +119,6 @@ beforeEach(() => {
     linearApiKeyConfigured: false,
     linearAutoTransition: false,
     linearAutoTransitionStateName: "",
-    editorTabEnabled: false,
     updateChannel: "stable",
     publicUrl: "",
   });
@@ -179,7 +177,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       updateChannel: "stable",
     });
 
@@ -211,7 +208,6 @@ describe("SettingsPage", () => {
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
         anthropicApiKey: "or-key",
         anthropicModel: "openai/gpt-4o-mini",
-        editorTabEnabled: false,
       });
     });
 
@@ -230,7 +226,6 @@ describe("SettingsPage", () => {
     await waitFor(() => {
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
         anthropicModel: "claude-sonnet-4-6",
-        editorTabEnabled: false,
       });
     });
   });
@@ -247,24 +242,6 @@ describe("SettingsPage", () => {
     await waitFor(() => {
       expect(mockApi.updateSettings).toHaveBeenCalledWith({
         anthropicModel: "openai/gpt-4o-mini",
-        editorTabEnabled: false,
-      });
-    });
-  });
-
-  // Editor tab toggle is in the General section; toggling it updates local state,
-  // which is then included in the Anthropic form's save payload.
-  it("saves editor tab toggle in settings payload", async () => {
-    render(<SettingsPage />);
-    await screen.findByText("Anthropic key configured");
-
-    fireEvent.click(screen.getByRole("button", { name: /Enable Editor tab \(CodeMirror\)/i }));
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() => {
-      expect(mockApi.updateSettings).toHaveBeenCalledWith({
-        anthropicModel: "claude-sonnet-4-6",
-        editorTabEnabled: true,
       });
     });
   });
@@ -312,7 +289,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: boolean;
       linearAutoTransition: boolean;
       linearAutoTransitionStateName: string;
-      editorTabEnabled: boolean;
     }) => void) | undefined;
     mockApi.updateSettings.mockReturnValueOnce(
       new Promise((resolve) => {
@@ -343,7 +319,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
     });
 
     await screen.findByText("Settings saved.");
@@ -718,7 +693,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       updateChannel: "stable",
     });
 
@@ -743,7 +717,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       aiValidationEnabled: true,
       aiValidationAutoApprove: true,
       aiValidationAutoDeny: true,
@@ -769,7 +742,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       aiValidationEnabled: true,
       aiValidationAutoApprove: true,
       aiValidationAutoDeny: true,
@@ -792,7 +764,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
       aiValidationAutoDeny: true,
@@ -815,7 +786,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       aiValidationEnabled: true,
       aiValidationAutoApprove: true,
       aiValidationAutoDeny: true,
@@ -827,7 +797,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       aiValidationEnabled: true,
       aiValidationAutoApprove: false,
       aiValidationAutoDeny: true,
@@ -853,7 +822,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       aiValidationEnabled: true,
       aiValidationAutoApprove: true,
       aiValidationAutoDeny: true,
@@ -865,7 +833,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       aiValidationEnabled: true,
       aiValidationAutoApprove: true,
       aiValidationAutoDeny: false,
@@ -940,7 +907,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       updateChannel: "prerelease",
     });
 
@@ -958,7 +924,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       updateChannel: "prerelease",
     });
     mockApi.forceCheckForUpdate.mockResolvedValueOnce({
@@ -1006,7 +971,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       updateChannel: "stable",
       dockerAutoUpdate: false,
     });
@@ -1035,7 +999,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       updateChannel: "stable",
       dockerAutoUpdate: false,
     });
@@ -1065,7 +1028,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       updateChannel: "stable",
       dockerAutoUpdate: true,
     });
@@ -1122,7 +1084,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       updateChannel: "stable",
       publicUrl: "https://my-companion.example.com",
     });
@@ -1142,7 +1103,6 @@ describe("SettingsPage", () => {
       linearApiKeyConfigured: false,
       linearAutoTransition: false,
       linearAutoTransitionStateName: "",
-      editorTabEnabled: false,
       updateChannel: "stable",
       publicUrl: "https://my-companion.example.com",
     });
@@ -1193,7 +1153,6 @@ describe("SettingsPage", () => {
       anthropicModel: "claude-sonnet-4-6",
       claudeCodeOAuthTokenConfigured: true,
       openaiApiKeyConfigured: false,
-      editorTabEnabled: false,
       updateChannel: "stable",
       publicUrl: "",
     });
@@ -1211,7 +1170,6 @@ describe("SettingsPage", () => {
       anthropicModel: "claude-sonnet-4-6",
       claudeCodeOAuthTokenConfigured: true,
       openaiApiKeyConfigured: false,
-      editorTabEnabled: false,
       updateChannel: "stable",
       publicUrl: "",
     });
@@ -1234,7 +1192,6 @@ describe("SettingsPage", () => {
       anthropicModel: "claude-sonnet-4-6",
       claudeCodeOAuthTokenConfigured: false,
       openaiApiKeyConfigured: false,
-      editorTabEnabled: false,
       updateChannel: "stable",
       publicUrl: "",
     });
@@ -1243,7 +1200,6 @@ describe("SettingsPage", () => {
       anthropicModel: "claude-sonnet-4-6",
       claudeCodeOAuthTokenConfigured: true,
       openaiApiKeyConfigured: true,
-      editorTabEnabled: false,
       updateChannel: "stable",
       publicUrl: "",
     });
@@ -1285,7 +1241,6 @@ describe("SettingsPage", () => {
       anthropicModel: "claude-sonnet-4-6",
       claudeCodeOAuthTokenConfigured: false,
       openaiApiKeyConfigured: false,
-      editorTabEnabled: false,
       updateChannel: "stable",
       publicUrl: "",
     });
@@ -1306,7 +1261,6 @@ describe("SettingsPage", () => {
       anthropicModel: "claude-sonnet-4-6",
       claudeCodeOAuthTokenConfigured: false,
       openaiApiKeyConfigured: false,
-      editorTabEnabled: false,
       updateChannel: "stable",
       publicUrl: "",
     });

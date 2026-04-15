@@ -411,7 +411,7 @@ export class CliLauncher {
       }
 
       // Validate the CLI binary exists inside the container
-      const binary = info.backendType === "codex" ? "codex" : (info.backendType === "gemini" ? "gemini" : "claude");
+      const binary = info.backendType === "codex" ? "codex" : (info.backendType === "gemini" ? "opencode" : "claude");
       if (!containerManager.hasBinaryInContainer(info.containerId, binary)) {
         console.error(`[cli-launcher] "${binary}" not found in container ${containerLabel} for session ${sessionId}`);
         info.state = "exited";
@@ -469,7 +469,7 @@ export class CliLauncher {
     // For containerized sessions, the CLI binary lives inside the container.
     // For host sessions, resolve the binary on the host.
     let binary = info.backendType === "gemini" 
-      ? (options.geminiBinary || "gemini") 
+      ? (options.geminiBinary || "opencode") 
       : (options.claudeBinary || "claude");
     if (!isContainerized) {
       const resolved = resolveBinary(binary);
@@ -701,7 +701,7 @@ export class CliLauncher {
     const connectTimeoutMs = Math.max(1000, parseInt(process.env.COMPANION_CODEX_WS_CONNECT_TIMEOUT_MS ?? "", 10) || 30000);
     const pongTimeoutMs = Math.max(1000, parseInt(process.env.COMPANION_CODEX_PONG_TIMEOUT_MS ?? "", 10) || 30000);
 
-    let binary = info.backendType === "gemini" ? (options.geminiBinary || "gemini") : (options.codexBinary || "codex");
+    let binary = info.backendType === "gemini" ? (options.geminiBinary || "opencode") : (options.codexBinary || "codex");
     if (!isContainerized) {
       const resolved = resolveBinary(binary);
       if (resolved) {

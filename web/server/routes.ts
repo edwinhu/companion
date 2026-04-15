@@ -1179,7 +1179,7 @@ export function createRoutes(
 
     backends.push({ id: "claude", name: "Claude Code", available: resolveBinary("claude") !== null });
     backends.push({ id: "codex", name: "Codex", available: resolveBinary("codex") !== null });
-    backends.push({ id: "gemini", name: "Gemini", available: resolveBinary("gemini") !== null });
+    backends.push({ id: "gemini", name: "Gemini", available: resolveBinary("opencode") !== null });
 
     return c.json(backends);
   });

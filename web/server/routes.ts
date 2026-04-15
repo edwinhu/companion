@@ -3,6 +3,7 @@ import { getCookie, setCookie } from "hono/cookie";
 import { streamSSE } from "hono/streaming";
 import { execSync } from "node:child_process";
 import { resolveBinary } from "./path-resolver.js";
+import { hasOpencodeAuth } from "./opencode-auth.js";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -1179,7 +1180,10 @@ export function createRoutes(
 
     backends.push({ id: "claude", name: "Claude Code", available: resolveBinary("claude") !== null });
     backends.push({ id: "codex", name: "Codex", available: resolveBinary("codex") !== null });
-    backends.push({ id: "gemini", name: "Gemini", available: resolveBinary("opencode") !== null });
+    // Gemini backend uses the 'opencode' binary. Mark available only if binary exists
+    // AND opencode has been authenticated (via `opencode auth login`).
+    const opencodeInstalled = resolveBinary("opencode") !== null;
+    backends.push({ id: "gemini", name: "Gemini", available: opencodeInstalled && hasOpencodeAuth() });
 
     return c.json(backends);
   });

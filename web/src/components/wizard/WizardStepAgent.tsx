@@ -154,6 +154,16 @@ export function WizardStepAgent({ onNext, onBack, oauthConnectionId, stagingId, 
             >
               Codex
             </button>
+            <button
+              onClick={() => { setBackend("gemini"); setModel(""); }}
+              className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-colors cursor-pointer ${
+                backend === "gemini"
+                  ? "border-cc-primary bg-cc-primary/10 text-cc-primary"
+                  : "border-cc-border text-cc-muted hover:text-cc-fg"
+              }`}
+            >
+              Gemini
+            </button>
           </div>
         </div>
 

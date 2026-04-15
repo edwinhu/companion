@@ -1,3 +1,5 @@
+import type { BackendType } from "../types.js";
+
 export interface SessionItem {
   id: string;
   model: string;
@@ -14,7 +16,7 @@ export interface SessionItem {
   sdkState: "starting" | "connected" | "running" | "exited" | null;
   createdAt: number;
   archived: boolean;
-  backendType: "claude" | "codex";
+  backendType: BackendType;
   repoRoot: string;
   permCount: number;
   cronJobId?: string;

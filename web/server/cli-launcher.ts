@@ -143,6 +143,7 @@ export interface LaunchOptions {
   cwd?: string;
   claudeBinary?: string;
   codexBinary?: string;
+  geminiBinary?: string;
   allowedTools?: string[];
   env?: Record<string, string>;
   backendType?: BackendType;
@@ -269,7 +270,7 @@ export class CliLauncher {
 
       // Avoid reusing ports already owned by recovered host-mode Codex sessions.
       if (
-        info.backendType === "codex"
+        (info.backendType === "codex" || info.backendType === "gemini")
         && !info.containerId
         && info.state !== "exited"
         && typeof info.codexWsPort === "number"
@@ -306,7 +307,7 @@ export class CliLauncher {
       info.forkSession = options.forkSession === true;
     }
 
-    if (backendType === "codex") {
+    if (backendType === "codex" || backendType === "gemini") {
       info.codexInternetAccess = options.codexInternetAccess === true;
       info.codexSandbox = options.codexSandbox;
     }
@@ -329,7 +330,7 @@ export class CliLauncher {
       this.sessionEnvs.set(sessionId, { ...options.env });
     }
 
-    if (backendType === "codex") {
+    if (backendType === "codex" || backendType === "gemini") {
       this.spawnCodex(sessionId, info, options);
     } else {
       this.spawnCLI(sessionId, info, options);
@@ -410,7 +411,7 @@ export class CliLauncher {
       }
 
       // Validate the CLI binary exists inside the container
-      const binary = info.backendType === "codex" ? "codex" : "claude";
+      const binary = info.backendType === "codex" ? "codex" : (info.backendType === "gemini" ? "gemini" : "claude");
       if (!containerManager.hasBinaryInContainer(info.containerId, binary)) {
         console.error(`[cli-launcher] "${binary}" not found in container ${containerLabel} for session ${sessionId}`);
         info.state = "exited";
@@ -427,7 +428,7 @@ export class CliLauncher {
 
     const runtimeEnv = this.sessionEnvs.get(sessionId);
 
-    if (info.backendType === "codex") {
+    if (info.backendType === "codex" || info.backendType === "gemini") {
       this.spawnCodex(sessionId, info, {
         model: info.model,
         permissionMode: info.permissionMode,
@@ -467,7 +468,9 @@ export class CliLauncher {
 
     // For containerized sessions, the CLI binary lives inside the container.
     // For host sessions, resolve the binary on the host.
-    let binary = options.claudeBinary || "claude";
+    let binary = info.backendType === "gemini" 
+      ? (options.geminiBinary || "gemini") 
+      : (options.claudeBinary || "claude");
     if (!isContainerized) {
       const resolved = resolveBinary(binary);
       if (resolved) {
@@ -698,7 +701,7 @@ export class CliLauncher {
     const connectTimeoutMs = Math.max(1000, parseInt(process.env.COMPANION_CODEX_WS_CONNECT_TIMEOUT_MS ?? "", 10) || 30000);
     const pongTimeoutMs = Math.max(1000, parseInt(process.env.COMPANION_CODEX_PONG_TIMEOUT_MS ?? "", 10) || 30000);
 
-    let binary = options.codexBinary || "codex";
+    let binary = info.backendType === "gemini" ? (options.geminiBinary || "gemini") : (options.codexBinary || "codex");
     if (!isContainerized) {
       const resolved = resolveBinary(binary);
       if (resolved) {

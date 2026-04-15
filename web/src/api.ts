@@ -1,4 +1,4 @@
-import type { SdkSessionInfo } from "./types.js";
+import type { SdkSessionInfo, BackendType } from "./types.js";
 import type { ContentBlock } from "./types.js";
 import { captureEvent, captureException } from "./analytics.js";
 
@@ -221,7 +221,7 @@ export interface CreateSessionOpts {
   branch?: string;
   createBranch?: boolean;
   useWorktree?: boolean;
-  backend?: "claude" | "codex";
+  backend?: BackendType;
   sandboxEnabled?: boolean;
   sandboxSlug?: string;
   container?: ContainerCreateOpts;
@@ -573,7 +573,7 @@ export interface CronJobInfo {
   prompt: string;
   schedule: string;
   recurring: boolean;
-  backendType: "claude" | "codex";
+  backendType: BackendType;
   model: string;
   cwd: string;
   envSlug?: string;
@@ -613,7 +613,7 @@ export interface AgentInfo {
   name: string;
   description: string;
   icon?: string;
-  backendType: "claude" | "codex";
+  backendType: BackendType;
   model: string;
   permissionMode: string;
   cwd: string;
@@ -737,7 +737,7 @@ export interface CreateSessionStreamResult {
   sessionId: string;
   state: string;
   cwd: string;
-  backendType?: "claude" | "codex";
+  backendType?: BackendType;
   resumeSessionAt?: string;
   forkSession?: boolean;
 }

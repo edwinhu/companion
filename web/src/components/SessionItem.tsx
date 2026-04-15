@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, type RefObject } from "react";
+import type { BackendType } from "../types.js";
 import type { SessionItem as SessionItemType } from "../utils/project-grouping.js";
 
 interface SessionItemProps {
@@ -60,7 +61,7 @@ function StatusDot({ status }: { status: DerivedStatus }) {
   }
 }
 
-function BackendBadge({ type }: { type: "claude" | "codex" }) {
+function BackendBadge({ type }: { type: BackendType }) {
   if (type === "codex") {
     return (
       <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-500 leading-none">

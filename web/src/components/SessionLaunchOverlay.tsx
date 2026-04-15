@@ -1,9 +1,10 @@
 import type { CreationProgressEvent } from "../api.js";
+import type { BackendType } from "../types.js";
 
 interface Props {
   steps: CreationProgressEvent[];
   error?: string | null;
-  backend?: "claude" | "codex";
+  backend?: BackendType;
   onCancel?: () => void;
 }
 

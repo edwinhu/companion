@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { api, type McpServerConfigAgent, type CompanionEnv, type LinearOAuthConnectionSummary } from "../api.js";
+import type { BackendType } from "../types.js";
 import { getModelsForBackend, getDefaultModel, getAgentModesForBackend, getDefaultAgentMode } from "../utils/backends.js";
 import { FolderPicker } from "./FolderPicker.js";
 import { AgentIcon, AGENT_ICON_OPTIONS } from "./AgentIcon.js";
@@ -18,7 +19,7 @@ export interface AgentFormData {
   name: string;
   description: string;
   icon: string;
-  backendType: "claude" | "codex";
+  backendType: BackendType;
   model: string;
   permissionMode: string;
   cwd: string;
@@ -171,7 +172,7 @@ export function AgentEditor({
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
-  function handleBackendChange(backend: "claude" | "codex") {
+  function handleBackendChange(backend: BackendType) {
     setForm((prev) => ({
       ...prev,
       backendType: backend,

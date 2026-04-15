@@ -56,6 +56,7 @@ export interface SessionOrchestratorDeps {
 
 export interface CreateSessionRequest {
   backend?: string;
+  backendType?: string;
   model?: string;
   permissionMode?: string;
   cwd?: string;
@@ -256,9 +257,9 @@ export class SessionOrchestrator {
           ? body.resumeSessionAt.trim()
           : undefined;
       const forkSession = body.forkSession === true;
-      const backend = (body.backend ?? "claude") as BackendType;
-      if (backend !== "claude" && backend !== "codex") {
-        return { ok: false, error: `Invalid backend: ${String(body.backend)}`, status: 400 };
+      const backend = (body.backend ?? body.backendType ?? "claude") as BackendType;
+      if (backend !== "claude" && backend !== "codex" && backend !== "gemini") {
+        return { ok: false, error: `Invalid backend: ${String(backend)}`, status: 400 };
       }
 
       // --- Step: Resolve environment ---

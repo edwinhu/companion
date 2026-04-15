@@ -3,6 +3,8 @@ import { createPortal } from "react-dom";
 import { api, type CronJobInfo } from "../api.js";
 import { getModelsForBackend, getDefaultModel, toModelOptions, type ModelOption } from "../utils/backends.js";
 import { FolderPicker } from "./FolderPicker.js";
+import { useStore } from "../store.js";
+import type { BackendType } from "../types.js";
 import { timeAgo } from "../utils/time-ago.js";
 import { useClickOutside } from "../utils/use-click-outside.js";
 
@@ -79,7 +81,7 @@ interface JobFormData {
   recurring: boolean;
   schedule: string;
   oneTimeDate: string;
-  backendType: "claude" | "codex";
+  backendType: BackendType;
   model: string;
   cwd: string;
 }

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { getModelsForBackend, getDefaultModel, getAgentModesForBackend, getDefaultAgentMode } from "../utils/backends.js";
+import type { BackendType } from "../types.js";
 import { FolderPicker } from "./FolderPicker.js";
 import { LinearLogo } from "./LinearLogo.js";
 import type { AgentFormData } from "./AgentEditor.js";
@@ -39,7 +40,7 @@ export function LinearAgentEditor({
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
-  function handleBackendChange(backend: "claude" | "codex") {
+  function handleBackendChange(backend: BackendType) {
     setForm((prev) => ({
       ...prev,
       backendType: backend,

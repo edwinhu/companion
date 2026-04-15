@@ -459,7 +459,7 @@ export function Sidebar() {
   const agentSessions = allSessionList.filter((s) => !s.archived && !!s.agentId);
   const archivedSessions = allSessionList.filter((s) => s.archived);
   const currentSession = currentSessionId ? allSessionList.find((s) => s.id === currentSessionId) : null;
-  const logoSrc = currentSession?.backendType === "codex" ? "/logo-codex.svg" : "/logo.svg";
+  const logoSrc = currentSession?.backendType === "codex" ? "/logo-codex.svg" : (currentSession?.backendType === "gemini" ? "/logo-gemini.svg" : "/logo.svg");
   const [showCronSessions, setShowCronSessions] = useState(true);
   const [showAgentSessions, setShowAgentSessions] = useState(true);
 

@@ -1,6 +1,7 @@
 import type { StateCreator } from "zustand";
 import type { AppState } from "./index.js";
 import type { UpdateInfo, CreationProgressEvent } from "../api.js";
+import type { BackendType } from "../types.js";
 
 function getInitialDismissedVersion(): string | null {
   if (typeof window === "undefined") return null;
@@ -15,7 +16,7 @@ export interface UpdatesSlice {
   creationProgress: CreationProgressEvent[] | null;
   creationError: string | null;
   sessionCreating: boolean;
-  sessionCreatingBackend: "claude" | "codex" | null;
+  sessionCreatingBackend: BackendType | null;
 
   setUpdateInfo: (info: UpdateInfo | null) => void;
   dismissUpdate: (version: string) => void;
@@ -23,7 +24,7 @@ export interface UpdatesSlice {
   setDockerUpdateDialogOpen: (open: boolean) => void;
   addCreationProgress: (step: CreationProgressEvent) => void;
   clearCreation: () => void;
-  setSessionCreating: (creating: boolean, backend?: "claude" | "codex") => void;
+  setSessionCreating: (creating: boolean, backend?: BackendType) => void;
   setCreationError: (error: string | null) => void;
 }
 

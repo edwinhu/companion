@@ -1,5 +1,7 @@
 // Types for the WebSocket bridge between Claude Code CLI and the browser
 
+import type { SessionPhase } from "./session-state-machine.js";
+
 // ─── CLI Message Types (NDJSON from Claude Code CLI) ──────────────────────────
 
 export interface CLISystemInitMessage {
@@ -200,6 +202,10 @@ export interface CLIControlRequestMessage {
     description?: string;
     tool_use_id: string;
     agent_id?: string;
+    title?: string;
+    display_name?: string;
+    blocked_path?: string;
+    decision_reason?: string;
   };
 }
 
@@ -226,6 +232,51 @@ export interface CLIControlResponseMessage {
   };
 }
 
+/** CLI echoes user messages back (including subagent tool_result blocks). */
+export interface CLIUserEchoMessage {
+  type: "user";
+  message: { role: string; content: unknown };
+  uuid?: string;
+  session_id?: string;
+}
+
+/** Rate-limit status from Claude API (allowed/throttled). */
+export interface CLIRateLimitEventMessage {
+  type: "rate_limit_event";
+  rate_limit_info: Record<string, unknown>;
+  uuid?: string;
+}
+
+/** CLI cancels a pending control_request (e.g. permission revoked). */
+export interface CLIControlCancelRequestMessage {
+  type: "control_cancel_request";
+  request_id: string;
+}
+
+/** Simplified assistant text (streamlined output mode). @internal */
+export interface CLIStreamlinedTextMessage {
+  type: "streamlined_text";
+  text: string;
+  session_id: string;
+  uuid: string;
+}
+
+/** Simplified tool use summary (e.g. "Read 2 files, wrote 1 file"). @internal */
+export interface CLIStreamlinedToolUseSummaryMessage {
+  type: "streamlined_tool_use_summary";
+  tool_summary: string;
+  session_id: string;
+  uuid: string;
+}
+
+/** Predicted next user prompts (enabled via promptSuggestions in initialize). */
+export interface CLIPromptSuggestionMessage {
+  type: "prompt_suggestion";
+  suggestions: string[];
+  session_id: string;
+  uuid: string;
+}
+
 export type CLIMessage =
   | CLISystemMessage
   | CLIAssistantMessage
@@ -236,7 +287,13 @@ export type CLIMessage =
   | CLIControlRequestMessage
   | CLIControlResponseMessage
   | CLIKeepAliveMessage
-  | CLIAuthStatusMessage;
+  | CLIAuthStatusMessage
+  | CLIUserEchoMessage
+  | CLIRateLimitEventMessage
+  | CLIControlCancelRequestMessage
+  | CLIStreamlinedTextMessage
+  | CLIStreamlinedToolUseSummaryMessage
+  | CLIPromptSuggestionMessage;
 
 // ─── Content Block Types ──────────────────────────────────────────────────────
 
@@ -261,7 +318,10 @@ export type BrowserOutgoingMessage =
   | { type: "mcp_toggle"; serverName: string; enabled: boolean; client_msg_id?: string }
   | { type: "mcp_reconnect"; serverName: string; client_msg_id?: string }
   | { type: "mcp_set_servers"; servers: Record<string, McpServerConfig>; client_msg_id?: string }
-  | { type: "set_ai_validation"; aiValidationEnabled?: boolean | null; aiValidationAutoApprove?: boolean | null; aiValidationAutoDeny?: boolean | null; client_msg_id?: string };
+  | { type: "set_ai_validation"; aiValidationEnabled?: boolean | null; aiValidationAutoApprove?: boolean | null; aiValidationAutoDeny?: boolean | null; client_msg_id?: string }
+  | { type: "end_session"; reason?: string; client_msg_id?: string }
+  | { type: "stop_task"; task_id: string; client_msg_id?: string }
+  | { type: "update_environment_variables"; variables: Record<string, string>; client_msg_id?: string };
 
 /** Messages the bridge sends to the browser */
 export type BrowserIncomingMessageBase =
@@ -296,7 +356,11 @@ export type BrowserIncomingMessageBase =
   | { type: "event_replay"; events: BufferedBrowserEvent[] }
   | { type: "session_name_update"; name: string }
   | { type: "pr_status_update"; pr: import("./github-pr.js").GitHubPRInfo | null; available: boolean }
-  | { type: "mcp_status"; servers: McpServerDetail[] };
+  | { type: "mcp_status"; servers: McpServerDetail[] }
+  | { type: "session_phase"; phase: SessionPhase; previousPhase: SessionPhase }
+  | { type: "prompt_suggestion"; suggestions: string[] }
+  | { type: "streamlined_text"; text: string }
+  | { type: "streamlined_tool_use_summary"; tool_summary: string };
 
 export type BrowserIncomingMessage = BrowserIncomingMessageBase & { seq?: number };
 
@@ -309,7 +373,7 @@ export interface BufferedBrowserEvent {
 
 // ─── Session State ────────────────────────────────────────────────────────────
 
-export type BackendType = "claude" | "codex";
+export type BackendType = "claude" | "codex" | "gemini";
 
 export interface SessionState {
   session_id: string;
@@ -362,6 +426,8 @@ export interface SessionState {
   aiValidationAutoApprove?: boolean | null;
   /** Per-session auto-deny override. null/undefined = use global default */
   aiValidationAutoDeny?: boolean | null;
+  /** If this session is linked to a Linear agent session */
+  linearSessionId?: string;
 }
 
 // ─── MCP Types ───────────────────────────────────────────────────────────────
@@ -412,6 +478,10 @@ export interface PermissionRequest {
   description?: string;
   tool_use_id: string;
   agent_id?: string;
+  title?: string;
+  display_name?: string;
+  blocked_path?: string;
+  decision_reason?: string;
   timestamp: number;
   ai_validation?: AiValidationInfo;
 }

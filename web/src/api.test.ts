@@ -299,7 +299,7 @@ describe("updateEnv", () => {
 // ===========================================================================
 describe("settings", () => {
   it("sends GET to /api/settings", async () => {
-    const settings = { anthropicApiKeyConfigured: true, anthropicModel: "claude-sonnet-4.6", linearApiKeyConfigured: false };
+    const settings = { anthropicApiKeyConfigured: true, anthropicModel: "claude-sonnet-4-6", linearApiKeyConfigured: false };
     mockFetch.mockResolvedValueOnce(mockResponse(settings));
 
     const result = await api.getSettings();
@@ -310,7 +310,7 @@ describe("settings", () => {
   });
 
   it("sends PUT to /api/settings", async () => {
-    const settings = { anthropicApiKeyConfigured: true, anthropicModel: "claude-sonnet-4.6", linearApiKeyConfigured: true };
+    const settings = { anthropicApiKeyConfigured: true, anthropicModel: "claude-sonnet-4-6", linearApiKeyConfigured: true };
     mockFetch.mockResolvedValueOnce(mockResponse(settings));
 
     await api.updateSettings({ anthropicApiKey: "sk-ant-key", linearApiKey: "lin_api_123" });
@@ -760,26 +760,73 @@ describe("environment API", () => {
     expect(opts.method).toBe("DELETE");
   });
 
-  it("buildEnvImage sends POST to /api/envs/:slug/build", async () => {
-    const data = { ok: true, imageTag: "my-env:latest" };
-    mockFetch.mockResolvedValueOnce(mockResponse(data));
+  it("listSandboxes sends GET to /api/sandboxes", async () => {
+    const sandboxes = [{ name: "Dev", slug: "dev", createdAt: 1, updatedAt: 1 }];
+    mockFetch.mockResolvedValueOnce(mockResponse(sandboxes));
 
-    const result = await api.buildEnvImage("my-env");
-
-    const [url, opts] = mockFetch.mock.calls[0];
-    expect(url).toBe("/api/envs/my-env/build");
-    expect(opts.method).toBe("POST");
-    expect(result).toEqual(data);
-  });
-
-  it("getEnvBuildStatus sends GET to /api/envs/:slug/build-status", async () => {
-    const data = { buildStatus: "success", lastBuiltAt: 1234, imageTag: "my-env:latest" };
-    mockFetch.mockResolvedValueOnce(mockResponse(data));
-
-    const result = await api.getEnvBuildStatus("my-env");
+    const result = await api.listSandboxes();
 
     const [url] = mockFetch.mock.calls[0];
-    expect(url).toBe("/api/envs/my-env/build-status");
+    expect(url).toBe("/api/sandboxes");
+    expect(result).toEqual(sandboxes);
+  });
+
+  it("getSandbox sends GET to /api/sandboxes/:slug", async () => {
+    const sandbox = { name: "Dev", slug: "dev", createdAt: 1, updatedAt: 1 };
+    mockFetch.mockResolvedValueOnce(mockResponse(sandbox));
+
+    const result = await api.getSandbox("dev");
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sandboxes/dev");
+    expect(result).toEqual(sandbox);
+  });
+
+  it("createSandbox sends POST to /api/sandboxes with name and options", async () => {
+    const sandbox = { name: "My Sandbox", slug: "my-sandbox", initScript: "npm install", createdAt: 1, updatedAt: 1 };
+    mockFetch.mockResolvedValueOnce(mockResponse(sandbox));
+
+    const result = await api.createSandbox("My Sandbox", { initScript: "npm install" });
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sandboxes");
+    expect(opts.method).toBe("POST");
+    expect(JSON.parse(opts.body)).toEqual({ name: "My Sandbox", initScript: "npm install" });
+    expect(result).toEqual(sandbox);
+  });
+
+  it("updateSandbox sends PUT to /api/sandboxes/:slug", async () => {
+    const sandbox = { name: "Renamed", slug: "renamed", createdAt: 1, updatedAt: 2 };
+    mockFetch.mockResolvedValueOnce(mockResponse(sandbox));
+
+    await api.updateSandbox("my-sandbox", { name: "Renamed" });
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sandboxes/my-sandbox");
+    expect(opts.method).toBe("PUT");
+    expect(JSON.parse(opts.body)).toEqual({ name: "Renamed" });
+  });
+
+  it("deleteSandbox sends DELETE to /api/sandboxes/:slug", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ ok: true }));
+
+    await api.deleteSandbox("old-sandbox");
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sandboxes/old-sandbox");
+    expect(opts.method).toBe("DELETE");
+  });
+
+  it("testInitScript sends POST to /api/sandboxes/:slug/test-init with initScript", async () => {
+    const data = { success: true, exitCode: 0, output: "hello\n" };
+    mockFetch.mockResolvedValueOnce(mockResponse(data));
+
+    const result = await api.testInitScript("my-sandbox", "/home/user/project", "echo hi");
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sandboxes/my-sandbox/test-init");
+    expect(opts.method).toBe("POST");
+    expect(JSON.parse(opts.body)).toEqual({ cwd: "/home/user/project", initScript: "echo hi" });
     expect(result).toEqual(data);
   });
 
@@ -806,27 +853,16 @@ describe("environment API", () => {
     expect(result).toEqual(data);
   });
 
-  it("createEnv includes docker options when provided", async () => {
-    const envData = { name: "Docker", slug: "docker", variables: {}, createdAt: 1, updatedAt: 1 };
+  it("createEnv sends name and variables only", async () => {
+    const envData = { name: "My Env", slug: "my-env", variables: { KEY: "val" }, createdAt: 1, updatedAt: 1 };
     mockFetch.mockResolvedValueOnce(mockResponse(envData));
 
-    await api.createEnv("Docker", { KEY: "val" }, {
-      dockerfile: "FROM node:20",
-      baseImage: "node:20",
-      ports: [3000],
-      volumes: ["/data"],
-      initScript: "npm install",
-    });
+    await api.createEnv("My Env", { KEY: "val" });
 
     const [, opts] = mockFetch.mock.calls[0];
     expect(JSON.parse(opts.body)).toEqual({
-      name: "Docker",
+      name: "My Env",
       variables: { KEY: "val" },
-      dockerfile: "FROM node:20",
-      baseImage: "node:20",
-      ports: [3000],
-      volumes: ["/data"],
-      initScript: "npm install",
     });
   });
 });
@@ -1868,6 +1904,124 @@ describe("del() error handling", () => {
       "api_request_failed",
       expect.objectContaining({ method: "DELETE", status: 409 }),
     );
+  });
+});
+
+// ===========================================================================
+// Browser preview API
+// ===========================================================================
+describe("browser preview API", () => {
+  it("navigateBrowser sends POST with url body", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ ok: true }));
+
+    const result = await api.navigateBrowser("sess-1", "https://example.com");
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sessions/sess-1/browser/navigate");
+    expect(opts.method).toBe("POST");
+    expect(JSON.parse(opts.body)).toEqual({ url: "https://example.com" });
+    expect(result).toEqual({ ok: true });
+  });
+});
+
+// ===========================================================================
+// Linear OAuth API (Agent Interaction SDK)
+// ===========================================================================
+describe("Linear OAuth API", () => {
+  it("getLinearOAuthStatus sends GET without params when no stagingId", async () => {
+    const data = { configured: true, hasClientId: true, hasClientSecret: true, hasWebhookSecret: true, hasAccessToken: true };
+    mockFetch.mockResolvedValueOnce(mockResponse(data));
+
+    const result = await api.getLinearOAuthStatus();
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/linear/oauth/status");
+    expect(result).toEqual(data);
+  });
+
+  it("getLinearOAuthStatus includes stagingId query param", async () => {
+    const data = { configured: false, hasClientId: true, hasClientSecret: true, hasWebhookSecret: false, hasAccessToken: false };
+    mockFetch.mockResolvedValueOnce(mockResponse(data));
+
+    const result = await api.getLinearOAuthStatus("staging-abc");
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/linear/oauth/status?stagingId=staging-abc");
+    expect(result).toEqual(data);
+  });
+
+  it("getLinearOAuthAuthorizeUrl sends GET without params", async () => {
+    const data = { url: "https://linear.app/oauth/authorize?client_id=xxx" };
+    mockFetch.mockResolvedValueOnce(mockResponse(data));
+
+    const result = await api.getLinearOAuthAuthorizeUrl();
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/linear/oauth/authorize-url");
+    expect(result).toEqual(data);
+  });
+
+  it("getLinearOAuthAuthorizeUrl includes returnTo and stagingId params", async () => {
+    const data = { url: "https://linear.app/oauth/authorize?client_id=xxx" };
+    mockFetch.mockResolvedValueOnce(mockResponse(data));
+
+    const result = await api.getLinearOAuthAuthorizeUrl("/#/settings", "staging-xyz");
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toContain("/api/linear/oauth/authorize-url?");
+    expect(url).toContain("returnTo=%2F%23%2Fsettings");
+    expect(url).toContain("stagingId=staging-xyz");
+    expect(result).toEqual(data);
+  });
+
+  it("disconnectLinearOAuth sends POST to /linear/oauth/disconnect", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ ok: true }));
+
+    const result = await api.disconnectLinearOAuth();
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/linear/oauth/disconnect");
+    expect(opts.method).toBe("POST");
+    expect(result).toEqual({ ok: true });
+  });
+});
+
+// ===========================================================================
+// Linear OAuth staging slots API
+// ===========================================================================
+describe("Linear OAuth staging API", () => {
+  it("createLinearStaging sends POST with credentials", async () => {
+    const creds = { clientId: "cid", clientSecret: "csec", webhookSecret: "wsec" };
+    mockFetch.mockResolvedValueOnce(mockResponse({ stagingId: "slot-123" }));
+
+    const result = await api.createLinearStaging(creds);
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/linear/oauth/staging");
+    expect(opts.method).toBe("POST");
+    expect(JSON.parse(opts.body)).toEqual(creds);
+    expect(result).toEqual({ stagingId: "slot-123" });
+  });
+
+  it("getLinearStagingStatus sends GET with encoded id", async () => {
+    const data = { exists: true, hasAccessToken: true, hasClientId: true, hasClientSecret: true };
+    mockFetch.mockResolvedValueOnce(mockResponse(data));
+
+    const result = await api.getLinearStagingStatus("slot-123");
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/linear/oauth/staging/slot-123/status");
+    expect(result).toEqual(data);
+  });
+
+  it("deleteLinearStaging sends DELETE with encoded id", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ ok: true }));
+
+    await api.deleteLinearStaging("slot-123");
+
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/linear/oauth/staging/slot-123");
+    expect(opts.method).toBe("DELETE");
   });
 });
 

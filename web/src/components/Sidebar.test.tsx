@@ -44,7 +44,9 @@ interface MockStoreState {
   sessions: Map<string, SessionState>;
   sdkSessions: SdkSessionInfo[];
   currentSessionId: string | null;
+  connectionStatus: Map<string, "connecting" | "connected" | "disconnected">;
   cliConnected: Map<string, boolean>;
+  cliReconnecting: Map<string, boolean>;
   sessionStatus: Map<string, "idle" | "running" | "compacting" | null>;
   sessionNames: Map<string, string>;
   recentlyRenamed: Set<string>;
@@ -60,7 +62,6 @@ interface MockStoreState {
   markRecentlyRenamed: ReturnType<typeof vi.fn>;
   clearRecentlyRenamed: ReturnType<typeof vi.fn>;
   setSdkSessions: ReturnType<typeof vi.fn>;
-  closeTerminal: ReturnType<typeof vi.fn>;
 }
 
 function makeSession(id: string, overrides: Partial<SessionState> = {}): SessionState {
@@ -109,7 +110,9 @@ function createMockState(overrides: Partial<MockStoreState> = {}): MockStoreStat
     sessions: new Map(),
     sdkSessions: [],
     currentSessionId: null,
+    connectionStatus: new Map(),
     cliConnected: new Map(),
+    cliReconnecting: new Map(),
     sessionStatus: new Map(),
     sessionNames: new Map(),
     recentlyRenamed: new Set(),
@@ -125,7 +128,6 @@ function createMockState(overrides: Partial<MockStoreState> = {}): MockStoreStat
     markRecentlyRenamed: vi.fn(),
     clearRecentlyRenamed: vi.fn(),
     setSdkSessions: vi.fn(),
-    closeTerminal: vi.fn(),
     ...overrides,
   };
 }
@@ -392,6 +394,22 @@ describe("Sidebar", () => {
     expect(awaitingDot).toBeTruthy();
   });
 
+  it("reconnecting session renders a spinning status dot", () => {
+    // Validates that a session in reconnecting state shows a spinning border dot
+    const session = makeSession("s1");
+    const sdk = makeSdkSession("s1");
+    mockState = createMockState({
+      sessions: new Map([["s1", session]]),
+      sdkSessions: [sdk],
+      cliConnected: new Map([["s1", false]]),
+      cliReconnecting: new Map([["s1", true]]),
+    });
+
+    render(<Sidebar />);
+    const reconnectingDot = document.querySelector(".animate-spin.border-t-cc-warning");
+    expect(reconnectingDot).toBeTruthy();
+  });
+
   it("archived sessions section shows count", () => {
     const sdk1 = makeSdkSession("s1", { archived: false });
     const sdk2 = makeSdkSession("s2", { archived: true });
@@ -455,12 +473,6 @@ describe("Sidebar", () => {
     render(<Sidebar />);
     fireEvent.click(screen.getByTitle("Prompts"));
     expect(window.location.hash).toBe("#/prompts");
-  });
-
-  it("navigates to terminal page when Terminal is clicked", () => {
-    render(<Sidebar />);
-    fireEvent.click(screen.getByTitle("Terminal"));
-    expect(window.location.hash).toBe("#/terminal");
   });
 
   it("session name shows animate-name-appear class when recently renamed", () => {
@@ -751,7 +763,6 @@ describe("Sidebar", () => {
     expect(screen.getByText("Integrations")).toBeInTheDocument();
     expect(screen.getByText("Agents")).toBeInTheDocument();
     expect(screen.getByText("Prompts")).toBeInTheDocument();
-    expect(screen.getByText("Terminal")).toBeInTheDocument();
     expect(screen.getByText("Settings")).toBeInTheDocument();
   });
 
@@ -951,6 +962,144 @@ describe("Sidebar", () => {
       expect(mockApi.listSessions).toHaveBeenCalled();
     });
     expect(screen.getByText("No sessions yet.")).toBeInTheDocument();
+  });
+
+  it("poll removes client-side sessions that the server no longer knows about", async () => {
+    // Regression test for: stale sessions persist in the sidebar after being cleared
+    // server-side. The poll updates sdkSessions but must also remove entries from the
+    // client-side `sessions` Map that are absent from the server response, otherwise
+    // the sidebar's UNION(sessions.keys(), sdkSessions) still includes the ghost entry.
+    //
+    // Scenario: session "stale-id" exists in the client sessions Map (populated earlier
+    // via a WebSocket session_init), but the server no longer knows about it. The poll
+    // should call removeSession("stale-id") to evict it from the client store.
+    const staleSession = makeSession("stale-id");
+
+    mockState = createMockState({
+      // Client has a stale session from a previous WebSocket session_init
+      sessions: new Map([["stale-id", staleSession]]),
+      // Server list is empty — the session was cleared server-side
+      sdkSessions: [],
+    });
+
+    // Poll returns an empty list — the server no longer has "stale-id"
+    mockApi.listSessions.mockResolvedValueOnce([]);
+
+    render(<Sidebar />);
+
+    await vi.waitFor(() => {
+      expect(mockApi.listSessions).toHaveBeenCalled();
+    });
+
+    // The poll must call removeSession for the stale client-side session
+    await vi.waitFor(() => {
+      expect(mockState.removeSession).toHaveBeenCalledWith("stale-id");
+    });
+
+    // setSdkSessions should have been called with the empty list from the server
+    expect(mockState.setSdkSessions).toHaveBeenCalledWith([]);
+  });
+
+  it("poll does not remove sessions that still exist on the server", async () => {
+    // Verifies the inverse: poll() must NOT call removeSession for sessions
+    // that ARE present in the server response. This guards against over-aggressive
+    // pruning that would clear valid sessions.
+    const activeSession = makeSession("active-id");
+    const serverSessions = [makeSdkSession("active-id")];
+
+    mockState = createMockState({
+      sessions: new Map([["active-id", activeSession]]),
+      sdkSessions: serverSessions,
+    });
+
+    mockApi.listSessions.mockResolvedValueOnce(serverSessions);
+
+    render(<Sidebar />);
+
+    await vi.waitFor(() => {
+      expect(mockApi.listSessions).toHaveBeenCalled();
+    });
+    await vi.waitFor(() => {
+      expect(mockState.setSdkSessions).toHaveBeenCalledWith(serverSessions);
+    });
+
+    // The active session is still on the server — removeSession must NOT be called
+    expect(mockState.removeSession).not.toHaveBeenCalled();
+  });
+
+  it("poll does not remove sessions that arrived via session_init after listSessions was dispatched", async () => {
+    // Race condition regression test: listSessions() is async. Between dispatch and
+    // response processing, a `session_init` WebSocket message can add a new session to
+    // store.sessions. That session IS legitimately on the server but absent from the
+    // `list` snapshot (which reflects server state at request time). Without this guard,
+    // the pruning loop would incorrectly evict a live, connected session.
+    //
+    // Scenario: "new-session-id" arrives via session_init WHILE listSessions is in-flight.
+    // The server response does NOT include it (stale snapshot), but the session has
+    // connectionStatus "connected". The poll must NOT call removeSession for it.
+
+    const newSession = makeSession("new-session-id");
+
+    // Simulate: listSessions resolves with an empty list (stale snapshot from before
+    // session_init arrived). setSdkSessions is a mock — it does NOT mutate mockState.
+    // After setSdkSessions completes, getState() should return the state that now
+    // includes "new-session-id" with connectionStatus "connected".
+    //
+    // We configure mockState upfront with the session and its connected status,
+    // mirroring what the store would look like after session_init fires mid-flight.
+    mockState = createMockState({
+      sessions: new Map([["new-session-id", newSession]]),
+      // connectionStatus "connected" signals this session has an active WebSocket —
+      // it was populated by session_init, not by a stale store state.
+      connectionStatus: new Map([["new-session-id", "connected"]]),
+    });
+
+    // Server snapshot is empty — doesn't yet include the newly-connected session
+    mockApi.listSessions.mockResolvedValueOnce([]);
+
+    render(<Sidebar />);
+
+    await vi.waitFor(() => {
+      expect(mockApi.listSessions).toHaveBeenCalled();
+    });
+    await vi.waitFor(() => {
+      expect(mockState.setSdkSessions).toHaveBeenCalledWith([]);
+    });
+
+    // The newly-connected session must NOT be evicted — it's live even though it
+    // wasn't in the server snapshot.
+    expect(mockState.removeSession).not.toHaveBeenCalledWith("new-session-id");
+  });
+
+  it("poll removes disconnected sessions absent from server", async () => {
+    // Verifies that the connectionStatus guard does not protect sessions that are
+    // genuinely stale (disconnected AND absent from the server list). A session with
+    // connectionStatus "disconnected" (or no status at all) that is not in the server
+    // response should be pruned.
+    //
+    // Scenario: "ghost-id" exists in the sessions Map with connectionStatus "disconnected"
+    // but is not in the server list. It must be removed.
+    const ghostSession = makeSession("ghost-id");
+
+    mockState = createMockState({
+      sessions: new Map([["ghost-id", ghostSession]]),
+      // connectionStatus is disconnected — no active WebSocket, this is a true ghost
+      connectionStatus: new Map([["ghost-id", "disconnected"]]),
+    });
+
+    // Server knows nothing about "ghost-id"
+    mockApi.listSessions.mockResolvedValueOnce([]);
+
+    render(<Sidebar />);
+
+    await vi.waitFor(() => {
+      expect(mockApi.listSessions).toHaveBeenCalled();
+    });
+
+    // The disconnected ghost session must be pruned
+    await vi.waitFor(() => {
+      expect(mockState.removeSession).toHaveBeenCalledWith("ghost-id");
+    });
   });
 
   // ─── Delete session flow ──────────────────────────────────────────────────
@@ -1220,7 +1369,7 @@ describe("Sidebar", () => {
     // Click the "Archive" confirm button in the warning panel
     // (There are multiple "Archive" texts, find the one in the confirmation panel)
     const archiveConfirmBtn = screen.getAllByText("Archive").find(
-      (el) => el.closest(".bg-amber-500\\/10") !== null,
+      (el) => el.closest(".bg-cc-warning\\/10") !== null,
     );
     expect(archiveConfirmBtn).toBeTruthy();
     fireEvent.click(archiveConfirmBtn!);
@@ -1247,7 +1396,7 @@ describe("Sidebar", () => {
 
     // Click Cancel in the warning panel
     const cancelBtn = screen.getAllByText("Cancel").find(
-      (el) => el.closest(".bg-amber-500\\/10") !== null,
+      (el) => el.closest(".bg-cc-warning\\/10") !== null,
     );
     fireEvent.click(cancelBtn!);
 
@@ -1520,38 +1669,22 @@ describe("Sidebar", () => {
     expect(screen.getByText("agent-model")).toBeInTheDocument();
   });
 
-  // ─── Footer nav: closeTerminal behavior ────────────────────────────────────
+  // ─── Footer nav behavior ───────────────────────────────────────────────────
 
-  it("clicking a non-terminal nav item calls closeTerminal", () => {
-    // Verifies that clicking any nav item except Terminal calls closeTerminal()
-    // to dismiss the terminal overlay.
+  it("clicking a nav item updates the hash", () => {
     render(<Sidebar />);
     fireEvent.click(screen.getByTitle("Prompts"));
-    expect(mockState.closeTerminal).toHaveBeenCalled();
+    expect(window.location.hash).toBe("#/prompts");
   });
 
-  it("clicking Terminal nav item does NOT call closeTerminal", () => {
-    // Verifies that clicking the Terminal nav item does NOT call closeTerminal,
-    // since the terminal should remain open when navigating to it.
-    render(<Sidebar />);
-
-    // Reset mocks from initial poll
-    mockState.closeTerminal.mockClear();
-
-    fireEvent.click(screen.getByTitle("Terminal"));
-    expect(mockState.closeTerminal).not.toHaveBeenCalled();
-  });
-
-  it("New Session button calls closeTerminal", () => {
-    // Verifies that clicking the New Session button closes any open terminal.
+  it("New Session button routes home", () => {
     render(<Sidebar />);
     const buttons = screen.getAllByTitle("New Session");
     fireEvent.click(buttons[0]);
-    expect(mockState.closeTerminal).toHaveBeenCalled();
+    expect(window.location.hash).toBe("");
   });
 
-  it("selecting a session calls closeTerminal", () => {
-    // Verifies that clicking on a session item closes any open terminal.
+  it("selecting a session routes to that session", () => {
     const session = makeSession("s1");
     const sdk = makeSdkSession("s1");
     mockState = createMockState({
@@ -1563,7 +1696,7 @@ describe("Sidebar", () => {
     const sessionButton = screen.getByText("claude-sonnet-4-6").closest("button")!;
     fireEvent.click(sessionButton);
 
-    expect(mockState.closeTerminal).toHaveBeenCalled();
+    expect(window.location.hash).toBe("#/session/s1");
   });
 
   // ─── Footer nav: active state ──────────────────────────────────────────────

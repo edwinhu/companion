@@ -212,6 +212,29 @@ describe("buildFallbackPath", () => {
     const dirs = result.split(":");
     expect(dirs.length).toBe(new Set(dirs).size);
   });
+
+  describe("Windows support", () => {
+    const originalPlatform = process.platform;
+
+    beforeEach(() => {
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+    });
+
+    it("uses semicolon as PATH separator on win32", () => {
+      mockExistsSync.mockImplementation((p: string) =>
+        ["/usr/local/bin", "/usr/bin"].includes(p as string),
+      );
+
+      const result = buildFallbackPath();
+      // Should use ; not : on Windows
+      expect(result).toContain(";");
+      expect(result).not.toContain(":");
+    });
+  });
 });
 
 // ─── getEnrichedPath ────────────────────────────────────────────────────────
@@ -282,6 +305,40 @@ describe("getEnrichedPath", () => {
       dirs.indexOf("/bin"),
     );
   });
+
+  describe("Windows support", () => {
+    const originalPlatform = process.platform;
+
+    beforeEach(() => {
+      _resetPathCache(); // ensure no cross-contamination from non-Windows tests
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+    });
+
+    it("splits and joins PATH with semicolons on win32", () => {
+      process.env.PATH = "C:\\Windows\\System32;C:\\Windows";
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (typeof cmd === "string" && cmd.includes("-lic")) {
+          return "___PATH_START___C:\\Users\\me\\AppData\\Roaming\\npm;C:\\Windows\\System32___PATH_END___\n";
+        }
+        return "";
+      });
+
+      const result = getEnrichedPath();
+      // Should use ; as separator and contain all directories
+      expect(result).toContain("C:\\Users\\me\\AppData\\Roaming\\npm");
+      expect(result).toContain("C:\\Windows\\System32");
+      expect(result).toContain("C:\\Windows");
+      // Should be semicolon-separated
+      const dirs = result.split(";");
+      expect(dirs.length).toBeGreaterThanOrEqual(3);
+      // C:\Windows\System32 should appear exactly once (deduplication)
+      expect(dirs.filter((d) => d === "C:\\Windows\\System32").length).toBe(1);
+    });
+  });
 });
 
 // ─── resolveBinary ──────────────────────────────────────────────────────────
@@ -350,6 +407,107 @@ describe("resolveBinary", () => {
   it("returns null when given an absolute path that does not exist", () => {
     mockExistsSync.mockReturnValue(false);
     expect(resolveBinary("/nonexistent/claude")).toBeNull();
+  });
+
+  describe("Windows support", () => {
+    const originalPlatform = process.platform;
+
+    beforeEach(() => {
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+    });
+
+    it("accepts Windows absolute paths like C:\\... on win32", () => {
+      mockExistsSync.mockReturnValue(true);
+      expect(resolveBinary("C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd")).toBe(
+        "C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd",
+      );
+    });
+
+    it("returns null for a non-existent Windows absolute path", () => {
+      mockExistsSync.mockReturnValue(false);
+      expect(resolveBinary("D:\\nonexistent\\claude.cmd")).toBeNull();
+    });
+
+    it("prefers 'where' over 'which' on Windows when both succeed", () => {
+      _resetPathCache();
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (typeof cmd === "string" && cmd.includes("-lic")) {
+          return "___PATH_START___/usr/bin___PATH_END___\n";
+        }
+        // 'where' succeeds with a native Win32 path
+        if (typeof cmd === "string" && cmd.startsWith("where")) {
+          return "C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd\r\nC:\\Users\\me\\AppData\\Roaming\\npm\\claude\r\n";
+        }
+        // 'which' also succeeds but returns a POSIX-style path (Git Bash)
+        if (typeof cmd === "string" && cmd.startsWith("which")) {
+          return "/c/Users/me/AppData/Roaming/npm/claude";
+        }
+        throw new Error("not found");
+      });
+
+      // Should return the 'where' result (native Win32 path), not the 'which' POSIX path
+      expect(resolveBinary("claude")).toBe("C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd");
+    });
+
+    it("falls back to 'which' when 'where' fails on Windows", () => {
+      _resetPathCache();
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (typeof cmd === "string" && cmd.includes("-lic")) {
+          return "___PATH_START___/usr/bin___PATH_END___\n";
+        }
+        // 'where' fails
+        if (typeof cmd === "string" && cmd.startsWith("where")) {
+          throw new Error("not found");
+        }
+        // 'which' succeeds (Git Bash fallback)
+        if (typeof cmd === "string" && cmd.startsWith("which")) {
+          return "/c/Users/me/AppData/Roaming/npm/claude";
+        }
+        throw new Error("not found");
+      });
+
+      expect(resolveBinary("claude")).toBe("/c/Users/me/AppData/Roaming/npm/claude");
+    });
+
+    it("prefers .cmd result from 'where' output with multiple lines", () => {
+      _resetPathCache();
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (typeof cmd === "string" && cmd.includes("-lic")) {
+          return "___PATH_START___/usr/bin___PATH_END___\n";
+        }
+        if (typeof cmd === "string" && cmd.startsWith("which")) {
+          throw new Error("not found");
+        }
+        if (typeof cmd === "string" && cmd.startsWith("where")) {
+          return "C:\\Program Files\\nodejs\\node\r\nC:\\Users\\me\\AppData\\Roaming\\npm\\node.cmd\r\n";
+        }
+        throw new Error("not found");
+      });
+
+      expect(resolveBinary("node")).toBe("C:\\Users\\me\\AppData\\Roaming\\npm\\node.cmd");
+    });
+
+    it("returns first line from 'where' when no .cmd match exists", () => {
+      _resetPathCache();
+      mockExecSync.mockImplementation((cmd: string) => {
+        if (typeof cmd === "string" && cmd.includes("-lic")) {
+          return "___PATH_START___/usr/bin___PATH_END___\n";
+        }
+        if (typeof cmd === "string" && cmd.startsWith("which")) {
+          throw new Error("not found");
+        }
+        if (typeof cmd === "string" && cmd.startsWith("where")) {
+          return "C:\\Program Files\\nodejs\\node.exe\r\n";
+        }
+        throw new Error("not found");
+      });
+
+      expect(resolveBinary("node")).toBe("C:\\Program Files\\nodejs\\node.exe");
+    });
   });
 });
 

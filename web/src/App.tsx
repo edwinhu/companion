@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useStore } from "./store.js";
 import { connectSession } from "./ws.js";
 import { api } from "./api.js";
@@ -13,24 +13,23 @@ import { TaskPanel } from "./components/TaskPanel.js";
 import { DiffPanel } from "./components/DiffPanel.js";
 import { UpdateBanner } from "./components/UpdateBanner.js";
 import { SessionLaunchOverlay } from "./components/SessionLaunchOverlay.js";
-import { SessionTerminalDock } from "./components/SessionTerminalDock.js";
-import { SessionEditorPane } from "./components/SessionEditorPane.js";
 import { UpdateOverlay } from "./components/UpdateOverlay.js";
+import { DockerUpdateDialog } from "./components/DockerUpdateDialog.js";
+import { OnboardingModal } from "./components/OnboardingModal.js";
 
 // Lazy-loaded route-level pages (not needed for initial render)
 const Playground = lazy(() => import("./components/Playground.js").then((m) => ({ default: m.Playground })));
 const SettingsPage = lazy(() => import("./components/SettingsPage.js").then((m) => ({ default: m.SettingsPage })));
 const IntegrationsPage = lazy(() => import("./components/IntegrationsPage.js").then((m) => ({ default: m.IntegrationsPage })));
 const LinearSettingsPage = lazy(() => import("./components/LinearSettingsPage.js").then((m) => ({ default: m.LinearSettingsPage })));
+const LinearOAuthSettingsPage = lazy(() => import("./components/LinearOAuthSettingsPage.js").then((m) => ({ default: m.LinearOAuthSettingsPage })));
 const TailscalePage = lazy(() => import("./components/TailscalePage.js").then((m) => ({ default: m.TailscalePage })));
 const PromptsPage = lazy(() => import("./components/PromptsPage.js").then((m) => ({ default: m.PromptsPage })));
 const EnvManager = lazy(() => import("./components/EnvManager.js").then((m) => ({ default: m.EnvManager })));
-const DockerBuilderPage = lazy(() => import("./components/DockerBuilderPage.js").then((m) => ({ default: m.DockerBuilderPage })));
+const SandboxManager = lazy(() => import("./components/SandboxManager.js").then((m) => ({ default: m.SandboxManager })));
 const CronManager = lazy(() => import("./components/CronManager.js").then((m) => ({ default: m.CronManager })));
 const AgentsPage = lazy(() => import("./components/AgentsPage.js").then((m) => ({ default: m.AgentsPage })));
 const RunsPage = lazy(() => import("./components/RunsPage.js").then((m) => ({ default: m.RunsPage })));
-const TerminalPage = lazy(() => import("./components/TerminalPage.js").then((m) => ({ default: m.TerminalPage })));
-const ProcessPanel = lazy(() => import("./components/ProcessPanel.js").then((m) => ({ default: m.ProcessPanel })));
 
 
 function LazyFallback() {
@@ -56,7 +55,6 @@ export default function App() {
   const taskPanelOpen = useStore((s) => s.taskPanelOpen);
   const homeResetKey = useStore((s) => s.homeResetKey);
   const activeTab = useStore((s) => s.activeTab);
-  const setActiveTab = useStore((s) => s.setActiveTab);
   const sessionCreating = useStore((s) => s.sessionCreating);
   const sessionCreatingBackend = useStore((s) => s.sessionCreatingBackend);
   const creationProgress = useStore((s) => s.creationProgress);
@@ -68,10 +66,10 @@ export default function App() {
   const isPromptsPage = route.page === "prompts";
   const isIntegrationsPage = route.page === "integrations";
   const isLinearIntegrationPage = route.page === "integration-linear";
+  const isLinearOAuthIntegrationPage = route.page === "integration-linear-oauth";
   const isTailscaleIntegrationPage = route.page === "integration-tailscale";
-  const isTerminalPage = route.page === "terminal";
   const isEnvironmentsPage = route.page === "environments";
-  const isDockerBuilderPage = route.page === "docker-builder";
+  const isSandboxesPage = route.page === "sandboxes";
   const isScheduledPage = route.page === "scheduled";
   const isAgentsPage = route.page === "agents" || route.page === "agent-detail";
   const isRunsPage = route.page === "runs";
@@ -84,13 +82,6 @@ export default function App() {
   useEffect(() => {
     document.documentElement.classList.toggle("dark", darkMode);
   }, [darkMode]);
-
-  // Migrate legacy "files" tab to "editor"
-  useEffect(() => {
-    if ((activeTab as string) === "files") {
-      setActiveTab("editor");
-    }
-  }, [activeTab, setActiveTab]);
 
   // Capture the localStorage-restored session ID during render (before any effects run)
   // so the mount logic can use it even if the hash-sync branch would clear it.
@@ -118,7 +109,7 @@ export default function App() {
         store.setCurrentSession(null);
       }
     }
-    // For other pages (settings, terminal, etc.), preserve currentSessionId
+    // For other pages (settings, etc.), preserve currentSessionId
   }, [route]);
 
   // Keep git changed-files count in sync for the badge regardless of which tab is active.
@@ -156,11 +147,26 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Load publicUrl from settings on mount (used for webhook URL generation)
+  // Load publicUrl from settings + check onboarding status.
+  // Re-runs when isAuthenticated flips to true (e.g. after login) so that
+  // users who authenticate first still see the onboarding wizard.
+  const [showOnboarding, setShowOnboarding] = useState(false);
   useEffect(() => {
+    if (!isAuthenticated) return;
     api.getSettings().then((s) => {
       if (s.publicUrl) useStore.getState().setPublicUrl(s.publicUrl);
+      if (!s.onboardingCompleted) {
+        setShowOnboarding(true);
+      }
     }).catch(() => {});
+  }, [isAuthenticated]);
+
+  // Show Docker image update dialog if an app update just completed
+  useEffect(() => {
+    if (localStorage.getItem("companion_docker_prompt_pending") === "1") {
+      localStorage.removeItem("companion_docker_prompt_pending");
+      useStore.getState().setDockerUpdateDialogOpen(true);
+    }
   }, []);
 
   // Auth gate: show login page when not authenticated
@@ -223,15 +229,15 @@ export default function App() {
             </div>
           )}
 
-          {isTailscaleIntegrationPage && (
+          {isLinearOAuthIntegrationPage && (
             <div className="absolute inset-0">
-              <Suspense fallback={<LazyFallback />}><TailscalePage embedded /></Suspense>
+              <Suspense fallback={<LazyFallback />}><LinearOAuthSettingsPage embedded /></Suspense>
             </div>
           )}
 
-          {isTerminalPage && (
+          {isTailscaleIntegrationPage && (
             <div className="absolute inset-0">
-              <Suspense fallback={<LazyFallback />}><TerminalPage /></Suspense>
+              <Suspense fallback={<LazyFallback />}><TailscalePage embedded /></Suspense>
             </div>
           )}
 
@@ -241,9 +247,10 @@ export default function App() {
             </div>
           )}
 
-          {isDockerBuilderPage && (
+
+          {isSandboxesPage && (
             <div className="absolute inset-0">
-              <Suspense fallback={<LazyFallback />}><DockerBuilderPage /></Suspense>
+              <Suspense fallback={<LazyFallback />}><SandboxManager embedded /></Suspense>
             </div>
           )}
 
@@ -269,25 +276,9 @@ export default function App() {
             <>
               <div className="absolute inset-0">
                 {currentSessionId ? (
-                  activeTab === "terminal"
-                    ? (
-                      <SessionTerminalDock
-                        sessionId={currentSessionId}
-                        terminalOnly
-                        onClosePanel={() => useStore.getState().setActiveTab("chat")}
-                      />
-                    )
-                    : activeTab === "processes"
-                      ? <Suspense fallback={<LazyFallback />}><ProcessPanel sessionId={currentSessionId} /></Suspense>
-                      : activeTab === "editor"
-                        ? <SessionEditorPane sessionId={currentSessionId} />
-                        : (
-                        <SessionTerminalDock sessionId={currentSessionId} suppressPanel>
-                          {activeTab === "diff"
-                            ? <DiffPanel sessionId={currentSessionId} />
-                            : <ChatView sessionId={currentSessionId} />}
-                        </SessionTerminalDock>
-                      )
+                  activeTab === "diff"
+                    ? <DiffPanel sessionId={currentSessionId} />
+                    : <ChatView sessionId={currentSessionId} />
                 ) : (
                   <HomePage key={homeResetKey} />
                 )}
@@ -345,6 +336,8 @@ export default function App() {
         </>
       )}
       <UpdateOverlay active={updateOverlayActive} />
+      <DockerUpdateDialog />
+      {showOnboarding && <OnboardingModal onComplete={() => setShowOnboarding(false)} />}
     </div>
   );
 }

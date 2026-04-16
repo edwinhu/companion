@@ -13,6 +13,9 @@ import {
   CODEX_MODES,
   CLAUDE_AGENT_MODES,
   CODEX_AGENT_MODES,
+  GEMINI_MODELS,
+  GEMINI_MODES,
+  GEMINI_AGENT_MODES,
 } from "./backends.js";
 
 describe("toModelOptions", () => {
@@ -82,6 +85,10 @@ describe("getModelsForBackend", () => {
   it("returns codex models for codex backend", () => {
     expect(getModelsForBackend("codex")).toBe(CODEX_MODELS);
   });
+
+  it("returns gemini models for gemini backend", () => {
+    expect(getModelsForBackend("gemini")).toBe(GEMINI_MODELS);
+  });
 });
 
 describe("getModesForBackend", () => {
@@ -91,6 +98,10 @@ describe("getModesForBackend", () => {
 
   it("returns codex modes for codex backend", () => {
     expect(getModesForBackend("codex")).toBe(CODEX_MODES);
+  });
+
+  it("returns gemini modes for gemini backend", () => {
+    expect(getModesForBackend("gemini")).toBe(GEMINI_MODES);
   });
 });
 
@@ -102,6 +113,10 @@ describe("getDefaultModel", () => {
   it("returns first codex model for codex backend", () => {
     expect(getDefaultModel("codex")).toBe(CODEX_MODELS[0].value);
   });
+
+  it("returns first gemini model for gemini backend", () => {
+    expect(getDefaultModel("gemini")).toBe(GEMINI_MODELS[0].value);
+  });
 });
 
 describe("getDefaultMode", () => {
@@ -111,6 +126,10 @@ describe("getDefaultMode", () => {
 
   it("returns first codex mode for codex backend", () => {
     expect(getDefaultMode("codex")).toBe(CODEX_MODES[0].value);
+  });
+
+  it("returns first gemini mode for gemini backend", () => {
+    expect(getDefaultMode("gemini")).toBe(GEMINI_MODES[0].value);
   });
 });
 
@@ -122,6 +141,10 @@ describe("getAgentModesForBackend", () => {
   it("returns codex agent modes for codex backend", () => {
     expect(getAgentModesForBackend("codex")).toBe(CODEX_AGENT_MODES);
   });
+
+  it("returns gemini agent modes for gemini backend", () => {
+    expect(getAgentModesForBackend("gemini")).toBe(GEMINI_AGENT_MODES);
+  });
 });
 
 describe("getDefaultAgentMode", () => {
@@ -131,6 +154,10 @@ describe("getDefaultAgentMode", () => {
 
   it("returns first codex agent mode for codex backend", () => {
     expect(getDefaultAgentMode("codex")).toBe(CODEX_AGENT_MODES[0].value);
+  });
+
+  it("returns first gemini agent mode for gemini backend", () => {
+    expect(getDefaultAgentMode("gemini")).toBe(GEMINI_AGENT_MODES[0].value);
   });
 });
 

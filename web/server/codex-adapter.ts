@@ -11,6 +11,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { Subprocess } from "bun";
+import type { IBackendAdapter } from "./backend-adapter.js";
 import type {
   BrowserIncomingMessage,
   BrowserOutgoingMessage,
@@ -21,6 +22,8 @@ import type {
   McpServerConfig,
 } from "./session-types.js";
 import type { RecorderManager } from "./recorder.js";
+import { reportProtocolDrift } from "./protocol-monitor.js";
+import { log } from "./logger.js";
 
 // ─── Codex JSON-RPC Types ─────────────────────────────────────────────────────
 
@@ -103,10 +106,6 @@ interface CodexReasoningItem extends CodexItem {
   content?: string;
 }
 
-interface CodexContextCompactionItem extends CodexItem {
-  type: "contextCompaction";
-}
-
 interface CodexCollabAgentToolCallItem extends CodexItem {
   type: "collabAgentToolCall";
   tool: string;
@@ -145,6 +144,7 @@ export interface ICodexTransport {
   onRequest(handler: (method: string, id: number, params: Record<string, unknown>) => void): void;
   onRawIncoming(cb: (line: string) => void): void;
   onRawOutgoing(cb: (data: string) => void): void;
+  onParseError(cb: (message: string) => void): void;
   isConnected(): boolean;
 }
 
@@ -175,6 +175,8 @@ export interface CodexAdapterOptions {
   recorder?: RecorderManager;
   /** Callback to kill the underlying process/connection on disconnect. */
   killProcess?: () => Promise<void> | void;
+  /** Optional system prompt injected into thread/start as instructions (e.g. Linear context). */
+  systemPrompt?: string;
 }
 
 // ─── Stdio JSON-RPC Transport ────────────────────────────────────────────────
@@ -187,13 +189,16 @@ export class StdioTransport implements ICodexTransport {
   private requestHandler: ((method: string, id: number, params: Record<string, unknown>) => void) | null = null;
   private rawInCb: ((line: string) => void) | null = null;
   private rawOutCb: ((data: string) => void) | null = null;
+  private parseErrorCb: ((message: string) => void) | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array>;
   private connected = true;
   private buffer = "";
+  private protocolDriftSeen = new Set<string>();
 
   constructor(
     stdin: WritableStream<Uint8Array> | { write(data: Uint8Array): number },
     stdout: ReadableStream<Uint8Array>,
+    private readonly sessionId = "unknown",
   ) {
     // Handle both Bun subprocess stdin types
     let writable: WritableStream<Uint8Array>;
@@ -225,16 +230,19 @@ export class StdioTransport implements ICodexTransport {
         this.processBuffer();
       }
     } catch (err) {
-      console.error("[codex-adapter] stdout reader error:", err);
+      log.error("codex-adapter", "stdout reader error", {
+        sessionId: this.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     } finally {
       this.connected = false;
       // Clear all pending RPC timers and reject promises so callers don't
       // hang indefinitely when the Codex process crashes or exits.
-      for (const [id, timer] of this.pendingTimers) {
+      for (const [, timer] of this.pendingTimers) {
         clearTimeout(timer);
       }
       this.pendingTimers.clear();
-      for (const [id, { reject }] of this.pending) {
+      for (const [, { reject }] of this.pending) {
         reject(new Error("Transport closed"));
       }
       this.pending.clear();
@@ -257,7 +265,18 @@ export class StdioTransport implements ICodexTransport {
       try {
         msg = JSON.parse(trimmed);
       } catch {
-        console.warn("[codex-adapter] Failed to parse JSON-RPC:", trimmed.substring(0, 200));
+        reportProtocolDrift(
+          this.protocolDriftSeen,
+          {
+            backend: "codex",
+            sessionId: this.sessionId,
+            direction: "incoming",
+            messageKind: "parse_error",
+            messageName: "json-rpc",
+            rawPreview: trimmed,
+          },
+          (message) => this.parseErrorCb?.(message),
+        );
         continue;
       }
 
@@ -283,13 +302,34 @@ export class StdioTransport implements ICodexTransport {
           }
           const resp = msg as JsonRpcResponse;
           if (resp.error) {
-            pending.reject(new Error(resp.error.message));
+            const rpcErr = new Error(resp.error.message);
+            (rpcErr as unknown as Record<string, unknown>).code = resp.error.code;
+            pending.reject(rpcErr);
           } else {
             pending.resolve(resp.result);
           }
         }
       }
     } else if ("method" in msg) {
+      // When the WS proxy reconnects to Codex, all pending RPC calls are
+      // orphaned (Codex sees a fresh connection and won't respond to them).
+      // Reject them immediately so callers don't hang until timeout.
+      if ((msg as JsonRpcNotification).method === "companion/wsReconnected") {
+        const pendingCount = this.pending.size;
+        if (pendingCount > 0) {
+          console.warn(
+            `[codex-adapter] WS proxy reconnected — rejecting ${pendingCount} orphaned RPC call(s)`,
+          );
+          for (const [, timer] of this.pendingTimers) {
+            clearTimeout(timer);
+          }
+          this.pendingTimers.clear();
+          for (const [, { reject }] of this.pending) {
+            reject(new Error("Transport reconnected"));
+          }
+          this.pending.clear();
+        }
+      }
       // Notification (no id)
       this.notificationHandler?.(msg.method, (msg as JsonRpcNotification).params || {});
     }
@@ -356,6 +396,11 @@ export class StdioTransport implements ICodexTransport {
     this.rawOutCb = cb;
   }
 
+  /** Register callback for parse error messages to surface to the browser. */
+  onParseError(cb: (message: string) => void): void {
+    this.parseErrorCb = cb;
+  }
+
   private async writeRaw(data: string): Promise<void> {
     if (!this.connected) {
       throw new Error("Transport closed");
@@ -368,7 +413,7 @@ export class StdioTransport implements ICodexTransport {
 
 // ─── Codex Adapter ────────────────────────────────────────────────────────────
 
-export class CodexAdapter {
+export class CodexAdapter implements IBackendAdapter {
   private transport: ICodexTransport;
   private sessionId: string;
   private options: CodexAdapterOptions;
@@ -385,6 +430,12 @@ export class CodexAdapter {
   private initialized = false;
   private initFailed = false;
   private initInProgress = false;
+  /** Monotonically increasing epoch — incremented on every WS reconnect or
+   *  resetForReconnect so that a stale in-flight initialize() can detect that
+   *  a newer one has been triggered and bail out early. */
+  private initEpoch = 0;
+  /** Guard against multiple cleanupAndDisconnect() calls firing disconnectCb twice. */
+  private disconnectFired = false;
 
   // Streaming accumulator for agent messages
   private streamingText = "";
@@ -417,6 +468,16 @@ export class CodexAdapter {
 
   // Queue messages received before initialization completes
   private pendingOutgoing: BrowserOutgoingMessage[] = [];
+  /** Number of consecutive reconnect-retries for the current user message. */
+  private reconnectRetryCount = 0;
+  /** Number of consecutive overload (-32001) retries for the current user message. */
+  private overloadRetryCount = 0;
+  private static readonly MAX_RECONNECT_RETRIES = 5;
+  /** Timer handle for the -32001 overload backoff retry, so we can cancel it on reconnect. */
+  private overloadRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The message captured in the overload retry timer closure, so it can be
+   *  rescued to pendingOutgoing if the timer is cancelled by a reconnect. */
+  private overloadRetryMsg: BrowserOutgoingMessage | null = null;
 
   // Pending approval requests (Codex sends these as JSON-RPC requests with an id)
   private pendingApprovals = new Map<string, number>(); // request_id -> JSON-RPC id
@@ -438,6 +499,7 @@ export class CodexAdapter {
     secondary: { usedPercent: number; windowDurationMins: number; resetsAt: number } | null;
   } | null = null;
   private static readonly DYNAMIC_TOOL_CALL_TIMEOUT_MS = 120_000;
+  private protocolDriftSeen = new Set<string>();
 
   private getExecutionCwd(): string {
     return this.options.executionCwd || this.options.cwd || "";
@@ -475,6 +537,7 @@ export class CodexAdapter {
       this.transport = new StdioTransport(
         stdin as WritableStream<Uint8Array> | { write(data: Uint8Array): number },
         stdout as ReadableStream<Uint8Array>,
+        this.sessionId,
       );
 
       // Monitor process exit — when using a subprocess directly,
@@ -494,13 +557,7 @@ export class CodexAdapter {
       }
 
       proc.exited.then(() => {
-        this.connected = false;
-        for (const pending of this.pendingDynamicToolCalls.values()) {
-          clearTimeout(pending.timeout);
-        }
-        this.pendingDynamicToolCalls.clear();
-        this.pendingExitPlanModeRequests.clear();
-        this.disconnectCb?.();
+        this.cleanupAndDisconnect();
       });
     }
 
@@ -518,6 +575,11 @@ export class CodexAdapter {
         recorder.record(sessionId, "out", data.trimEnd(), "cli", "codex", cwd);
       });
     }
+
+    // Surface transport-level parse errors to the browser
+    this.transport.onParseError((message) => {
+      this.browserMessageCb?.({ type: "error", message });
+    });
 
     // Start initialization
     this.initialize();
@@ -537,13 +599,128 @@ export class CodexAdapter {
    * event to this method so the adapter can clean up and fire disconnectCb.
    */
   handleTransportClose(): void {
-    this.connected = false;
+    this.cleanupAndDisconnect();
+  }
+
+  /**
+   * Handle a WebSocket proxy reconnection event.  The proxy reconnected
+   * to the Codex app-server after a transient drop (e.g. outbound queue
+   * overflow on the Codex side).  Pending RPC calls were already rejected
+   * by the StdioTransport, but we need to:
+   *  1. Cancel any pending dynamic tool call timers
+   *  2. Cancel pending permissions (they're stale after reconnect)
+   *  3. Re-initialize the thread so we can accept new messages
+   */
+  private handleWsReconnected(): void {
+    console.log(`[codex-adapter] Session ${this.sessionId}: WS proxy reconnected to Codex`);
+
+    // Clean up pending dynamic tool calls (timers would fire stale errors)
     for (const pending of this.pendingDynamicToolCalls.values()) {
       clearTimeout(pending.timeout);
     }
     this.pendingDynamicToolCalls.clear();
     this.pendingExitPlanModeRequests.clear();
-    this.disconnectCb?.();
+    // Emit permission_cancelled for each stale approval so the browser
+    // can dismiss its permission dialog (the bridge also clears its own
+    // pendingPermissions map when it sees these messages).
+    for (const [requestId] of this.pendingApprovals) {
+      this.emit({ type: "permission_cancelled", request_id: requestId });
+    }
+    this.pendingApprovals.clear();
+    this.pendingUserInputQuestionIds.clear();
+    this.pendingReviewDecisions.clear();
+
+    // If an agentMessage was actively streaming, emit a synthetic
+    // content_block_stop so the browser doesn't show an orphaned streaming
+    // block that never completes.
+    if (this.streamingItemId) {
+      this.emit({
+        type: "stream_event",
+        event: { type: "content_block_stop", index: 0 },
+        parent_tool_use_id: null,
+      });
+      this.emit({
+        type: "stream_event",
+        event: {
+          type: "message_delta",
+          delta: { stop_reason: "interrupted" },
+          usage: { output_tokens: 0 },
+        },
+        parent_tool_use_id: null,
+      });
+    }
+    this.streamingText = "";
+    this.streamingItemId = null;
+
+    // Clear stale per-item tracking state — after a reconnect, Codex starts
+    // fresh and won't reference old item/turn IDs. Keeping them wastes memory
+    // and risks stale lookups.
+    this.emittedToolUseIds.clear();
+    this.commandStartTimes.clear();
+    this.reasoningTextByItemId.clear();
+    this.parentToolUseByThreadId.clear();
+    this.planDeltaByTurnId.clear();
+    this.planUpdateCountByTurnId.clear();
+
+    // Clear the current turn — it's gone after reconnect
+    this.currentTurnId = null;
+    // Reset so the next turn/start re-sends collaborationMode (the server
+    // sees a fresh connection and won't have the previously-set mode).
+    this.lastSentCollaborationModeKind = null;
+    // NOTE: Do NOT reset reconnectRetryCount here. The rejection microtask
+    // from StdioTransport.dispatch() hasn't fired yet — resetting the counter
+    // would defeat the MAX_RECONNECT_RETRIES guard. The counter is reset on
+    // successful initialize() and turn/start instead.
+    //
+    // IMPORTANT: Do NOT clear pendingOutgoing here. The rejection microtask
+    // from the turn/start call hasn't fired yet. When it fires, the catch
+    // handler in handleOutgoingUserMessage will re-queue the user message.
+    // Clearing pendingOutgoing here would race with that microtask and lose
+    // the user's message. The queue is naturally drained by flushPendingOutgoing()
+    // after re-initialization completes.
+    // Rescue any message pending in the overload retry timer before cancelling.
+    if (this.overloadRetryTimer) {
+      if (this.overloadRetryMsg) {
+        this.pendingOutgoing.push(this.overloadRetryMsg);
+        this.overloadRetryMsg = null;
+      }
+      clearTimeout(this.overloadRetryTimer);
+      this.overloadRetryTimer = null;
+    }
+    this.overloadRetryCount = 0;
+
+    // After a WS reconnect, Codex requires a fresh initialize/initialized
+    // handshake before accepting turn/start, even if this adapter was already
+    // initialized before the drop.
+    // Bump the epoch so any in-flight initialize() from the previous cycle
+    // detects it has been superseded and bails out instead of racing.
+    this.initEpoch++;
+    this.initInProgress = false;
+    this.initialized = false;
+    this.initFailed = false;
+    if (!this.options.threadId && this.threadId) {
+      this.options.threadId = this.threadId;
+    }
+    this.initialize();
+  }
+
+  /**
+   * Clear pending timers, mark disconnected, and fire the disconnect callback.
+   * Shared by handleTransportClose, RPC timeout paths, and process exit handlers.
+   */
+  private cleanupAndDisconnect(): void {
+    this.connected = false;
+    this.overloadRetryMsg = null; // No rescue needed — session is being torn down
+    if (this.overloadRetryTimer) { clearTimeout(this.overloadRetryTimer); this.overloadRetryTimer = null; }
+    for (const pending of this.pendingDynamicToolCalls.values()) {
+      clearTimeout(pending.timeout);
+    }
+    this.pendingDynamicToolCalls.clear();
+    this.pendingExitPlanModeRequests.clear();
+    if (!this.disconnectFired) {
+      this.disconnectFired = true;
+      this.disconnectCb?.();
+    }
   }
 
   /**
@@ -557,7 +734,40 @@ export class CodexAdapter {
     this.connected = false;
     this.initialized = false;
     this.initFailed = false;
+    // Bump epoch to invalidate any stale in-flight initialize() from the old transport.
+    this.initEpoch++;
     this.initInProgress = false;
+    this.disconnectFired = false;
+
+    // Clean up stale approval and per-item state from the old transport.
+    // The new Codex process won't know about old request IDs.
+    for (const pending of this.pendingDynamicToolCalls.values()) {
+      clearTimeout(pending.timeout);
+    }
+    this.pendingDynamicToolCalls.clear();
+    this.pendingExitPlanModeRequests.clear();
+    for (const [requestId] of this.pendingApprovals) {
+      this.emit({ type: "permission_cancelled", request_id: requestId });
+    }
+    this.pendingApprovals.clear();
+    this.pendingUserInputQuestionIds.clear();
+    this.pendingReviewDecisions.clear();
+    this.emittedToolUseIds.clear();
+    this.commandStartTimes.clear();
+    this.reasoningTextByItemId.clear();
+    this.parentToolUseByThreadId.clear();
+    this.planDeltaByTurnId.clear();
+    this.planUpdateCountByTurnId.clear();
+    this.streamingText = "";
+    this.streamingItemId = null;
+    this.overloadRetryMsg = null; // Full relaunch — no rescue needed
+    if (this.overloadRetryTimer) { clearTimeout(this.overloadRetryTimer); this.overloadRetryTimer = null; }
+    this.overloadRetryCount = 0;
+    // Reset reconnect retry budget — this is a full relaunch with a new
+    // transport, not a transient WS proxy reconnect, so the budget should
+    // start fresh.
+    this.reconnectRetryCount = 0;
+    this.pendingOutgoing.length = 0;
 
     // Re-wire handlers on the new transport
     this.transport.onNotification((method, params) => this.handleNotification(method, params));
@@ -575,6 +785,11 @@ export class CodexAdapter {
       });
     }
 
+    // Re-wire parse error surfacing
+    this.transport.onParseError((message) => {
+      this.browserMessageCb?.({ type: "error", message });
+    });
+
     // Re-run initialization (which will resume the thread if threadId is set)
     this.initialize();
   }
@@ -585,6 +800,12 @@ export class CodexAdapter {
     return this._rateLimits;
   }
 
+  /** IBackendAdapter.send() — unified entry point for browser-originated messages. */
+  send(msg: BrowserOutgoingMessage): boolean {
+    return this.sendBrowserMessage(msg);
+  }
+
+  /** @deprecated Use send() instead. Kept for backward compatibility during migration. */
   sendBrowserMessage(msg: BrowserOutgoingMessage): boolean {
     // If initialization failed, reject all new messages
     if (this.initFailed) {
@@ -609,9 +830,12 @@ export class CodexAdapter {
       if (!this.connected) return false;
     }
 
-    // Guard against dispatching when transport is down (e.g. after proxy WS drop)
+    // Guard against dispatching when transport is down (e.g. after proxy WS drop).
+    // Also trigger cleanup so the bridge sees the adapter as disconnected and
+    // stops trying to flush messages in a loop (proc.exited may not have fired yet).
     if (!this.transport.isConnected()) {
       console.warn(`[codex-adapter] Transport disconnected — cannot dispatch ${msg.type}`);
+      this.cleanupAndDisconnect();
       return false;
     }
 
@@ -632,6 +856,12 @@ export class CodexAdapter {
    */
   private flushPendingOutgoing(): void {
     if (this.pendingOutgoing.length === 0) return;
+    if (!this.initialized || !this.threadId || this.initInProgress) {
+      console.log(
+        `[codex-adapter] Session ${this.sessionId}: init not ready — keeping ${this.pendingOutgoing.length} message(s) queued`,
+      );
+      return;
+    }
     if (!this.transport.isConnected()) {
       console.warn(
         `[codex-adapter] Session ${this.sessionId}: transport disconnected — keeping ${this.pendingOutgoing.length} message(s) queued`,
@@ -726,10 +956,14 @@ export class CodexAdapter {
       return;
     }
     this.initInProgress = true;
+    // Snapshot the epoch at call time. If a WS reconnect or resetForReconnect
+    // bumps the epoch while we're awaiting async operations, this initialize()
+    // is stale and should abort to avoid racing with the newer call.
+    const myEpoch = this.initEpoch;
 
     try {
       // Step 1: Send initialize request
-      const result = await this.transport.call("initialize", {
+      await this.transport.call("initialize", {
         clientInfo: {
           name: "thecompanion",
           title: "The Companion",
@@ -739,6 +973,13 @@ export class CodexAdapter {
           experimentalApi: true,
         },
       }) as Record<string, unknown>;
+
+      // Bail if a newer init cycle superseded us while we were awaiting
+      if (myEpoch !== this.initEpoch) {
+        console.warn(`[codex-adapter] Session ${this.sessionId}: init epoch ${myEpoch} superseded by ${this.initEpoch}, aborting stale init`);
+        this.initInProgress = false;
+        return;
+      }
 
       // Step 2: Send initialized notification
       await this.transport.notify("initialized", {});
@@ -754,6 +995,12 @@ export class CodexAdapter {
       let lastThreadError: unknown;
 
       for (let attempt = 0; attempt < CodexAdapter.INIT_THREAD_MAX_RETRIES; attempt++) {
+        // Bail out early if superseded by a newer init cycle
+        if (myEpoch !== this.initEpoch) {
+          console.warn(`[codex-adapter] Session ${this.sessionId}: init epoch ${myEpoch} superseded during thread start, aborting`);
+          this.initInProgress = false;
+          return;
+        }
         // Bail out early if the transport went away between retries
         if (!this.transport.isConnected()) {
           lastThreadError = new Error("Transport closed before thread start");
@@ -762,20 +1009,49 @@ export class CodexAdapter {
 
         try {
           if (this.options.threadId) {
-            const resumeResult = await this.transport.call("thread/resume", {
-              threadId: this.options.threadId,
-              model: this.options.model,
-              cwd: this.getExecutionCwd(),
-              approvalPolicy: this.mapApprovalPolicy(this.currentPermissionMode),
-              sandbox: this.options.sandbox || this.mapSandboxPolicy(this.currentPermissionMode),
-            }) as { thread: { id: string } };
-            this.threadId = resumeResult.thread.id;
+            try {
+              const resumeResult = await this.transport.call("thread/resume", {
+                threadId: this.options.threadId,
+                model: this.options.model,
+                cwd: this.getExecutionCwd(),
+                approvalPolicy: this.mapApprovalPolicy(this.currentPermissionMode),
+                sandbox: this.options.sandbox || this.mapSandboxPolicy(this.currentPermissionMode),
+              }) as { thread: { id: string } };
+              this.threadId = resumeResult.thread.id;
+            } catch (resumeErr) {
+              // If resume fails with a non-transient error (e.g. "no rollout found"),
+              // fall back to starting a fresh thread instead of failing entirely.
+              const isTransport = resumeErr instanceof Error && resumeErr.message === "Transport closed";
+              if (isTransport) throw resumeErr; // Let outer retry handle transient errors
+              const resumeErrMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+              console.warn(
+                `[codex-adapter] thread/resume failed for ${this.sessionId} (threadId=${this.options.threadId}), falling back to thread/start: ${resumeErrMsg}`,
+              );
+              const freshResult = await this.transport.call("thread/start", {
+                model: this.options.model,
+                cwd: this.getExecutionCwd(),
+                approvalPolicy: this.mapApprovalPolicy(this.currentPermissionMode),
+                sandbox: this.options.sandbox || this.mapSandboxPolicy(this.currentPermissionMode),
+                ...(this.options.systemPrompt ? { instructions: this.options.systemPrompt } : {}),
+              }) as { thread: { id: string } };
+              this.threadId = freshResult.thread.id;
+              // Update options.threadId so subsequent resetForReconnect calls
+              // attempt to resume this new thread, not the original stale one.
+              this.options.threadId = freshResult.thread.id;
+              // Notify the browser that context was lost — the conversation
+              // history is still visible in the UI but Codex has no memory of it.
+              this.emit({
+                type: "error",
+                message: `Session context could not be restored (${resumeErrMsg}). Started a fresh thread — Codex won't remember prior messages.`,
+              });
+            }
           } else {
             const threadResult = await this.transport.call("thread/start", {
               model: this.options.model,
               cwd: this.getExecutionCwd(),
               approvalPolicy: this.mapApprovalPolicy(this.currentPermissionMode),
               sandbox: this.options.sandbox || this.mapSandboxPolicy(this.currentPermissionMode),
+              ...(this.options.systemPrompt ? { instructions: this.options.systemPrompt } : {}),
             }) as { thread: { id: string } };
             this.threadId = threadResult.thread.id;
           }
@@ -798,6 +1074,11 @@ export class CodexAdapter {
       }
 
       this.initialized = true;
+      // Reset reconnect retry budget after successful initialization.
+      // This covers the case where WS drops during init but the re-init
+      // succeeds — without this, the counter would accumulate across
+      // reconnect cycles and eventually trigger cleanupAndDisconnect().
+      this.reconnectRetryCount = 0;
       console.log(`[codex-adapter] Session ${this.sessionId} initialized (threadId=${this.threadId})`);
 
       // Notify session metadata
@@ -843,18 +1124,26 @@ export class CodexAdapter {
 
       // Flush any messages that were queued during initialization, but only
       // if the transport is still connected (avoids immediate "Transport closed").
+      this.initInProgress = false;
       this.flushPendingOutgoing();
     } catch (err) {
+      // If a WS reconnection was detected mid-init, handleWsReconnected
+      // already kicked off a fresh initialize(). Don't reset initInProgress
+      // here — that would clobber the new initialize() call's flag.
+      if (err instanceof Error && err.message === "Transport reconnected") {
+        console.warn(`[codex-adapter] Session ${this.sessionId}: init interrupted by WS reconnection, re-init in progress`);
+        return;
+      }
+      this.initInProgress = false;
       const errorMsg = `Codex initialization failed: ${err}`;
       console.error(`[codex-adapter] ${errorMsg}`);
       this.initFailed = true;
       this.connected = false;
       // Discard any messages queued during the failed init attempt
+      if (this.overloadRetryTimer) { clearTimeout(this.overloadRetryTimer); this.overloadRetryTimer = null; }
       this.pendingOutgoing.length = 0;
       this.emit({ type: "error", message: errorMsg });
       this.initErrorCb?.(errorMsg);
-    } finally {
-      this.initInProgress = false;
     }
   }
 
@@ -905,12 +1194,69 @@ export class CodexAdapter {
       const result = await this.transport.call("turn/start", turnParams) as { turn: { id: string } };
 
       this.currentTurnId = result.turn.id;
+      this.reconnectRetryCount = 0; // Reset on success
+      this.overloadRetryCount = 0; // Reset overload budget on success
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      if (errMsg.startsWith("RPC timeout")) {
-        this.emit({ type: "error", message: "Codex is not responding. Try relaunching the session." });
+      if (errMsg === "Transport reconnected") {
+        // The WS proxy reconnected mid-call — this is transient.
+        // Retry up to MAX_RECONNECT_RETRIES times before giving up to
+        // avoid an unbounded loop when the WS keeps dropping.
+        this.reconnectRetryCount++;
+        if (this.reconnectRetryCount > CodexAdapter.MAX_RECONNECT_RETRIES) {
+          this.reconnectRetryCount = 0;
+          this.emit({ type: "error", message: "Connection lost after multiple reconnects. Relaunching session..." });
+          this.cleanupAndDisconnect();
+        } else {
+          this.emit({ type: "error", message: "Connection briefly interrupted. Retrying your message..." });
+          // Prepend (not push) so the original message preserves ordering if
+          // a new browser message arrived in the meantime. Guard against
+          // duplicate re-queuing: if a message with the same client_msg_id is
+          // already in the queue (from a prior reconnect cycle), skip the
+          // unshift to avoid sending the same message to Codex multiple times.
+          // Uses client_msg_id (stable unique ID per send) instead of content
+          // comparison to avoid silently dropping legitimate repeat messages.
+          const clientId = "client_msg_id" in msg ? msg.client_msg_id : undefined;
+          const alreadyQueued = clientId != null
+            && this.pendingOutgoing.some((m) => "client_msg_id" in m && m.client_msg_id === clientId);
+          if (!alreadyQueued) {
+            this.pendingOutgoing.unshift(msg);
+          }
+          this.flushPendingOutgoing();
+        }
+      } else if ((err as Record<string, unknown>)?.code === -32001) {
+        // Codex server overloaded (channel capacity 128 exceeded) — transient,
+        // retry after a short delay rather than relaunching the whole session.
+        this.overloadRetryCount++;
+        if (this.overloadRetryCount > CodexAdapter.MAX_RECONNECT_RETRIES) {
+          this.overloadRetryCount = 0;
+          this.emit({ type: "error", message: "Codex server overloaded after multiple retries. Relaunching session..." });
+          this.cleanupAndDisconnect();
+        } else {
+          this.emit({ type: "error", message: "Codex server busy. Retrying your message..." });
+          // Cancel any previous overload retry timer — we only need one active
+          // retry at a time. Without this, consecutive -32001 errors would
+          // schedule multiple timers and the counter-snapshot guard would
+          // silently drop the earlier messages (Cubic review).
+          if (this.overloadRetryTimer) clearTimeout(this.overloadRetryTimer);
+          // Track the pending message so handleWsReconnected can rescue it
+          // to pendingOutgoing if the timer is cancelled by a reconnect.
+          this.overloadRetryMsg = msg;
+          this.overloadRetryTimer = setTimeout(() => {
+            this.overloadRetryTimer = null;
+            this.overloadRetryMsg = null;
+            // If a WS reconnect cleared everything, bail out.
+            if (!this.initialized) return;
+            this.pendingOutgoing.unshift(msg);
+            this.flushPendingOutgoing();
+          }, 1000 * this.overloadRetryCount); // Linear backoff: 1s, 2s, 3s...
+        }
+      } else if (errMsg.startsWith("RPC timeout")) {
+        this.emit({ type: "error", message: "Codex is not responding. Relaunching session..." });
+        this.cleanupAndDisconnect();
       } else if (errMsg === "Transport closed") {
-        this.emit({ type: "error", message: "Connection to Codex lost. Try relaunching the session." });
+        this.emit({ type: "error", message: "Connection to Codex lost. Relaunching session..." });
+        this.cleanupAndDisconnect();
       } else {
         this.emit({ type: "error", message: `Failed to start turn: ${err}` });
       }
@@ -926,83 +1272,104 @@ export class CodexAdapter {
       return;
     }
 
-    // Dynamic tool calls (item/tool/call) require a DynamicToolCallResponse payload.
-    const pendingDynamic = this.pendingDynamicToolCalls.get(msg.request_id);
-    if (pendingDynamic) {
-      this.pendingDynamicToolCalls.delete(msg.request_id);
-      this.pendingApprovals.delete(msg.request_id);
-      clearTimeout(pendingDynamic.timeout);
+    // Wrap all transport.respond() calls in try/catch — the transport may have
+    // closed between when the user clicked allow/deny and when we send the
+    // response.  Without this, "Transport closed" rejects as unhandled promises
+    // and can leave the session in an inconsistent state.
+    try {
+      // Dynamic tool calls (item/tool/call) require a DynamicToolCallResponse payload.
+      const pendingDynamic = this.pendingDynamicToolCalls.get(msg.request_id);
+      if (pendingDynamic) {
+        this.pendingDynamicToolCalls.delete(msg.request_id);
+        this.pendingApprovals.delete(msg.request_id);
+        clearTimeout(pendingDynamic.timeout);
 
-      const result = this.buildDynamicToolCallResponse(msg, pendingDynamic.toolName);
-      await this.transport.respond(jsonRpcId, result);
-      return;
-    }
-
-    // ExitPlanMode requests need DynamicToolCallResponse + collaboration mode update
-    if (this.pendingExitPlanModeRequests.has(msg.request_id)) {
-      this.pendingExitPlanModeRequests.delete(msg.request_id);
-      this.pendingApprovals.delete(msg.request_id);
-
-      if (msg.behavior === "allow") {
-        // Exit plan mode: switch collaboration mode back to default
-        this.currentCollaborationModeKind = "default";
-        this.currentPermissionMode = this.lastNonPlanPermissionMode;
-        this.emit({
-          type: "session_update",
-          session: { permissionMode: this.currentPermissionMode },
-        });
-
-        await this.transport.respond(jsonRpcId, {
-          contentItems: [{ type: "inputText", text: "Plan approved. Exiting plan mode." }],
-          success: true,
-        });
-      } else {
-        await this.transport.respond(jsonRpcId, {
-          contentItems: [{ type: "inputText", text: "Plan denied by user." }],
-          success: false,
-        });
-      }
-      return;
-    }
-
-    this.pendingApprovals.delete(msg.request_id);
-
-    // User input requests (item/tool/requestUserInput) need ToolRequestUserInputResponse
-    const questionIds = this.pendingUserInputQuestionIds.get(msg.request_id);
-    if (questionIds) {
-      this.pendingUserInputQuestionIds.delete(msg.request_id);
-
-      if (msg.behavior === "deny") {
-        // Respond with empty answers on deny
-        await this.transport.respond(jsonRpcId, { answers: {} });
+        const result = this.buildDynamicToolCallResponse(msg, pendingDynamic.toolName);
+        await this.transport.respond(jsonRpcId, result);
         return;
       }
 
-      // Convert browser answers (keyed by index "0","1",...) to Codex format (keyed by question ID)
-      const browserAnswers = msg.updated_input?.answers as Record<string, string> || {};
-      const codexAnswers: Record<string, { answers: string[] }> = {};
-      for (let i = 0; i < questionIds.length; i++) {
-        const answer = browserAnswers[String(i)];
-        if (answer !== undefined) {
-          codexAnswers[questionIds[i]] = { answers: [answer] };
+      // ExitPlanMode requests need DynamicToolCallResponse + collaboration mode update
+      if (this.pendingExitPlanModeRequests.has(msg.request_id)) {
+        this.pendingExitPlanModeRequests.delete(msg.request_id);
+        this.pendingApprovals.delete(msg.request_id);
+
+        if (msg.behavior === "allow") {
+          // Send the response first — only mutate local state if the transport
+          // accepted it. Otherwise the browser would think plan mode is off
+          // while Codex never received the approval (see Greptile review).
+          await this.transport.respond(jsonRpcId, {
+            contentItems: [{ type: "inputText", text: "Plan approved. Exiting plan mode." }],
+            success: true,
+          });
+
+          // Exit plan mode: switch collaboration mode back to default
+          this.currentCollaborationModeKind = "default";
+          this.currentPermissionMode = this.lastNonPlanPermissionMode;
+          this.emit({
+            type: "session_update",
+            session: { permissionMode: this.currentPermissionMode },
+          });
+        } else {
+          await this.transport.respond(jsonRpcId, {
+            contentItems: [{ type: "inputText", text: "Plan denied by user." }],
+            success: false,
+          });
         }
+        return;
       }
 
-      await this.transport.respond(jsonRpcId, { answers: codexAnswers });
-      return;
-    }
+      this.pendingApprovals.delete(msg.request_id);
 
-    // Review decisions (applyPatchApproval / execCommandApproval) need ReviewDecision
-    if (this.pendingReviewDecisions.has(msg.request_id)) {
-      this.pendingReviewDecisions.delete(msg.request_id);
-      const decision = msg.behavior === "allow" ? "approved" : "denied";
+      // User input requests (item/tool/requestUserInput) need ToolRequestUserInputResponse
+      const questionIds = this.pendingUserInputQuestionIds.get(msg.request_id);
+      if (questionIds) {
+        this.pendingUserInputQuestionIds.delete(msg.request_id);
+
+        if (msg.behavior === "deny") {
+          // Respond with empty answers on deny
+          await this.transport.respond(jsonRpcId, { answers: {} });
+          return;
+        }
+
+        // Convert browser answers (keyed by index "0","1",...) to Codex format (keyed by question ID)
+        const browserAnswers = msg.updated_input?.answers as Record<string, string> || {};
+        const codexAnswers: Record<string, { answers: string[] }> = {};
+        for (let i = 0; i < questionIds.length; i++) {
+          const answer = browserAnswers[String(i)];
+          if (answer !== undefined) {
+            codexAnswers[questionIds[i]] = { answers: [answer] };
+          }
+        }
+
+        await this.transport.respond(jsonRpcId, { answers: codexAnswers });
+        return;
+      }
+
+      // Review decisions (applyPatchApproval / execCommandApproval) need ReviewDecision
+      if (this.pendingReviewDecisions.has(msg.request_id)) {
+        this.pendingReviewDecisions.delete(msg.request_id);
+        const decision = msg.behavior === "allow" ? "approved" : "denied";
+        await this.transport.respond(jsonRpcId, { decision });
+        return;
+      }
+
+      // Standard item/*/requestApproval — uses accept/decline
+      const decision = msg.behavior === "allow" ? "accept" : "decline";
       await this.transport.respond(jsonRpcId, { decision });
-      return;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg === "Transport closed" || errMsg === "Transport reconnected") {
+        console.warn(
+          `[codex-adapter] Session ${this.sessionId}: permission response for ${msg.request_id} dropped (${errMsg})`,
+        );
+        // Transport is gone — the permission is moot. If the transport
+        // reconnected, handleWsReconnected() already cancelled pending
+        // approvals. If it closed, cleanupAndDisconnect() will fire.
+      } else {
+        console.error(`[codex-adapter] Session ${this.sessionId}: unexpected error sending permission response:`, err);
+      }
     }
-
-    // Standard item/*/requestApproval — uses accept/decline
-    const decision = msg.behavior === "allow" ? "accept" : "decline";
-    await this.transport.respond(jsonRpcId, { decision });
   }
 
   private async handleOutgoingInterrupt(): Promise<void> {
@@ -1016,7 +1383,8 @@ export class CodexAdapter {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.startsWith("RPC timeout")) {
-        this.emit({ type: "error", message: "Codex is not responding to interrupt. Try relaunching the session." });
+        this.emit({ type: "error", message: "Codex is not responding to interrupt. Relaunching session..." });
+        this.cleanupAndDisconnect();
       } else {
         console.warn("[codex-adapter] Interrupt failed:", err);
       }
@@ -1076,7 +1444,13 @@ export class CodexAdapter {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg === "Transport closed") {
-        this.emit({ type: "error", message: "Connection to Codex lost. Cannot fetch MCP status." });
+        // Transient disconnect (e.g. page refresh, WS proxy reconnection).
+        // Trigger cleanup so the bridge sees the adapter as disconnected
+        // immediately and can relaunch — same race fix as sendBrowserMessage.
+        // No re-queue needed: the browser will re-send mcp_get_status when
+        // the new adapter emits cli_connected after relaunch.
+        console.log(`[codex-adapter] Session ${this.sessionId}: mcp_get_status failed (transport closed), triggering cleanup`);
+        this.cleanupAndDisconnect();
       } else {
         this.emit({ type: "error", message: `Failed to get MCP status: ${err}` });
       }
@@ -1173,10 +1547,16 @@ export class CodexAdapter {
         // shows a live elapsed-time indicator while the command runs.
         this.emitCommandProgress(params);
         break;
+      case "item/commandExecution/terminalInteraction":
+        // Interactive terminal IO event (stdin prompt/tty exchange). Treat it
+        // as command progress so the UI keeps the command block active.
+        this.emitCommandProgress(params);
+        break;
       case "item/fileChange/outputDelta":
         // Streaming file change output. Same as above.
         break;
       case "item/reasoning/textDelta":
+      case "item/reasoning/delta":
       case "item/reasoning/summaryTextDelta":
       case "item/reasoning/summaryPartAdded":
         this.handleReasoningDelta(params);
@@ -1184,7 +1564,6 @@ export class CodexAdapter {
       case "item/mcpToolCall/progress": {
         // MCP tool call progress — map to tool_progress
         const itemId = params.itemId as string | undefined;
-        const threadId = params.threadId as string | undefined;
         if (itemId) {
           this.emit({
             type: "tool_progress",
@@ -1222,6 +1601,9 @@ export class CodexAdapter {
       case "thread/started":
         // Thread started after init — nothing to emit.
         break;
+      case "thread/status/changed":
+        this.handleThreadStatusChanged(params);
+        break;
       case "thread/tokenUsage/updated":
         this.handleTokenUsageUpdated(params);
         break;
@@ -1231,6 +1613,36 @@ export class CodexAdapter {
         break;
       case "account/rateLimits/updated":
         this.updateRateLimits(params);
+        break;
+      // Legacy codex/event/* notifications forwarded by newer Codex runtimes.
+      // token_count is still useful for metrics, but the streaming deltas are
+      // often duplicated by canonical item/* deltas in the same session.
+      // Ignore duplicated legacy streams to avoid double-emitting text.
+      case "codex/event/token_count":
+        this.handleLegacyTokenCount(params);
+        break;
+      case "codex/event/agent_message_delta":
+      case "codex/event/agent_message_content_delta":
+      case "codex/event/reasoning_content_delta":
+      case "codex/event/agent_message":
+      case "codex/event/item_started":
+      case "codex/event/item_completed":
+      case "codex/event/exec_command_begin":
+      case "codex/event/exec_command_output_delta":
+      case "codex/event/exec_command_end":
+      case "codex/event/turn_diff":
+      case "codex/event/terminal_interaction":
+      case "codex/event/patch_apply_begin":
+      case "codex/event/patch_apply_end":
+      case "codex/event/user_message":
+      case "codex/event/task_started":
+      case "codex/event/task_complete":
+      case "codex/event/mcp_startup_complete":
+      case "codex/event/context_compacted":
+      case "codex/event/agent_reasoning":
+      case "codex/event/agent_reasoning_delta":
+      case "codex/event/agent_reasoning_section_break":
+        // Duplicates of canonical v2 events — silently ignore.
         break;
       case "codex/event/stream_error": {
         const msg = params.msg as { message?: string } | undefined;
@@ -1247,15 +1659,59 @@ export class CodexAdapter {
         }
         break;
       }
-      default:
-        // Unknown notification, log for debugging
-        if (!method.startsWith("account/") && !method.startsWith("codex/event/")) {
-          console.log(`[codex-adapter] Unhandled notification: ${method}`);
+      // Bare "error" notification — Codex sends this for transient stream
+      // disconnections and retries (e.g. "Reconnecting... 2/5").
+      case "error": {
+        const errObj = params.error as { message?: string; additionalDetails?: string } | undefined;
+        const willRetry = params.willRetry as boolean | undefined;
+        const message = errObj?.message || errObj?.additionalDetails || "Unknown Codex error";
+        if (willRetry) {
+          console.log(`[codex-adapter] Codex transient error (will retry): ${message}`);
+        } else {
+          console.error(`[codex-adapter] Codex error: ${message}`);
+          this.emit({ type: "error", message });
         }
+        break;
+      }
+      // MCP server startup progress — Codex v2 reports per-server status as
+      // they initialise. Trigger a full mcp_get_status refresh so the browser
+      // sees up-to-date server states.
+      case "mcpServer/startupStatus/updated":
+        this.handleOutgoingMcpGetStatus();
+        break;
+      // Context compaction — similar to codex/event/context_compacted.
+      case "thread/compacted":
+        break;
+      // Informational: config or deprecation warnings from Codex runtime.
+      case "configWarning":
+      case "deprecationNotice":
+      case "codex/event/deprecation_notice":
+        break;
+      // Legacy event variants already covered by canonical item/* handlers.
+      case "codex/event/mcp_startup_update":
+      case "codex/event/turn_aborted":
+      case "codex/event/view_image_tool_call":
+      case "codex/event/web_search_begin":
+      case "codex/event/web_search_end":
+        break;
+      case "companion/wsReconnected":
+        this.handleWsReconnected();
+        break;
+      default:
+        this.reportProtocolDrift("notification", method, { payload: params });
         break;
     }
     } catch (err) {
-      console.error(`[codex-adapter] Error handling notification ${method}:`, err);
+      log.error("codex-adapter", `Error handling notification ${method}`, {
+        sessionId: this.sessionId,
+        method,
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      });
+      this.browserMessageCb?.({
+        type: "error",
+        message: `Codex notification handler crashed on "${method}". Companion may need an update.`,
+      });
     }
   }
 
@@ -1294,13 +1750,21 @@ export class CodexAdapter {
           this.transport.respond(id, { error: "not supported" });
           break;
         default:
-          console.log(`[codex-adapter] Unhandled request: ${method}`);
-          // Auto-accept unknown requests
-          this.transport.respond(id, { decision: "accept" });
+          this.reportProtocolDrift("request", method, { payload: params, blockedForSafety: true });
+          this.transport.respond(id, { error: `Unsupported Codex request method: ${method}` });
           break;
       }
     } catch (err) {
-      console.error(`[codex-adapter] Error handling request ${method}:`, err);
+      log.error("codex-adapter", `Error handling request ${method}`, {
+        sessionId: this.sessionId,
+        method,
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      });
+      this.browserMessageCb?.({
+        type: "error",
+        message: `Codex request handler crashed on "${method}". Companion may need an update.`,
+      });
     }
   }
 
@@ -1671,15 +2135,16 @@ export class CodexAdapter {
 
       case "reasoning": {
         const r = item as CodexReasoningItem;
-        this.reasoningTextByItemId.set(item.id, r.summary || r.content || "");
+        const initialThinking = this.coerceReasoningText(r.summary) || this.coerceReasoningText(r.content);
+        this.reasoningTextByItemId.set(item.id, initialThinking);
         // Emit as thinking content block
-        if (r.summary || r.content) {
+        if (initialThinking) {
           this.emit({
             type: "stream_event",
             event: {
               type: "content_block_start",
               index: 0,
-              content_block: { type: "thinking", thinking: r.summary || r.content || "" },
+              content_block: { type: "thinking", thinking: initialThinking },
             },
             parent_tool_use_id: null,
           });
@@ -1761,6 +2226,19 @@ export class CodexAdapter {
     const toolUseId = `codex-plan-${turnId}-${nextCount}`;
 
     this.emitToolUseTracked(toolUseId, "TodoWrite", { todos });
+  }
+
+  private handleThreadStatusChanged(params: Record<string, unknown>): void {
+    const raw = params.status;
+    const statusRaw = typeof raw === "string"
+      ? raw
+      : (raw && typeof raw === "object" && typeof (raw as Record<string, unknown>).type === "string")
+        ? ((raw as Record<string, unknown>).type as string)
+        : null;
+    const status = statusRaw === "running" || statusRaw === "compacting"
+      ? statusRaw
+      : null;
+    this.emit({ type: "status_change", status });
   }
 
   private extractPlanTodos(params: Record<string, unknown>, turnId: string): PlanTodo[] {
@@ -1870,6 +2348,21 @@ export class CodexAdapter {
     return null;
   }
 
+  private coerceReasoningText(value: unknown): string {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) {
+      return value
+        .map((entry) => this.coerceReasoningText(entry))
+        .filter(Boolean)
+        .join("\n");
+    }
+    if (value && typeof value === "object") {
+      const obj = value as Record<string, unknown>;
+      return this.firstString(obj, ["text", "content", "summary"]) || "";
+    }
+    return "";
+  }
+
   private normalizePlanStatus(statusRaw: string | null): "pending" | "in_progress" | "completed" {
     const status = (statusRaw || "").toLowerCase();
     if (
@@ -1913,7 +2406,7 @@ export class CodexAdapter {
     });
   }
 
-  private handleItemUpdated(params: Record<string, unknown>): void {
+  private handleItemUpdated(_params: Record<string, unknown>): void {
     // item/updated is a general update — currently we handle streaming via the specific delta events
     // Could handle status updates for command_execution / file_change items here
   }
@@ -2041,12 +2534,12 @@ export class CodexAdapter {
 
       case "reasoning": {
         const r = item as CodexReasoningItem;
-        const thinkingText = (
+        const raw =
           this.reasoningTextByItemId.get(item.id)
-          || r.summary
-          || r.content
-          || ""
-        ).trim();
+          || this.coerceReasoningText(r.summary)
+          || this.coerceReasoningText(r.content)
+          || "";
+        const thinkingText = (typeof raw === "string" ? raw : String(raw ?? "")).trim();
 
         if (thinkingText) {
           this.emit({
@@ -2218,6 +2711,36 @@ export class CodexAdapter {
     }
   }
 
+  // ── Legacy codex/event/* helpers ──────────────────────────────────────
+
+  private handleLegacyTokenCount(params: Record<string, unknown>): void {
+    const msg = this.asRecord(params.msg);
+    const info = this.asRecord(msg?.info);
+    if (!info) return;
+
+    const toUsage = (raw: unknown): Record<string, number> => {
+      const usage = this.asRecord(raw);
+      if (!usage) {
+        return { totalTokens: 0, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+      }
+      return {
+        totalTokens: Number(usage.total_tokens || 0),
+        inputTokens: Number(usage.input_tokens || 0),
+        cachedInputTokens: Number(usage.cached_input_tokens || 0),
+        outputTokens: Number(usage.output_tokens || 0),
+        reasoningOutputTokens: Number(usage.reasoning_output_tokens || 0),
+      };
+    };
+
+    this.handleTokenUsageUpdated({
+      tokenUsage: {
+        total: toUsage(info.total_token_usage),
+        last: toUsage(info.last_token_usage),
+        modelContextWindow: Number(info.model_context_window || 0),
+      },
+    });
+  }
+
   // ── Command progress tracking ─────────────────────────────────────────
 
   private emitCommandProgress(params: Record<string, unknown>): void {
@@ -2237,6 +2760,27 @@ export class CodexAdapter {
 
   private emit(msg: BrowserIncomingMessage): void {
     this.browserMessageCb?.(msg);
+  }
+
+  private reportProtocolDrift(
+    messageKind: "notification" | "request",
+    messageName: string,
+    options?: { payload?: Record<string, unknown>; blockedForSafety?: boolean },
+  ): void {
+    reportProtocolDrift(
+      this.protocolDriftSeen,
+      {
+        backend: "codex",
+        sessionId: this.sessionId,
+        direction: "incoming",
+        messageKind,
+        messageName,
+        keys: options?.payload ? Object.keys(options.payload) : undefined,
+        rawPreview: options?.payload ? JSON.stringify(options.payload) : undefined,
+        blockedForSafety: options?.blockedForSafety,
+      },
+      (message) => this.emit({ type: "error", message }),
+    );
   }
 
   private getParentToolUseIdForThread(threadId?: string): string | null {

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Mock settings-manager before importing the module under test
 vi.mock("./settings-manager.js", () => ({
-  DEFAULT_ANTHROPIC_MODEL: "claude-sonnet-4.6",
+  DEFAULT_ANTHROPIC_MODEL: "claude-sonnet-4-6",
   getSettings: vi.fn(),
 }));
 
@@ -18,6 +18,8 @@ import type { CodexAdapter } from "./codex-adapter.js";
 import type { CodexAttachDeps } from "./ws-bridge-codex.js";
 import * as settingsManager from "./settings-manager.js";
 import * as aiValidator from "./ai-validator.js";
+import { companionBus } from "./event-bus.js";
+import { SessionStateMachine } from "./session-state-machine.js";
 
 // ── Mock Factories ──────────────────────────────────────────────────────────
 
@@ -25,8 +27,7 @@ function createMockSession(overrides = {}): Session {
   return {
     id: "test-session",
     backendType: "codex",
-    cliSocket: null,
-    codexAdapter: null,
+    backendAdapter: null,
     browserSockets: new Set(),
     state: {
       session_id: "test-session",
@@ -54,7 +55,6 @@ function createMockSession(overrides = {}): Session {
       total_lines_removed: 0,
     } as SessionState,
     pendingPermissions: new Map(),
-    pendingControlRequests: new Map(),
     messageHistory: [] as BrowserIncomingMessage[],
     pendingMessages: [] as string[],
     nextEventSeq: 0,
@@ -62,6 +62,8 @@ function createMockSession(overrides = {}): Session {
     lastAckSeq: 0,
     processedClientMessageIds: [],
     processedClientMessageIdSet: new Set(),
+    lastCliActivityTs: Date.now(),
+    stateMachine: new SessionStateMachine("test-session"),
     ...overrides,
   } as Session;
 }
@@ -89,12 +91,7 @@ function createMockDeps(overrides = {}): CodexAttachDeps {
     persistSession: vi.fn(),
     refreshGitInfo: vi.fn(),
     broadcastToBrowsers: vi.fn(),
-    onCLISessionId: vi.fn(),
-    onFirstTurnCompleted: vi.fn(),
     autoNamingAttempted: new Set<string>(),
-    assistantMessageListeners: new Map(),
-    resultListeners: new Map(),
-    onCLIRelaunchNeeded: vi.fn(),
     ...overrides,
   };
 }
@@ -108,6 +105,7 @@ describe("attachCodexAdapterHandlers", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    companionBus.clear();
     session = createMockSession();
     adapter = createMockAdapter();
     deps = createMockDeps();
@@ -115,7 +113,7 @@ describe("attachCodexAdapterHandlers", () => {
     // Default: AI validation disabled — existing tests should not be affected
     vi.mocked(settingsManager.getSettings).mockReturnValue({
       anthropicApiKey: "",
-      anthropicModel: "claude-sonnet-4.6",
+      anthropicModel: "claude-sonnet-4-6",
       linearApiKey: "",
       linearAutoTransition: false,
       linearAutoTransitionStateId: "",
@@ -123,12 +121,20 @@ describe("attachCodexAdapterHandlers", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
-      editorTabEnabled: false,
+      linearOAuthClientId: "",
+      linearOAuthClientSecret: "",
+      linearOAuthWebhookSecret: "",
+      linearOAuthAccessToken: "",
+      linearOAuthRefreshToken: "",
+      claudeCodeOAuthToken: "",
+      openaiApiKey: "",
+      onboardingCompleted: false,
       aiValidationEnabled: false,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       publicUrl: "",
       updateChannel: "stable",
+      dockerAutoUpdate: false,
       updatedAt: 0,
     });
   });
@@ -189,7 +195,112 @@ describe("attachCodexAdapterHandlers", () => {
     expect(deps.persistSession).toHaveBeenCalledWith(session);
   });
 
+  it("session_init preserves pre-populated commands/skills when adapter sends empty arrays", () => {
+    // When prePopulateCommands has set commands/skills on the session before
+    // the Codex adapter sends session_init with empty arrays, the pre-populated
+    // data should be preserved (Codex does not provide its own commands/skills).
+    session.state.slash_commands = ["pre-cmd-1", "pre-cmd-2"];
+    session.state.skills = ["pre-skill"];
+
+    attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
+
+    adapter._trigger("onBrowserMessage", {
+      type: "session_init",
+      session: {
+        session_id: "test-session",
+        backend_type: "codex",
+        model: "o3-pro",
+        cwd: "/home/user/project",
+        tools: [],
+        permissionMode: "default",
+        claude_code_version: "",
+        mcp_servers: [],
+        agents: [],
+        slash_commands: [],
+        skills: [],
+        total_cost_usd: 0,
+        num_turns: 0,
+        context_used_percent: 0,
+        is_compacting: false,
+        git_branch: "",
+        is_worktree: false,
+        is_containerized: false,
+        repo_root: "",
+        git_ahead: 0,
+        git_behind: 0,
+        total_lines_added: 0,
+        total_lines_removed: 0,
+      },
+    });
+
+    // Pre-populated data should survive the Codex session_init merge
+    expect(session.state.slash_commands).toEqual(["pre-cmd-1", "pre-cmd-2"]);
+    expect(session.state.skills).toEqual(["pre-skill"]);
+    // Other fields should still be updated
+    expect(session.state.model).toBe("o3-pro");
+    expect(session.state.cwd).toBe("/home/user/project");
+  });
+
+  it("session_init allows overwriting commands/skills when adapter sends non-empty arrays", () => {
+    // If a future Codex version sends actual commands/skills, they should
+    // overwrite the pre-populated data.
+    session.state.slash_commands = ["pre-cmd"];
+    session.state.skills = ["pre-skill"];
+
+    attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
+
+    adapter._trigger("onBrowserMessage", {
+      type: "session_init",
+      session: {
+        session_id: "test-session",
+        backend_type: "codex",
+        model: "o3-pro",
+        cwd: "/home/user/project",
+        tools: [],
+        permissionMode: "default",
+        claude_code_version: "",
+        mcp_servers: [],
+        agents: [],
+        slash_commands: ["codex-cmd"],
+        skills: ["codex-skill"],
+        total_cost_usd: 0,
+        num_turns: 0,
+        context_used_percent: 0,
+        is_compacting: false,
+        git_branch: "",
+        is_worktree: false,
+        is_containerized: false,
+        repo_root: "",
+        git_ahead: 0,
+        git_behind: 0,
+        total_lines_added: 0,
+        total_lines_removed: 0,
+      },
+    });
+
+    // Non-empty arrays from the adapter should overwrite pre-populated data
+    expect(session.state.slash_commands).toEqual(["codex-cmd"]);
+    expect(session.state.skills).toEqual(["codex-skill"]);
+  });
+
   // ── session_update ──────────────────────────────────────────────────────
+
+  it("session_update preserves pre-populated commands/skills when update has empty arrays", () => {
+    // Same preservation logic applies to session_update messages.
+    session.state.slash_commands = ["pre-cmd"];
+    session.state.skills = ["pre-skill"];
+
+    attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
+
+    adapter._trigger("onBrowserMessage", {
+      type: "session_update",
+      session: { model: "gpt-4.1", slash_commands: [], skills: [] },
+    });
+
+    expect(session.state.slash_commands).toEqual(["pre-cmd"]);
+    expect(session.state.skills).toEqual(["pre-skill"]);
+    expect(session.state.model).toBe("gpt-4.1");
+  });
 
   it("session_update merges partial state and sets backend_type to codex", () => {
     // session_update should spread the partial session fields into state,
@@ -353,6 +464,35 @@ describe("attachCodexAdapterHandlers", () => {
     expect(deps.persistSession).toHaveBeenCalled();
   });
 
+  it("permission_cancelled removes entry from pendingPermissions", () => {
+    // When the adapter emits permission_cancelled (e.g. after a WS reconnect),
+    // the bridge should remove the corresponding entry from pendingPermissions
+    // so the browser doesn't show a stale approval dialog.
+    attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
+
+    // Pre-populate a pending permission
+    session.pendingPermissions.set("perm-stale", {
+      request_id: "perm-stale",
+      tool_name: "Bash",
+      input: { command: "rm -rf /" },
+      description: "Execute: rm -rf /",
+      tool_use_id: "tool-stale",
+      timestamp: Date.now(),
+    });
+
+    adapter._trigger("onBrowserMessage", {
+      type: "permission_cancelled",
+      request_id: "perm-stale",
+    });
+
+    expect(session.pendingPermissions.has("perm-stale")).toBe(false);
+    expect(deps.persistSession).toHaveBeenCalled();
+    expect(deps.broadcastToBrowsers).toHaveBeenCalledWith(
+      session,
+      expect.objectContaining({ type: "permission_cancelled", request_id: "perm-stale" }),
+    );
+  });
+
   // ── broadcast to browsers ───────────────────────────────────────────────
 
   it("all messages are broadcast to browsers", () => {
@@ -443,9 +583,12 @@ describe("attachCodexAdapterHandlers", () => {
 
   // ── auto-naming via onFirstTurnCompleted ────────────────────────────────
 
-  it("result triggers onFirstTurnCompleted for auto-naming on first successful result", () => {
+  it("result triggers session:first-turn-completed event for auto-naming on first successful result", () => {
     // When a non-error result arrives and auto-naming hasn't been attempted yet,
-    // the handler should call onFirstTurnCompleted with the first user_message content.
+    // the handler should emit session:first-turn-completed with the first user_message content.
+    const onFirstTurnCompleted = vi.fn();
+    companionBus.on("session:first-turn-completed", onFirstTurnCompleted);
+
     session.messageHistory.push({
       type: "user_message",
       content: "What is the meaning of life?",
@@ -471,18 +614,21 @@ describe("attachCodexAdapterHandlers", () => {
       },
     });
 
-    expect(deps.onFirstTurnCompleted).toHaveBeenCalledOnce();
-    expect(deps.onFirstTurnCompleted).toHaveBeenCalledWith(
-      "test-session",
-      "What is the meaning of life?",
-    );
+    expect(onFirstTurnCompleted).toHaveBeenCalledOnce();
+    expect(onFirstTurnCompleted).toHaveBeenCalledWith({
+      sessionId: "test-session",
+      firstUserMessage: "What is the meaning of life?",
+    });
     // The session ID should be recorded in autoNamingAttempted
     expect(deps.autoNamingAttempted.has("test-session")).toBe(true);
   });
 
-  it("result does NOT trigger onFirstTurnCompleted a second time (only once per session)", () => {
+  it("result does NOT trigger session:first-turn-completed a second time (only once per session)", () => {
     // Auto-naming should only fire once per session. Subsequent results should not
-    // re-trigger onFirstTurnCompleted.
+    // re-trigger the event.
+    const onFirstTurnCompleted = vi.fn();
+    companionBus.on("session:first-turn-completed", onFirstTurnCompleted);
+
     session.messageHistory.push({
       type: "user_message",
       content: "First message",
@@ -512,11 +658,14 @@ describe("attachCodexAdapterHandlers", () => {
     adapter._trigger("onBrowserMessage", resultMsg);
 
     // Should only be called once despite two result messages
-    expect(deps.onFirstTurnCompleted).toHaveBeenCalledOnce();
+    expect(onFirstTurnCompleted).toHaveBeenCalledOnce();
   });
 
-  it("result does NOT trigger onFirstTurnCompleted when result is an error", () => {
+  it("result does NOT trigger session:first-turn-completed when result is an error", () => {
     // Error results should not trigger auto-naming.
+    const onFirstTurnCompleted = vi.fn();
+    companionBus.on("session:first-turn-completed", onFirstTurnCompleted);
+
     session.messageHistory.push({
       type: "user_message",
       content: "Some message",
@@ -542,12 +691,15 @@ describe("attachCodexAdapterHandlers", () => {
       },
     });
 
-    expect(deps.onFirstTurnCompleted).not.toHaveBeenCalled();
+    expect(onFirstTurnCompleted).not.toHaveBeenCalled();
   });
 
-  it("result does NOT trigger onFirstTurnCompleted when no user_message exists", () => {
-    // If there's no user_message in the history, onFirstTurnCompleted should not be called
+  it("result does NOT trigger session:first-turn-completed when no user_message exists", () => {
+    // If there's no user_message in the history, the event should not be emitted
     // even on a successful result.
+    const onFirstTurnCompleted = vi.fn();
+    companionBus.on("session:first-turn-completed", onFirstTurnCompleted);
+
     attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
     adapter._trigger("onBrowserMessage", {
@@ -568,20 +720,19 @@ describe("attachCodexAdapterHandlers", () => {
       },
     });
 
-    expect(deps.onFirstTurnCompleted).not.toHaveBeenCalled();
+    expect(onFirstTurnCompleted).not.toHaveBeenCalled();
     // But the session should still be marked as naming-attempted
     expect(deps.autoNamingAttempted.has("test-session")).toBe(true);
   });
 
-  it("result does NOT trigger onFirstTurnCompleted when deps.onFirstTurnCompleted is null", () => {
-    // When onFirstTurnCompleted is null (not provided), the auto-naming block
-    // should be skipped entirely.
+  it("result emits session:first-turn-completed safely even with no bus subscribers", () => {
+    // When no subscriber is listening on the bus, the event should still be
+    // emitted without errors and autoNamingAttempted should be updated.
     session.messageHistory.push({
       type: "user_message",
       content: "Some message",
     } as any);
 
-    deps = createMockDeps({ onFirstTurnCompleted: null });
     attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
     adapter._trigger("onBrowserMessage", {
@@ -602,8 +753,8 @@ describe("attachCodexAdapterHandlers", () => {
       },
     });
 
-    // autoNamingAttempted should NOT be touched when the callback is null
-    expect(deps.autoNamingAttempted.has("test-session")).toBe(false);
+    // autoNamingAttempted should be set — the bus event fires even without subscribers
+    expect(deps.autoNamingAttempted.has("test-session")).toBe(true);
   });
 
   // ── onSessionMeta ───────────────────────────────────────────────────────
@@ -629,9 +780,12 @@ describe("attachCodexAdapterHandlers", () => {
     expect(deps.persistSession).toHaveBeenCalledWith(session);
   });
 
-  it("onSessionMeta calls onCLISessionId when cliSessionId is present", () => {
-    // When the meta includes a cliSessionId, the onCLISessionId dep should be called
+  it("onSessionMeta emits session:cli-id-received when cliSessionId is present", () => {
+    // When the meta includes a cliSessionId, the bus event should be emitted
     // to track the mapping from our session ID to the Codex thread ID.
+    const onCLISessionId = vi.fn();
+    companionBus.on("session:cli-id-received", onCLISessionId);
+
     attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
     adapter._trigger("onSessionMeta", {
@@ -639,21 +793,23 @@ describe("attachCodexAdapterHandlers", () => {
       model: "gpt-4.1",
     });
 
-    expect(deps.onCLISessionId).toHaveBeenCalledWith("test-session", "codex-thread-456");
+    expect(onCLISessionId).toHaveBeenCalledWith({ sessionId: "test-session", cliSessionId: "codex-thread-456" });
   });
 
-  it("onSessionMeta does not call onCLISessionId when cliSessionId is absent", () => {
-    // If no cliSessionId in the meta, onCLISessionId should not be called.
+  it("onSessionMeta does not emit session:cli-id-received when cliSessionId is absent", () => {
+    // If no cliSessionId in the meta, the bus event should not be emitted.
+    const onCLISessionId = vi.fn();
+    companionBus.on("session:cli-id-received", onCLISessionId);
+
     attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
     adapter._trigger("onSessionMeta", { model: "gpt-4.1" });
 
-    expect(deps.onCLISessionId).not.toHaveBeenCalled();
+    expect(onCLISessionId).not.toHaveBeenCalled();
   });
 
-  it("onSessionMeta does not call onCLISessionId when dep is null", () => {
-    // When onCLISessionId is null, it should be safely skipped.
-    deps = createMockDeps({ onCLISessionId: null });
+  it("onSessionMeta emits session:cli-id-received safely even with no bus subscribers", () => {
+    // When no subscriber is listening, the event should fire without errors.
     attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
     // Should not throw
@@ -680,10 +836,10 @@ describe("attachCodexAdapterHandlers", () => {
 
   it("onDisconnect clears pending permissions and broadcasts cli_disconnected", () => {
     // When the adapter disconnects, all pending permissions should be cancelled
-    // (broadcast permission_cancelled for each), the map cleared, codexAdapter set to null,
+    // (broadcast permission_cancelled for each), the map cleared, backendAdapter set to null,
     // session persisted, and a cli_disconnected message broadcast.
-    // Simulate the real flow: ws-bridge sets session.codexAdapter before calling handlers.
-    session.codexAdapter = adapter as unknown as CodexAdapter;
+    // Simulate the real flow: ws-bridge sets session.backendAdapter before calling handlers.
+    session.backendAdapter = adapter as unknown as CodexAdapter;
     attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
     // Add some pending permissions first
@@ -709,8 +865,8 @@ describe("attachCodexAdapterHandlers", () => {
     // Pending permissions should be cleared
     expect(session.pendingPermissions.size).toBe(0);
 
-    // codexAdapter should be nulled out
-    expect(session.codexAdapter).toBeNull();
+    // backendAdapter should be nulled out
+    expect(session.backendAdapter).toBeNull();
 
     // Should broadcast permission_cancelled for each pending permission
     expect(deps.broadcastToBrowsers).toHaveBeenCalledWith(session, {
@@ -733,14 +889,14 @@ describe("attachCodexAdapterHandlers", () => {
   it("onDisconnect with no pending permissions still broadcasts cli_disconnected", () => {
     // Even when there are no pending permissions to cancel, the disconnect handler
     // should still broadcast cli_disconnected and persist.
-    // Simulate the real flow: ws-bridge sets session.codexAdapter before calling handlers.
-    session.codexAdapter = adapter as unknown as CodexAdapter;
+    // Simulate the real flow: ws-bridge sets session.backendAdapter before calling handlers.
+    session.backendAdapter = adapter as unknown as CodexAdapter;
     attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
     adapter._trigger("onDisconnect", undefined);
 
     expect(session.pendingPermissions.size).toBe(0);
-    expect(session.codexAdapter).toBeNull();
+    expect(session.backendAdapter).toBeNull();
     expect(deps.broadcastToBrowsers).toHaveBeenCalledWith(session, {
       type: "cli_disconnected",
     });
@@ -748,18 +904,18 @@ describe("attachCodexAdapterHandlers", () => {
   });
 
   it("onDisconnect from stale adapter is ignored when adapter has been replaced", () => {
-    // When a session is relaunched, the new adapter is set on session.codexAdapter
+    // When a session is relaunched, the new adapter is set on session.backendAdapter
     // before the old adapter's disconnect fires. The old adapter's disconnect should
     // be a no-op so it doesn't null out the new adapter.
     const oldAdapter = createMockAdapter();
     const newAdapter = createMockAdapter();
 
     // Simulate: old adapter is attached
-    session.codexAdapter = oldAdapter as unknown as CodexAdapter;
+    session.backendAdapter = oldAdapter as unknown as CodexAdapter;
     attachCodexAdapterHandlers("test-session", session, oldAdapter as unknown as CodexAdapter, deps);
 
     // Simulate: relaunch replaces the adapter
-    session.codexAdapter = newAdapter as unknown as CodexAdapter;
+    session.backendAdapter = newAdapter as unknown as CodexAdapter;
     attachCodexAdapterHandlers("test-session", session, newAdapter as unknown as CodexAdapter, deps);
 
     // Clear broadcast calls from the two cli_connected broadcasts during attach
@@ -768,8 +924,8 @@ describe("attachCodexAdapterHandlers", () => {
     // Old adapter fires disconnect (happens async after kill)
     oldAdapter._trigger("onDisconnect", undefined);
 
-    // session.codexAdapter should still be the NEW adapter, not null
-    expect(session.codexAdapter).toBe(newAdapter);
+    // session.backendAdapter should still be the NEW adapter, not null
+    expect(session.backendAdapter).toBe(newAdapter);
     // No cli_disconnected broadcast should have happened
     expect(deps.broadcastToBrowsers).not.toHaveBeenCalledWith(session, {
       type: "cli_disconnected",
@@ -779,7 +935,10 @@ describe("attachCodexAdapterHandlers", () => {
   it("onDisconnect triggers auto-relaunch when browsers are still connected", () => {
     // When the transport drops mid-conversation and browsers are still connected,
     // the session should be auto-relaunched instead of leaving users with a dead session.
-    session.codexAdapter = adapter as unknown as CodexAdapter;
+    const onRelaunchNeeded = vi.fn();
+    companionBus.on("session:relaunch-needed", onRelaunchNeeded);
+
+    session.backendAdapter = adapter as unknown as CodexAdapter;
     // Simulate a connected browser
     const fakeBrowserWs = {} as any;
     session.browserSockets.add(fakeBrowserWs);
@@ -787,57 +946,62 @@ describe("attachCodexAdapterHandlers", () => {
 
     adapter._trigger("onDisconnect", undefined);
 
-    expect(deps.onCLIRelaunchNeeded).toHaveBeenCalledWith("test-session");
+    expect(onRelaunchNeeded).toHaveBeenCalledWith({ sessionId: "test-session" });
   });
 
   it("onDisconnect does NOT auto-relaunch when no browsers are connected", () => {
     // If no browsers are watching, don't waste resources relaunching — the relaunch
     // will happen when a browser reconnects via handleBrowserOpen.
-    session.codexAdapter = adapter as unknown as CodexAdapter;
+    const onRelaunchNeeded = vi.fn();
+    companionBus.on("session:relaunch-needed", onRelaunchNeeded);
+
+    session.backendAdapter = adapter as unknown as CodexAdapter;
     expect(session.browserSockets.size).toBe(0);
     attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
     adapter._trigger("onDisconnect", undefined);
 
-    expect(deps.onCLIRelaunchNeeded).not.toHaveBeenCalled();
+    expect(onRelaunchNeeded).not.toHaveBeenCalled();
   });
 
-  it("onDisconnect does NOT auto-relaunch when callback is null", () => {
-    // When the relaunch callback is not configured, disconnect should still work
-    // without errors.
-    session.codexAdapter = adapter as unknown as CodexAdapter;
+  it("onDisconnect works safely even with no bus subscribers for relaunch", () => {
+    // When no subscriber is listening for session:relaunch-needed, disconnect
+    // should still work without errors.
+    session.backendAdapter = adapter as unknown as CodexAdapter;
     const fakeBrowserWs = {} as any;
     session.browserSockets.add(fakeBrowserWs);
-    const depsNoRelaunch = createMockDeps({ onCLIRelaunchNeeded: null });
-    attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, depsNoRelaunch);
+    attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
     // Should not throw
     adapter._trigger("onDisconnect", undefined);
 
-    expect(session.codexAdapter).toBeNull();
+    expect(session.backendAdapter).toBeNull();
   });
 
   it("stale adapter disconnect does NOT trigger auto-relaunch", () => {
     // When a stale adapter disconnects after being replaced, it should not
     // trigger a relaunch (the new adapter is already active).
+    const onRelaunchNeeded = vi.fn();
+    companionBus.on("session:relaunch-needed", onRelaunchNeeded);
+
     const oldAdapter = createMockAdapter();
     const newAdapter = createMockAdapter();
     const fakeBrowserWs = {} as any;
     session.browserSockets.add(fakeBrowserWs);
 
-    session.codexAdapter = oldAdapter as unknown as CodexAdapter;
+    session.backendAdapter = oldAdapter as unknown as CodexAdapter;
     attachCodexAdapterHandlers("test-session", session, oldAdapter as unknown as CodexAdapter, deps);
 
     // Relaunch replaces the adapter
-    session.codexAdapter = newAdapter as unknown as CodexAdapter;
+    session.backendAdapter = newAdapter as unknown as CodexAdapter;
     attachCodexAdapterHandlers("test-session", session, newAdapter as unknown as CodexAdapter, deps);
-    (deps.onCLIRelaunchNeeded as ReturnType<typeof vi.fn>).mockClear();
+    onRelaunchNeeded.mockClear();
 
     // Old adapter fires disconnect
     oldAdapter._trigger("onDisconnect", undefined);
 
     // Should NOT trigger relaunch since the old adapter was stale
-    expect(deps.onCLIRelaunchNeeded).not.toHaveBeenCalled();
+    expect(onRelaunchNeeded).not.toHaveBeenCalled();
   });
 
   // ── Pending message flushing ────────────────────────────────────────────
@@ -935,7 +1099,7 @@ describe("attachCodexAdapterHandlers", () => {
     function enableAiValidation() {
       vi.mocked(settingsManager.getSettings).mockReturnValue({
         anthropicApiKey: "test-api-key",
-        anthropicModel: "claude-sonnet-4.6",
+        anthropicModel: "claude-sonnet-4-6",
         linearApiKey: "",
         linearAutoTransition: false,
         linearAutoTransitionStateId: "",
@@ -943,12 +1107,20 @@ describe("attachCodexAdapterHandlers", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
-        editorTabEnabled: false,
+        linearOAuthClientId: "",
+        linearOAuthClientSecret: "",
+        linearOAuthWebhookSecret: "",
+        linearOAuthAccessToken: "",
+        linearOAuthRefreshToken: "",
+        claudeCodeOAuthToken: "",
+        openaiApiKey: "",
+        onboardingCompleted: false,
         aiValidationEnabled: true,
         aiValidationAutoApprove: true,
         aiValidationAutoDeny: true,
         publicUrl: "",
         updateChannel: "stable",
+        dockerAutoUpdate: false,
         updatedAt: 0,
       });
     }
@@ -1103,7 +1275,7 @@ describe("attachCodexAdapterHandlers", () => {
       // without calling validatePermission at all.
       vi.mocked(settingsManager.getSettings).mockReturnValue({
         anthropicApiKey: "test-api-key",
-        anthropicModel: "claude-sonnet-4.6",
+        anthropicModel: "claude-sonnet-4-6",
         linearApiKey: "",
         linearAutoTransition: false,
         linearAutoTransitionStateId: "",
@@ -1111,12 +1283,20 @@ describe("attachCodexAdapterHandlers", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
-        editorTabEnabled: false,
+        linearOAuthClientId: "",
+        linearOAuthClientSecret: "",
+        linearOAuthWebhookSecret: "",
+        linearOAuthAccessToken: "",
+        linearOAuthRefreshToken: "",
+        claudeCodeOAuthToken: "",
+        openaiApiKey: "",
+        onboardingCompleted: false,
         aiValidationEnabled: false,  // disabled
         aiValidationAutoApprove: true,
         aiValidationAutoDeny: true,
         publicUrl: "",
         updateChannel: "stable",
+        dockerAutoUpdate: false,
         updatedAt: 0,
       });
 
@@ -1141,7 +1321,7 @@ describe("attachCodexAdapterHandlers", () => {
       // the AI — fall through to normal manual flow.
       vi.mocked(settingsManager.getSettings).mockReturnValue({
         anthropicApiKey: "",  // empty
-        anthropicModel: "claude-sonnet-4.6",
+        anthropicModel: "claude-sonnet-4-6",
         linearApiKey: "",
         linearAutoTransition: false,
         linearAutoTransitionStateId: "",
@@ -1149,12 +1329,20 @@ describe("attachCodexAdapterHandlers", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
-        editorTabEnabled: false,
+        linearOAuthClientId: "",
+        linearOAuthClientSecret: "",
+        linearOAuthWebhookSecret: "",
+        linearOAuthAccessToken: "",
+        linearOAuthRefreshToken: "",
+        claudeCodeOAuthToken: "",
+        openaiApiKey: "",
+        onboardingCompleted: false,
         aiValidationEnabled: true,
         aiValidationAutoApprove: true,
         aiValidationAutoDeny: true,
         publicUrl: "",
         updateChannel: "stable",
+        dockerAutoUpdate: false,
         updatedAt: 0,
       });
 
@@ -1244,7 +1432,7 @@ describe("attachCodexAdapterHandlers", () => {
       // should fall through to manual review instead of auto-approving.
       vi.mocked(settingsManager.getSettings).mockReturnValue({
         anthropicApiKey: "test-api-key",
-        anthropicModel: "claude-sonnet-4.6",
+        anthropicModel: "claude-sonnet-4-6",
         linearApiKey: "",
         linearAutoTransition: false,
         linearAutoTransitionStateId: "",
@@ -1252,12 +1440,20 @@ describe("attachCodexAdapterHandlers", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
-        editorTabEnabled: false,
+        linearOAuthClientId: "",
+        linearOAuthClientSecret: "",
+        linearOAuthWebhookSecret: "",
+        linearOAuthAccessToken: "",
+        linearOAuthRefreshToken: "",
+        claudeCodeOAuthToken: "",
+        openaiApiKey: "",
+        onboardingCompleted: false,
         aiValidationEnabled: true,
         aiValidationAutoApprove: false,  // disabled
         aiValidationAutoDeny: true,
         publicUrl: "",
         updateChannel: "stable",
+        dockerAutoUpdate: false,
         updatedAt: 0,
       });
 
@@ -1366,7 +1562,7 @@ describe("attachCodexAdapterHandlers", () => {
       // should fall through to manual review instead of auto-denying.
       vi.mocked(settingsManager.getSettings).mockReturnValue({
         anthropicApiKey: "test-api-key",
-        anthropicModel: "claude-sonnet-4.6",
+        anthropicModel: "claude-sonnet-4-6",
         linearApiKey: "",
         linearAutoTransition: false,
         linearAutoTransitionStateId: "",
@@ -1374,12 +1570,20 @@ describe("attachCodexAdapterHandlers", () => {
     linearArchiveTransition: false,
     linearArchiveTransitionStateId: "",
     linearArchiveTransitionStateName: "",
-        editorTabEnabled: false,
+        linearOAuthClientId: "",
+        linearOAuthClientSecret: "",
+        linearOAuthWebhookSecret: "",
+        linearOAuthAccessToken: "",
+        linearOAuthRefreshToken: "",
+        claudeCodeOAuthToken: "",
+        openaiApiKey: "",
+        onboardingCompleted: false,
         aiValidationEnabled: true,
         aiValidationAutoApprove: true,
         aiValidationAutoDeny: false,  // disabled
         publicUrl: "",
         updateChannel: "stable",
+        dockerAutoUpdate: false,
         updatedAt: 0,
       });
 
@@ -1412,13 +1616,15 @@ describe("attachCodexAdapterHandlers", () => {
 
   // ── Per-session listeners (chat relay) ──────────────────────────────────
 
-  describe("per-session assistant/result listeners", () => {
-    it("invokes assistantMessageListeners when assistant message arrives", () => {
-      // Chat relay relies on per-session listeners to forward agent responses
-      // to external platforms. The Codex path must invoke these just like the
+  describe("per-session bus events (chat relay)", () => {
+    it("emits message:assistant on bus when assistant message arrives", () => {
+      // Chat relay relies on bus events to forward agent responses
+      // to external platforms. The Codex path must emit these just like the
       // Claude Code path does.
       const listener = vi.fn();
-      deps.assistantMessageListeners.set("test-session", new Set([listener]));
+      companionBus.on("message:assistant", ({ sessionId, message }) => {
+        if (sessionId === "test-session") listener(message);
+      });
 
       attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
@@ -1447,11 +1653,13 @@ describe("attachCodexAdapterHandlers", () => {
       });
     });
 
-    it("invokes resultListeners when result message arrives", () => {
-      // Result listeners signal turn completion so chat relay can post
+    it("emits message:result on bus when result message arrives", () => {
+      // Result events signal turn completion so chat relay can post
       // accumulated text back to the platform.
       const listener = vi.fn();
-      deps.resultListeners.set("test-session", new Set([listener]));
+      companionBus.on("message:result", ({ sessionId, message }) => {
+        if (sessionId === "test-session") listener(message);
+      });
 
       attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
@@ -1479,11 +1687,13 @@ describe("attachCodexAdapterHandlers", () => {
       expect(listener.mock.calls[0][0]).toMatchObject({ type: "result" });
     });
 
-    it("does not invoke listeners for a different session", () => {
-      // Listeners registered for "other-session" should not fire when
-      // messages arrive for "test-session".
+    it("does not invoke session-filtered listeners for a different session", () => {
+      // Bus subscribers that filter by sessionId should not fire when
+      // messages arrive for a different session.
       const listener = vi.fn();
-      deps.assistantMessageListeners.set("other-session", new Set([listener]));
+      companionBus.on("message:assistant", ({ sessionId, message }) => {
+        if (sessionId === "other-session") listener(message);
+      });
 
       attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
@@ -1505,9 +1715,9 @@ describe("attachCodexAdapterHandlers", () => {
       expect(listener).not.toHaveBeenCalled();
     });
 
-    it("does not throw when no listeners are registered", () => {
-      // When no listeners are registered for the session, the handler
-      // should not throw (Map.get returns undefined, optional chaining).
+    it("does not throw when no bus subscribers are registered", () => {
+      // When no subscribers are listening on the bus, emitting events
+      // should not throw.
       attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
 
       expect(() => {
@@ -1526,6 +1736,102 @@ describe("attachCodexAdapterHandlers", () => {
           timestamp: Date.now(),
         });
       }).not.toThrow();
+    });
+  });
+
+  // ── lastCliActivityTs tracking ──────────────────────────────────────────
+
+  describe("lastCliActivityTs tracking for idle detection", () => {
+    it("updates lastCliActivityTs when adapter emits messages", () => {
+      // Codex sessions route through the adapter, not routeCLIMessage.
+      // Without updating lastCliActivityTs here, the idle kill watchdog
+      // would incorrectly kill active Codex sessions.
+      const initialTs = session.lastCliActivityTs;
+
+      // Advance time — use try/finally to ensure fake timers are restored
+      // even if assertions fail, preventing leaks into subsequent tests.
+      vi.useFakeTimers();
+      try {
+        vi.advanceTimersByTime(5000);
+
+        attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
+
+        // Simulate an assistant message from Codex
+        adapter._trigger("onBrowserMessage", {
+          type: "assistant",
+          message: {
+            id: "msg-1",
+            type: "message",
+            role: "assistant",
+            model: "o4-mini",
+            content: [{ type: "text", text: "Hi" }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+          },
+          parent_tool_use_id: null,
+          timestamp: Date.now(),
+        });
+
+        // lastCliActivityTs should have been updated
+        expect(session.lastCliActivityTs).toBeGreaterThan(initialTs);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("updates lastCliActivityTs on result messages", () => {
+      // Result messages (turn completed) should also update activity tracking
+      const oldTs = Date.now() - 60000;
+      session.lastCliActivityTs = oldTs;
+
+      attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
+
+      adapter._trigger("onBrowserMessage", {
+        type: "result",
+        subtype: "result",
+        data: { result: "Task completed" },
+      });
+
+      expect(session.lastCliActivityTs).toBeGreaterThan(oldTs);
+    });
+
+    it("updates lastCliActivityTs on session_init messages", () => {
+      // Even session_init should count as activity
+      const oldTs = Date.now() - 60000;
+      session.lastCliActivityTs = oldTs;
+
+      attachCodexAdapterHandlers("test-session", session, adapter as unknown as CodexAdapter, deps);
+
+      adapter._trigger("onBrowserMessage", {
+        type: "session_init",
+        session: {
+          session_id: "test-session",
+          backend_type: "codex",
+          model: "o4-mini",
+          cwd: "/tmp",
+          tools: [],
+          permissionMode: "bypassPermissions",
+          claude_code_version: "",
+          mcp_servers: [],
+          agents: [],
+          slash_commands: [],
+          skills: [],
+          total_cost_usd: 0,
+          num_turns: 0,
+          context_used_percent: 0,
+          is_compacting: false,
+          git_branch: "",
+          is_worktree: false,
+          is_containerized: false,
+          repo_root: "",
+          git_ahead: 0,
+          git_behind: 0,
+          total_lines_added: 0,
+          total_lines_removed: 0,
+        },
+      });
+
+      expect(session.lastCliActivityTs).toBeGreaterThan(oldTs);
     });
   });
 });

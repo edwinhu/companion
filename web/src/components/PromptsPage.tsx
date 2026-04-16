@@ -151,7 +151,7 @@ export function PromptsPage({ embedded = false }: PromptsPageProps) {
 
   return (
     <div className={`${embedded ? "h-full" : "h-[100dvh]"} bg-cc-bg text-cc-fg font-sans-ui antialiased overflow-y-auto`}>
-      <div className="max-w-2xl mx-auto px-4 sm:px-6 py-6 sm:py-10 pb-safe">
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 py-6 sm:py-10 pb-safe">
         {/* Header */}
         <div className="flex items-start justify-between gap-3 mb-2">
           <div className="min-w-0">
@@ -209,72 +209,29 @@ export function PromptsPage({ embedded = false }: PromptsPageProps) {
         {showCreate && (
           <form
             onSubmit={handleCreate}
-            className="mb-6 rounded-xl bg-cc-card p-4 sm:p-5 space-y-3"
+            className="mb-6"
             style={{ animation: "fadeSlideIn 150ms ease-out" }}
           >
-            <div>
-              <label className="block text-xs font-medium text-cc-muted mb-1" htmlFor="prompt-name">
-                Title
-              </label>
-              <input
-                id="prompt-name"
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="review-pr"
-                className="w-full px-3 py-2.5 min-h-[44px] text-sm bg-cc-bg rounded-lg text-cc-fg placeholder:text-cc-muted focus:outline-none focus:ring-1 focus:ring-cc-primary/40 transition-shadow"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-cc-muted mb-1" htmlFor="prompt-content">
-                Content
-              </label>
-              <textarea
-                id="prompt-content"
-                value={content}
-                onChange={(e) => setContent(e.target.value)}
-                placeholder="Review this PR and summarize risks, regressions, and missing tests."
-                rows={4}
-                className="w-full px-3 py-2.5 text-sm bg-cc-bg rounded-lg text-cc-fg placeholder:text-cc-muted focus:outline-none focus:ring-1 focus:ring-cc-primary/40 resize-y transition-shadow"
-              />
-            </div>
-
-            {/* Scope selector */}
-            <ScopeSelector
+            <PromptEditorCard
+              mode="create"
+              name={name}
+              content={content}
               scope={createScope}
+              folders={createFolders}
+              error={error}
+              saving={saving}
+              submitLabel={saving ? "Saving..." : "Create Prompt"}
+              onNameChange={setName}
+              onContentChange={setContent}
               onScopeChange={(s) => {
                 setCreateScope(s);
                 if (s === "project" && createFolders.length === 0 && cwd) {
                   setCreateFolders([cwd]);
                 }
               }}
-              folders={createFolders}
               onRemoveFolder={(path) => setCreateFolders((f) => f.filter((p) => p !== path))}
               onAddFolder={() => setShowFolderPicker(true)}
             />
-
-            {error && (
-              <div className="px-3 py-2 rounded-lg bg-cc-error/10 text-xs text-cc-error">
-                {error}
-              </div>
-            )}
-
-            <div className="flex items-center justify-between pt-1">
-              <p className="text-[11px] text-cc-muted">
-                Stored in <code className="text-[10px]">~/.companion/prompts.json</code>
-              </p>
-              <button
-                type="submit"
-                disabled={saving || !name.trim() || !content.trim()}
-                className={`px-4 py-2.5 min-h-[44px] rounded-lg text-sm font-medium transition-colors ${
-                  saving || !name.trim() || !content.trim()
-                    ? "bg-cc-hover text-cc-muted cursor-not-allowed"
-                    : "bg-cc-primary hover:bg-cc-primary-hover text-white cursor-pointer"
-                }`}
-              >
-                {saving ? "Saving..." : "Create Prompt"}
-              </button>
-            </div>
           </form>
         )}
 
@@ -302,6 +259,7 @@ export function PromptsPage({ embedded = false }: PromptsPageProps) {
                       key={prompt.id}
                       prompt={prompt}
                       isEditing={editingId === prompt.id}
+                      error={error}
                       editName={editName}
                       editContent={editContent}
                       editScope={editScope}
@@ -349,6 +307,7 @@ export function PromptsPage({ embedded = false }: PromptsPageProps) {
                       key={prompt.id}
                       prompt={prompt}
                       isEditing={editingId === prompt.id}
+                      error={error}
                       editName={editName}
                       editContent={editContent}
                       editScope={editScope}
@@ -428,16 +387,21 @@ interface ScopeSelectorProps {
 
 function ScopeSelector({ scope, onScopeChange, folders, onRemoveFolder, onAddFolder }: ScopeSelectorProps) {
   return (
-    <div className="space-y-2">
-      <label className="block text-xs font-medium text-cc-muted">Scope</label>
-      <div className="flex items-center gap-2">
+    <div className="space-y-3">
+      <div>
+        <label className="block text-xs font-medium uppercase tracking-[0.24em] text-cc-muted">Scope</label>
+        <p className="mt-1 text-xs text-cc-muted/80">
+          Choose whether this prompt should be available everywhere or only inside specific repos.
+        </p>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
           aria-pressed={scope === "global"}
           onClick={() => onScopeChange("global")}
-          className={`px-3 py-1.5 text-xs rounded-md border transition-colors cursor-pointer ${
+          className={`inline-flex min-h-[40px] items-center rounded-full border px-4 py-2 text-sm transition-colors cursor-pointer ${
             scope === "global"
-              ? "border-cc-primary/40 text-cc-primary bg-cc-primary/8"
+              ? "border-cc-primary/40 text-cc-primary bg-cc-primary/10 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]"
               : "border-cc-border text-cc-muted hover:text-cc-fg hover:bg-cc-hover"
           }`}
         >
@@ -447,9 +411,9 @@ function ScopeSelector({ scope, onScopeChange, folders, onRemoveFolder, onAddFol
           type="button"
           aria-pressed={scope === "project"}
           onClick={() => onScopeChange("project")}
-          className={`px-3 py-1.5 text-xs rounded-md border transition-colors cursor-pointer ${
+          className={`inline-flex min-h-[40px] items-center rounded-full border px-4 py-2 text-sm transition-colors cursor-pointer ${
             scope === "project"
-              ? "border-cc-primary/40 text-cc-primary bg-cc-primary/8"
+              ? "border-cc-primary/40 text-cc-primary bg-cc-primary/10 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]"
               : "border-cc-border text-cc-muted hover:text-cc-fg hover:bg-cc-hover"
           }`}
         >
@@ -458,13 +422,21 @@ function ScopeSelector({ scope, onScopeChange, folders, onRemoveFolder, onAddFol
       </div>
 
       {scope === "project" && (
-        <div className="space-y-1.5">
+        <div className="rounded-2xl border border-cc-border/70 bg-cc-bg/60 p-3 space-y-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-cc-fg">Project folders</p>
+              <p className="mt-1 text-xs text-cc-muted">
+                Prompts scoped to folders only appear when the active session is inside one of those paths.
+              </p>
+            </div>
+          </div>
           {folders.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {folders.map((folder) => (
                 <span
                   key={folder}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-cc-hover text-xs font-mono-code text-cc-fg"
+                  className="inline-flex min-h-[32px] items-center gap-1.5 rounded-full border border-cc-border/80 bg-cc-hover px-3 py-1.5 text-xs font-mono-code text-cc-fg"
                 >
                   <span className="truncate max-w-[200px]" title={folder}>
                     {folder.split("/").pop() || folder}
@@ -486,7 +458,7 @@ function ScopeSelector({ scope, onScopeChange, folders, onRemoveFolder, onAddFol
           <button
             type="button"
             onClick={onAddFolder}
-            className="inline-flex items-center gap-1 px-2 py-1 text-xs text-cc-muted hover:text-cc-fg hover:bg-cc-hover rounded-md border border-dashed border-cc-border transition-colors cursor-pointer"
+            className="inline-flex min-h-[40px] items-center gap-1.5 rounded-full border border-dashed border-cc-border px-3 py-2 text-sm text-cc-muted transition-colors cursor-pointer hover:text-cc-fg hover:bg-cc-hover"
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3 h-3">
               <path d="M8 3v10M3 8h10" strokeLinecap="round" />
@@ -496,6 +468,168 @@ function ScopeSelector({ scope, onScopeChange, folders, onRemoveFolder, onAddFol
         </div>
       )}
     </div>
+  );
+}
+
+interface PromptEditorCardProps {
+  mode: "create" | "edit";
+  name: string;
+  content: string;
+  scope: "global" | "project";
+  folders: string[];
+  saving?: boolean;
+  error?: string;
+  submitLabel: string;
+  cancelLabel?: string;
+  onNameChange: (value: string) => void;
+  onContentChange: (value: string) => void;
+  onScopeChange: (scope: "global" | "project") => void;
+  onRemoveFolder: (path: string) => void;
+  onAddFolder: () => void;
+  onSubmit?: () => void;
+  onCancel?: () => void;
+}
+
+function PromptEditorCard({
+  mode,
+  name,
+  content,
+  scope,
+  folders,
+  saving = false,
+  error,
+  submitLabel,
+  cancelLabel = "Cancel",
+  onNameChange,
+  onContentChange,
+  onScopeChange,
+  onRemoveFolder,
+  onAddFolder,
+  onSubmit,
+  onCancel,
+}: PromptEditorCardProps) {
+  const isValid = Boolean(name.trim() && content.trim());
+  const contentLines = content.split(/\r?\n/).length;
+  const contentChars = content.length;
+
+  return (
+    <section className="overflow-hidden rounded-[28px] border border-cc-border/70 bg-cc-card shadow-[0_20px_60px_rgba(0,0,0,0.22)]">
+      <div className="border-b border-cc-border/60 bg-[linear-gradient(135deg,rgba(255,255,255,0.04),rgba(255,255,255,0))] px-5 py-4 sm:px-6">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.28em] text-cc-primary/80">
+              {mode === "create" ? "Prompt Studio" : "Edit Prompt"}
+            </p>
+            <h2 className="mt-1 text-xl font-semibold text-cc-fg">
+              {mode === "create" ? "Write with room to think" : "Refine this saved prompt"}
+            </h2>
+            <p className="mt-1 max-w-2xl text-sm leading-relaxed text-cc-muted">
+              Structure the title, scope, and body separately so longer instructions stay easy to review before saving.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2 text-xs text-cc-muted">
+            <span className="inline-flex min-h-[32px] items-center rounded-full border border-cc-border/70 bg-cc-bg/60 px-3">
+              {contentLines} line{contentLines > 1 ? "s" : ""}
+            </span>
+            <span className="inline-flex min-h-[32px] items-center rounded-full border border-cc-border/70 bg-cc-bg/60 px-3">
+              {contentChars} char{contentChars > 1 ? "s" : ""}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-0 lg:grid-cols-[minmax(280px,340px)_minmax(0,1fr)]">
+        <div className="border-b border-cc-border/60 p-5 sm:p-6 lg:border-b-0 lg:border-r">
+          <div className="space-y-5">
+            <div>
+              <label className="mb-1.5 block text-xs font-medium uppercase tracking-[0.24em] text-cc-muted" htmlFor={mode === "create" ? "prompt-name" : undefined}>
+                Title
+              </label>
+              <input
+                id={mode === "create" ? "prompt-name" : undefined}
+                type="text"
+                value={name}
+                onChange={(e) => onNameChange(e.target.value)}
+                placeholder="review-pr"
+                className="w-full rounded-2xl border border-cc-border/70 bg-cc-bg px-4 py-3 text-sm text-cc-fg placeholder:text-cc-muted focus:outline-none focus:ring-1 focus:ring-cc-primary/40 transition-shadow"
+              />
+              <p className="mt-2 text-xs leading-relaxed text-cc-muted">
+                Use a short handle that is easy to insert with <code className="rounded bg-cc-hover px-1 py-0.5 text-[11px] text-cc-fg">@title</code>.
+              </p>
+            </div>
+
+            <ScopeSelector
+              scope={scope}
+              onScopeChange={onScopeChange}
+              folders={folders}
+              onRemoveFolder={onRemoveFolder}
+              onAddFolder={onAddFolder}
+            />
+
+            <div className="rounded-2xl border border-dashed border-cc-border/70 bg-cc-bg/40 p-4">
+              <p className="text-xs font-medium uppercase tracking-[0.24em] text-cc-muted">Storage</p>
+              <p className="mt-2 text-sm leading-relaxed text-cc-muted">
+                Saved in <code className="text-[11px] text-cc-fg">~/.companion/prompts.json</code> and available from the composer autocomplete.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="p-5 sm:p-6">
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <label className="mb-1.5 block text-xs font-medium uppercase tracking-[0.24em] text-cc-muted" htmlFor={mode === "create" ? "prompt-content" : undefined}>
+                  Content
+                </label>
+                <p className="text-sm text-cc-muted">
+                  Longer prompts stay readable here. Leave breathing room for detailed review flows, checklists, or operating instructions.
+                </p>
+              </div>
+            </div>
+
+            <textarea
+              id={mode === "create" ? "prompt-content" : undefined}
+              value={content}
+              onChange={(e) => onContentChange(e.target.value)}
+              placeholder="Review this PR and summarize risks, regressions, and missing tests."
+              rows={mode === "create" ? 14 : 10}
+              className="min-h-[320px] w-full resize-y rounded-[24px] border border-cc-border/70 bg-cc-bg px-4 py-4 text-sm leading-7 text-cc-fg placeholder:text-cc-muted focus:outline-none focus:ring-1 focus:ring-cc-primary/40 transition-shadow lg:min-h-[420px]"
+            />
+
+            {error && (
+              <div className="rounded-2xl border border-cc-error/20 bg-cc-error/10 px-4 py-3 text-sm text-cc-error">
+                {error}
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-cc-border/60 pt-4">
+              {onCancel && (
+                <button
+                  type="button"
+                  onClick={onCancel}
+                  className="min-h-[44px] rounded-full px-4 py-2.5 text-sm text-cc-muted transition-colors cursor-pointer hover:bg-cc-hover hover:text-cc-fg"
+                >
+                  {cancelLabel}
+                </button>
+              )}
+              <button
+                type={onSubmit ? "button" : "submit"}
+                onClick={onSubmit}
+                disabled={saving || !isValid}
+                className={`min-h-[44px] rounded-full px-5 py-2.5 text-sm font-medium transition-colors ${
+                  saving || !isValid
+                    ? "bg-cc-hover text-cc-muted cursor-not-allowed"
+                    : "bg-cc-primary text-white cursor-pointer hover:bg-cc-primary-hover"
+                }`}
+              >
+                {submitLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -531,6 +665,7 @@ interface PromptRowProps {
   editContent: string;
   editScope: "global" | "project";
   editFolders: string[];
+  error?: string;
   cwd: string;
   onEditNameChange: (v: string) => void;
   onEditContentChange: (v: string) => void;
@@ -546,6 +681,7 @@ interface PromptRowProps {
 function PromptRow({
   prompt,
   isEditing,
+  error,
   editName,
   editContent,
   editScope,
@@ -563,49 +699,25 @@ function PromptRow({
   if (isEditing) {
     return (
       <div
-        className="rounded-xl bg-cc-card p-4 space-y-3"
+        className="rounded-2xl"
         style={{ animation: "fadeSlideIn 150ms ease-out" }}
       >
-        <input
-          value={editName}
-          onChange={(e) => onEditNameChange(e.target.value)}
-          placeholder="Prompt title"
-          className="w-full px-3 py-2.5 min-h-[44px] text-sm bg-cc-bg rounded-lg text-cc-fg focus:outline-none focus:ring-1 focus:ring-cc-primary/40 transition-shadow"
-        />
-        <textarea
-          value={editContent}
-          onChange={(e) => onEditContentChange(e.target.value)}
-          rows={4}
-          className="w-full px-3 py-2.5 text-sm bg-cc-bg rounded-lg text-cc-fg focus:outline-none focus:ring-1 focus:ring-cc-primary/40 resize-y transition-shadow"
-        />
-
-        <ScopeSelector
+        <PromptEditorCard
+          mode="edit"
+          name={editName}
+          content={editContent}
           scope={editScope}
-          onScopeChange={onEditScopeChange}
           folders={editFolders}
+          error={error}
+          submitLabel="Save"
+          onNameChange={onEditNameChange}
+          onContentChange={onEditContentChange}
+          onScopeChange={onEditScopeChange}
           onRemoveFolder={onEditRemoveFolder}
           onAddFolder={onEditAddFolder}
+          onCancel={onCancelEdit}
+          onSubmit={onSaveEdit}
         />
-
-        <div className="flex justify-end gap-2">
-          <button
-            onClick={onCancelEdit}
-            className="px-3 py-2.5 min-h-[44px] text-sm rounded-lg text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onSaveEdit}
-            disabled={!editName.trim() || !editContent.trim()}
-            className={`px-4 py-2.5 min-h-[44px] text-sm rounded-lg font-medium transition-colors ${
-              editName.trim() && editContent.trim()
-                ? "bg-cc-primary hover:bg-cc-primary-hover text-white cursor-pointer"
-                : "bg-cc-hover text-cc-muted cursor-not-allowed"
-            }`}
-          >
-            Save
-          </button>
-        </div>
       </div>
     );
   }

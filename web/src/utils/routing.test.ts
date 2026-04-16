@@ -32,10 +32,6 @@ describe("parseHash", () => {
     expect(parseHash("#/integrations/linear")).toEqual({ page: "integration-linear" });
   });
 
-  it("parses terminal route", () => {
-    expect(parseHash("#/terminal")).toEqual({ page: "terminal" });
-  });
-
   it("parses prompts route", () => {
     expect(parseHash("#/prompts")).toEqual({ page: "prompts" });
   });
@@ -44,8 +40,9 @@ describe("parseHash", () => {
     expect(parseHash("#/environments")).toEqual({ page: "environments" });
   });
 
-  it("parses docker-builder route", () => {
-    expect(parseHash("#/docker-builder")).toEqual({ page: "docker-builder" });
+  it("parses docker-builder route as home (removed)", () => {
+    // docker-builder route was removed; unknown routes map to home
+    expect(parseHash("#/docker-builder")).toEqual({ page: "home" });
   });
 
   it("parses scheduled route (redirects to agents)", () => {

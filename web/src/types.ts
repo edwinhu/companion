@@ -12,6 +12,7 @@ import type {
 } from "../server/session-types.js";
 
 export type { SessionState, PermissionRequest, AiValidationInfo, ContentBlock, BrowserIncomingMessage, BrowserOutgoingMessage, BackendType, McpServerDetail, McpServerConfig, CreationProgressEvent };
+export type { SessionPhase } from "../server/session-state-machine.js";
 
 export interface ChatMessage {
   id: string;
@@ -22,6 +23,7 @@ export interface ChatMessage {
   timestamp: number;
   parentToolUseId?: string | null;
   isStreaming?: boolean;
+  streamingPhase?: "thinking" | "text";
   model?: string;
   stopReason?: string | null;
 }
@@ -56,6 +58,27 @@ export interface ProcessItem {
   /** Timestamp when status changed to a terminal state */
   completedAt?: number;
   /** Summary text from task_notification */
+  summary?: string;
+}
+
+export type BackgroundAgentStatus = "running" | "completed" | "failed";
+
+export interface BackgroundAgentItem {
+  /** The tool_use_id of the Agent tool call that spawned this */
+  toolUseId: string;
+  /** Agent name (from the `name` input field) */
+  name: string;
+  /** Short description (from the `description` input field) */
+  description: string;
+  /** Agent type (e.g., "Explore", "general-purpose") */
+  agentType: string;
+  /** Current status */
+  status: BackgroundAgentStatus;
+  /** Timestamp when detected */
+  startedAt: number;
+  /** Timestamp when completed/failed */
+  completedAt?: number;
+  /** Result summary from task_notification */
   summary?: string;
 }
 
@@ -105,4 +128,6 @@ export interface SdkSessionInfo {
   agentId?: string;
   /** Human-readable name of the agent that spawned this session */
   agentName?: string;
+  /** Sandbox profile slug used for this session */
+  sandboxSlug?: string;
 }

@@ -1,4 +1,4 @@
-import type { SdkSessionInfo } from "../types.js";
+import type { BackendType } from "../types.js";
 
 export interface SessionItem {
   id: string;
@@ -11,11 +11,12 @@ export interface SessionItem {
   linesAdded: number;
   linesRemoved: number;
   isConnected: boolean;
+  isReconnecting: boolean;
   status: "idle" | "running" | "compacting" | null;
   sdkState: "starting" | "connected" | "running" | "exited" | null;
   createdAt: number;
   archived: boolean;
-  backendType: "claude" | "codex";
+  backendType: BackendType;
   repoRoot: string;
   permCount: number;
   cronJobId?: string;

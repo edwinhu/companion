@@ -13,8 +13,10 @@ import type { SessionStore } from "./session-store.js";
 import type { BackendType } from "./session-types.js";
 import type { RecorderManager } from "./recorder.js";
 import { CodexAdapter } from "./codex-adapter.js";
+import { OpencodeAdapter, waitForOpencodeReady, createOpencodeSession } from "./opencode-adapter.js";
 import { resolveBinary, getEnrichedPath } from "./path-resolver.js";
 import { containerManager } from "./container-manager.js";
+import { companionBus } from "./event-bus.js";
 import {
   getLegacyCodexHome,
   resolveCompanionCodexSessionHome,
@@ -27,8 +29,13 @@ function isCodexWsTransportEnabled(): boolean {
 }
 
 /** Find a free TCP port in the given range by attempting to listen on each. */
-async function findFreePort(start = 4500, end = 4600): Promise<number> {
+async function findFreePort(
+  start = 4500,
+  end = 4600,
+  isReserved?: (port: number) => boolean,
+): Promise<number> {
   for (let port = start; port <= end; port++) {
+    if (isReserved?.(port)) continue;
     try {
       const server = Bun.listen({
         hostname: "127.0.0.1",
@@ -111,12 +118,18 @@ export interface SdkSessionInfo {
   agentId?: string;
   /** Human-readable name of the agent that spawned this session */
   agentName?: string;
+  /** Sandbox profile slug used for this session */
+  sandboxSlug?: string;
 
   // Codex WebSocket transport fields
   /** Port used for Codex WebSocket transport (host mode). */
   codexWsPort?: number;
   /** Full WebSocket URL for the Codex app-server. */
   codexWsUrl?: string;
+  /** opencode (Gemini) internal session ID (ses_...) for resume support. */
+  opencodeSessionId?: string;
+  /** Port the opencode serve daemon is listening on. */
+  opencodePort?: number;
 
   // Container fields
   /** Docker container ID when session runs inside a container */
@@ -135,6 +148,7 @@ export interface LaunchOptions {
   cwd?: string;
   claudeBinary?: string;
   codexBinary?: string;
+  geminiBinary?: string;
   allowedTools?: string[];
   env?: Record<string, string>;
   backendType?: BackendType;
@@ -156,6 +170,10 @@ export interface LaunchOptions {
   resumeSessionAt?: string;
   /** Fork a new Claude session when resuming from prior context. */
   forkSession?: boolean;
+  /** Optional system prompt to inject into Codex sessions (e.g. Linear context). */
+  systemPrompt?: string;
+  /** Sandbox profile slug used for this session */
+  sandboxSlug?: string;
 }
 
 /**
@@ -167,26 +185,15 @@ export class CliLauncher {
   private processes = new Map<string, Subprocess>();
   /** Sidecar Node proxy processes used by Codex WebSocket transport. */
   private codexWsProxies = new Map<string, Subprocess>();
+  /** Host-mode Codex WS listen ports currently reserved by active sessions. */
+  private claimedCodexWsPorts = new Set<number>();
   /** Runtime-only env vars per session (kept out of persisted launcher state). */
   private sessionEnvs = new Map<string, Record<string, string>>();
   private port: number;
   private store: SessionStore | null = null;
   private recorder: RecorderManager | null = null;
-  private onCodexAdapter: ((sessionId: string, adapter: CodexAdapter) => void) | null = null;
-  private exitHandlers: ((sessionId: string, exitCode: number | null) => void)[] = [];
-
   constructor(port: number) {
     this.port = port;
-  }
-
-  /** Register a callback for when a CodexAdapter is created (WsBridge needs to attach it). */
-  onCodexAdapterCreated(cb: (sessionId: string, adapter: CodexAdapter) => void): void {
-    this.onCodexAdapter = cb;
-  }
-
-  /** Register a callback for when a CLI/Codex process exits. */
-  onSessionExited(cb: (sessionId: string, exitCode: number | null) => void): void {
-    this.exitHandlers.push(cb);
   }
 
   /** Attach a persistent store for surviving server restarts. */
@@ -204,6 +211,18 @@ export class CliLauncher {
     if (!this.store) return;
     const data = Array.from(this.sessions.values());
     this.store.saveLauncher(data);
+  }
+
+  private claimCodexWsPort(port: number): void {
+    this.claimedCodexWsPorts.add(port);
+  }
+
+  private releaseCodexWsPort(info: SdkSessionInfo | undefined): void {
+    if (!info || info.containerId) return;
+    if (typeof info.codexWsPort !== "number") return;
+    this.claimedCodexWsPorts.delete(info.codexWsPort);
+    info.codexWsPort = undefined;
+    info.codexWsUrl = undefined;
   }
 
   /**
@@ -253,6 +272,16 @@ export class CliLauncher {
         // Already exited
         this.sessions.set(info.sessionId, info);
       }
+
+      // Avoid reusing ports already owned by recovered host-mode Codex sessions.
+      if (
+        (info.backendType === "codex" || info.backendType === "gemini")
+        && !info.containerId
+        && info.state !== "exited"
+        && typeof info.codexWsPort === "number"
+      ) {
+        this.claimCodexWsPort(info.codexWsPort);
+      }
     }
     if (recovered > 0) {
       console.log(`[cli-launcher] Recovered ${recovered} live session(s) from disk`);
@@ -283,9 +312,14 @@ export class CliLauncher {
       info.forkSession = options.forkSession === true;
     }
 
-    if (backendType === "codex") {
+    if (backendType === "codex" || backendType === "gemini") {
       info.codexInternetAccess = options.codexInternetAccess === true;
       info.codexSandbox = options.codexSandbox;
+    }
+
+    // Store sandbox slug if provided
+    if (options.sandboxSlug) {
+      info.sandboxSlug = options.sandboxSlug;
     }
 
     // Store container metadata if provided
@@ -303,6 +337,8 @@ export class CliLauncher {
 
     if (backendType === "codex") {
       this.spawnCodex(sessionId, info, options);
+    } else if (backendType === "gemini") {
+      this.spawnOpencode(sessionId, info, options);
     } else {
       this.spawnCLI(sessionId, info, options);
     }
@@ -347,6 +383,9 @@ export class CliLauncher {
       try { process.kill(info.pid, "SIGTERM"); } catch {}
     }
 
+    // Release any host-mode Codex port claim before picking a new one.
+    this.releaseCodexWsPort(info);
+
     // Pre-flight validation for containerized sessions
     if (info.containerId) {
       const containerLabel = info.containerName || info.containerId.slice(0, 12);
@@ -379,7 +418,7 @@ export class CliLauncher {
       }
 
       // Validate the CLI binary exists inside the container
-      const binary = info.backendType === "codex" ? "codex" : "claude";
+      const binary = info.backendType === "codex" ? "codex" : (info.backendType === "gemini" ? "opencode" : "claude");
       if (!containerManager.hasBinaryInContainer(info.containerId, binary)) {
         console.error(`[cli-launcher] "${binary}" not found in container ${containerLabel} for session ${sessionId}`);
         info.state = "exited";
@@ -396,7 +435,7 @@ export class CliLauncher {
 
     const runtimeEnv = this.sessionEnvs.get(sessionId);
 
-    if (info.backendType === "codex") {
+    if (info.backendType === "codex" || info.backendType === "gemini") {
       this.spawnCodex(sessionId, info, {
         model: info.model,
         permissionMode: info.permissionMode,
@@ -431,12 +470,164 @@ export class CliLauncher {
     return Array.from(this.sessions.values()).filter((s) => s.state === "starting");
   }
 
+  /**
+   * Spawn opencode (Gemini backend) as a headless HTTP server and wire up
+   * an OpencodeAdapter that translates REST+SSE events into BrowserIncomingMessages.
+   *
+   * Flow:
+   *   1. Find a free port and spawn: opencode serve --port <PORT>
+   *   2. Poll GET /session until the server is ready (up to 30s)
+   *   3. POST /session to create a session inside opencode
+   *   4. Instantiate OpencodeAdapter and attach it to the WsBridge
+   */
+  private async spawnOpencode(sessionId: string, info: SdkSessionInfo, options: LaunchOptions): Promise<void> {
+    const binary = options.geminiBinary || "opencode";
+    const resolvedBinary = resolveBinary(binary);
+    if (!resolvedBinary) {
+      console.error(`[cli-launcher] Binary "${binary}" not found in PATH`);
+      info.state = "exited";
+      info.exitCode = 127;
+      this.persistState();
+      return;
+    }
+
+    // Find a free port for the opencode HTTP server
+    let port: number;
+    try {
+      port = await findFreePort(4600, 4700, (p) => this.claimedCodexWsPorts.has(p));
+      this.claimedCodexWsPorts.add(port);
+      info.opencodePort = port;
+    } catch (err) {
+      console.error(`[cli-launcher] Failed to find free port for opencode: ${err}`);
+      info.state = "exited";
+      info.exitCode = 1;
+      this.persistState();
+      return;
+    }
+
+    const enrichedPath = getEnrichedPath();
+    const cwd = info.cwd || process.cwd();
+
+    const args = ["serve", "--port", String(port), "--hostname", "127.0.0.1"];
+
+    console.log(`[cli-launcher] Spawning opencode serve session ${sessionId} on port ${port}: ${resolvedBinary} ${args.join(" ")}`);
+
+    const proc = Bun.spawn([resolvedBinary, ...args], {
+      cwd,
+      env: {
+        ...process.env,
+        ...options.env,
+        PATH: enrichedPath,
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    info.pid = proc.pid;
+    this.processes.set(sessionId, proc);
+    this.pipeOutput(sessionId, proc);
+
+    // Wait for the opencode HTTP server to be ready
+    let baseUrl: string;
+    try {
+      baseUrl = await waitForOpencodeReady(port, 30_000);
+    } catch (err) {
+      console.error(`[cli-launcher] opencode serve did not start for session ${sessionId}: ${err}`);
+      try { proc.kill("SIGTERM"); } catch {}
+      info.state = "exited";
+      info.exitCode = 1;
+      this.claimedCodexWsPorts.delete(port);
+      info.opencodePort = undefined;
+      this.processes.delete(sessionId);
+      this.persistState();
+      this.initErrorCbForSession?.(sessionId, `opencode serve failed to start: ${err}`);
+      return;
+    }
+
+    // Create an opencode session
+    let opencodeSessionId: string;
+    try {
+      opencodeSessionId = await createOpencodeSession(baseUrl, {
+        modelID: this.mapModelToOpencode(options.model),
+        cwd,
+      });
+    } catch (err) {
+      console.error(`[cli-launcher] Failed to create opencode session for ${sessionId}: ${err}`);
+      try { proc.kill("SIGTERM"); } catch {}
+      info.state = "exited";
+      info.exitCode = 1;
+      this.claimedCodexWsPorts.delete(port);
+      info.opencodePort = undefined;
+      this.processes.delete(sessionId);
+      this.persistState();
+      return;
+    }
+
+    info.opencodeSessionId = opencodeSessionId;
+    info.cliSessionId = opencodeSessionId;
+
+    // Create adapter and wire it up
+    const adapter = new OpencodeAdapter(baseUrl, sessionId, opencodeSessionId);
+
+    // Notify WsBridge so it can attach this adapter (same bus event as Codex)
+    companionBus.emit("backend:codex-adapter-created", { sessionId, adapter });
+
+    info.state = "connected";
+    this.persistState();
+
+    // Start the SSE listener and emit session_init to the browser
+    await adapter.start({
+      model: options.model || "gemini",
+      cwd,
+      permissionMode: options.permissionMode,
+    });
+
+    // Monitor process exit
+    proc.exited.then((exitCode) => {
+      console.log(`[cli-launcher] opencode serve session ${sessionId} exited (code=${exitCode})`);
+      adapter.disconnect().catch(() => {});
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.state = "exited";
+        session.exitCode = exitCode;
+        this.claimedCodexWsPorts.delete(port);
+        session.opencodePort = undefined;
+      }
+      this.processes.delete(sessionId);
+      this.persistState();
+      companionBus.emit("session:exited", { sessionId, exitCode });
+    });
+  }
+
+  /** Map a Companion model name to an opencode modelID (provider/model format). */
+  private mapModelToOpencode(model?: string): string | undefined {
+    if (!model) return undefined;
+    // If already in provider/model format, return as-is
+    if (model.includes("/")) return model;
+    // Map known shorthand names
+    const mapping: Record<string, string> = {
+      "gemini-2.5-pro": "google/gemini-2.5-pro",
+      "gemini-2.5-flash": "google/gemini-2.5-flash",
+      "gemini-2.0-flash": "google/gemini-2.0-flash",
+      "gemini-1.5-pro": "google/gemini-1.5-pro",
+      "gemini-1.5-flash": "google/gemini-1.5-flash",
+    };
+    return mapping[model] ?? `google/${model}`;
+  }
+
+  /** Internal helper: fire init error callback for a session. */
+  private initErrorCbForSession?: (sessionId: string, error: string) => void;
+
   private spawnCLI(sessionId: string, info: SdkSessionInfo, options: LaunchOptions & { resumeSessionId?: string }): void {
+
     const isContainerized = !!options.containerId;
 
     // For containerized sessions, the CLI binary lives inside the container.
     // For host sessions, resolve the binary on the host.
-    let binary = options.claudeBinary || "claude";
+    let binary = info.backendType === "gemini" 
+      ? (options.geminiBinary || "opencode") 
+      : (options.claudeBinary || "claude");
     if (!isContainerized) {
       const resolved = resolveBinary(binary);
       if (resolved) {
@@ -461,18 +652,26 @@ export class CliLauncher {
       ? `ws://${containerSdkHost}:${this.port}/ws/cli/${sessionId}`
       : `ws://localhost:${this.port}/ws/cli/${sessionId}`;
 
-    // Claude Code rejects bypassPermissions when running with root/sudo. Most
-    // container images run as root by default, so downgrade to acceptEdits unless
-    // explicitly forced.
+    // Claude Code rejects bypassPermissions when running with root/sudo.
+    // Container sessions are downgraded by default; host sessions are only
+    // downgraded when this server itself runs as root.
     let effectivePermissionMode = options.permissionMode;
-    if (
+    const isRootProcess = typeof process.getuid === "function" && process.getuid() === 0;
+    const shouldDowngradeContainerBypass =
       isContainerized
       && options.permissionMode === "bypassPermissions"
-      && process.env.COMPANION_FORCE_BYPASS_IN_CONTAINER !== "1"
-    ) {
+      && process.env.COMPANION_FORCE_BYPASS_IN_CONTAINER !== "1";
+    const shouldDowngradeRootBypass =
+      !isContainerized
+      && isRootProcess
+      && options.permissionMode === "bypassPermissions"
+      && process.env.COMPANION_FORCE_BYPASS_AS_ROOT !== "1";
+
+    if (shouldDowngradeContainerBypass || shouldDowngradeRootBypass) {
+      const scope = isContainerized ? "container" : "root";
       console.warn(
-        `[cli-launcher] Session ${sessionId}: downgrading container permission mode ` +
-        `from bypassPermissions to acceptEdits (set COMPANION_FORCE_BYPASS_IN_CONTAINER=1 to force bypass).`,
+        `[cli-launcher] Session ${sessionId}: downgrading ${scope} permission mode ` +
+        `from bypassPermissions to acceptEdits.`,
       );
       effectivePermissionMode = "acceptEdits";
       info.permissionMode = "acceptEdits";
@@ -544,7 +743,10 @@ export class CliLauncher {
       spawnCwd = undefined; // cwd is set inside the container via -w at creation
     } else {
       // Host-based spawn (original behavior)
-      spawnCmd = [binary, ...args];
+      // On Windows, .cmd/.bat files cannot be spawned directly by Bun.spawn;
+      // they must be invoked via cmd.exe /c.
+      const isCmdScript = process.platform === "win32" && (binary.endsWith(".cmd") || binary.endsWith(".bat"));
+      spawnCmd = isCmdScript ? ["cmd.exe", "/c", binary, ...args] : [binary, ...args];
       spawnEnv = {
         ...process.env,
         CLAUDECODE: undefined,
@@ -591,9 +793,7 @@ export class CliLauncher {
       }
       this.processes.delete(sessionId);
       this.persistState();
-      for (const handler of this.exitHandlers) {
-        try { handler(sessionId, exitCode); } catch {}
-      }
+      companionBus.emit("session:exited", { sessionId, exitCode });
     });
 
     this.persistState();
@@ -655,8 +855,10 @@ export class CliLauncher {
    */
   private async spawnCodexWs(sessionId: string, info: SdkSessionInfo, options: LaunchOptions): Promise<void> {
     const isContainerized = !!options.containerId;
+    const connectTimeoutMs = Math.max(1000, parseInt(process.env.COMPANION_CODEX_WS_CONNECT_TIMEOUT_MS ?? "", 10) || 30000);
+    const pongTimeoutMs = Math.max(1000, parseInt(process.env.COMPANION_CODEX_PONG_TIMEOUT_MS ?? "", 10) || 30000);
 
-    let binary = options.codexBinary || "codex";
+    let binary = info.backendType === "gemini" ? (options.geminiBinary || "opencode") : (options.codexBinary || "codex");
     if (!isContainerized) {
       const resolved = resolveBinary(binary);
       if (resolved) {
@@ -691,7 +893,14 @@ export class CliLauncher {
       proxyConnectPort = mappedPort;
     } else {
       try {
-        proxyConnectPort = await findFreePort(4500, 4600);
+        proxyConnectPort = await findFreePort(
+          4500,
+          4600,
+          (port) => this.claimedCodexWsPorts.has(port),
+        );
+        this.claimCodexWsPort(proxyConnectPort);
+        // Set immediately after claiming so any downstream failure can release it.
+        info.codexWsPort = proxyConnectPort;
       } catch (err) {
         console.error(`[cli-launcher] Failed to find free port for Codex WS: ${err}`);
         info.state = "exited";
@@ -744,7 +953,8 @@ export class CliLauncher {
       const binaryDir = resolve(binary, "..");
       const siblingNode = join(binaryDir, "node");
       const enrichedPath = getEnrichedPath();
-      const spawnPath = [binaryDir, ...enrichedPath.split(":")].filter(Boolean).join(":");
+      const pathSep = process.platform === "win32" ? ";" : ":";
+      const spawnPath = [binaryDir, ...enrichedPath.split(pathSep)].filter(Boolean).join(pathSep);
 
       if (existsSync(siblingNode)) {
         let codexScript: string;
@@ -755,7 +965,9 @@ export class CliLauncher {
         }
         spawnCmd = [siblingNode, codexScript, ...args];
       } else {
-        spawnCmd = [binary, ...args];
+        // On Windows, .cmd/.bat files cannot be spawned directly by Bun.spawn
+        const isCmdScript = process.platform === "win32" && (binary.endsWith(".cmd") || binary.endsWith(".bat"));
+        spawnCmd = isCmdScript ? ["cmd.exe", "/c", binary, ...args] : [binary, ...args];
       }
 
       spawnEnv = {
@@ -789,7 +1001,9 @@ export class CliLauncher {
 
     // Store WS metadata
     const wsUrl = `ws://127.0.0.1:${proxyConnectPort}`;
-    info.codexWsPort = proxyConnectPort;
+    if (typeof info.codexWsPort !== "number") {
+      info.codexWsPort = proxyConnectPort;
+    }
     info.codexWsUrl = wsUrl;
 
     // Connect to Codex app-server through a Node helper process that uses the
@@ -799,7 +1013,7 @@ export class CliLauncher {
     const codexBinaryDir = isContainerized ? undefined : resolve(binary, "..");
     const proxyNodeCandidate = codexBinaryDir ? join(codexBinaryDir, "node") : undefined;
     const proxyNode = proxyNodeCandidate && existsSync(proxyNodeCandidate) ? proxyNodeCandidate : "node";
-    const proxyProc = Bun.spawn([proxyNode, CODEX_WS_PROXY_PATH, wsUrl, "10000"], {
+    const proxyProc = Bun.spawn([proxyNode, CODEX_WS_PROXY_PATH, wsUrl, String(connectTimeoutMs), String(pongTimeoutMs)], {
       cwd: info.cwd,
       env: {
         ...process.env,
@@ -826,6 +1040,7 @@ export class CliLauncher {
       threadId: info.cliSessionId,
       sandbox: options.codexSandbox,
       recorder: this.recorder ?? undefined,
+      systemPrompt: options.systemPrompt,
       killProcess: async () => {
         try {
           proxyProc.kill("SIGTERM");
@@ -850,14 +1065,13 @@ export class CliLauncher {
         session.state = "exited";
         session.exitCode = 1;
         session.cliSessionId = undefined;
+        this.releaseCodexWsPort(session);
       }
       this.persistState();
     });
 
     // Notify the WsBridge to attach this adapter
-    if (this.onCodexAdapter) {
-      this.onCodexAdapter(sessionId, adapter);
-    }
+    companionBus.emit("backend:codex-adapter-created", { sessionId, adapter });
 
     info.state = "connected";
 
@@ -874,17 +1088,26 @@ export class CliLauncher {
       // pending promises and stop accepting messages immediately.
       adapter.handleTransportClose();
 
+      // Kill the other process too — if the proxy exits, kill Codex and vice versa.
+      // This prevents orphaned processes lingering after a partial crash.
+      // Note: The SIGTERM will cause the sibling to exit, which fires its own
+      // exit handler, but the `exitHandled` guard above ensures it's a no-op.
+      if (source === "proxy") {
+        try { proc.kill("SIGTERM"); } catch {}
+      } else {
+        try { proxyProc.kill("SIGTERM"); } catch {}
+      }
+
       const session = this.sessions.get(sessionId);
       if (session) {
         session.state = "exited";
         session.exitCode = exitCode;
+        this.releaseCodexWsPort(session);
       }
       this.processes.delete(sessionId);
       this.codexWsProxies.delete(sessionId);
       this.persistState();
-      for (const handler of this.exitHandlers) {
-        try { handler(sessionId, exitCode); } catch {}
-      }
+      companionBus.emit("session:exited", { sessionId, exitCode });
     };
 
     proxyProc.exited.then((exitCode) => {
@@ -970,7 +1193,8 @@ export class CliLauncher {
       const binaryDir = resolve(binary, "..");
       const siblingNode = join(binaryDir, "node");
       const enrichedPath = getEnrichedPath();
-      const spawnPath = [binaryDir, ...enrichedPath.split(":")].filter(Boolean).join(":");
+      const pathSep = process.platform === "win32" ? ";" : ":";
+      const spawnPath = [binaryDir, ...enrichedPath.split(pathSep)].filter(Boolean).join(pathSep);
 
       if (existsSync(siblingNode)) {
         let codexScript: string;
@@ -981,7 +1205,9 @@ export class CliLauncher {
         }
         spawnCmd = [siblingNode, codexScript, ...args];
       } else {
-        spawnCmd = [binary, ...args];
+        // On Windows, .cmd/.bat files cannot be spawned directly by Bun.spawn
+        const isCmdScript = process.platform === "win32" && (binary.endsWith(".cmd") || binary.endsWith(".bat"));
+        spawnCmd = isCmdScript ? ["cmd.exe", "/c", binary, ...args] : [binary, ...args];
       }
 
       spawnEnv = {
@@ -1026,6 +1252,7 @@ export class CliLauncher {
       threadId: info.cliSessionId,
       sandbox: options.codexSandbox,
       recorder: this.recorder ?? undefined,
+      systemPrompt: options.systemPrompt,
     });
 
     // Handle init errors — mark session as exited so UI shows failure.
@@ -1043,9 +1270,7 @@ export class CliLauncher {
     });
 
     // Notify the WsBridge to attach this adapter
-    if (this.onCodexAdapter) {
-      this.onCodexAdapter(sessionId, adapter);
-    }
+    companionBus.emit("backend:codex-adapter-created", { sessionId, adapter });
 
     // Mark as connected immediately (no WS handshake needed for stdio)
     info.state = "connected";
@@ -1060,9 +1285,7 @@ export class CliLauncher {
       }
       this.processes.delete(sessionId);
       this.persistState();
-      for (const handler of this.exitHandlers) {
-        try { handler(sessionId, exitCode); } catch {}
-      }
+      companionBus.emit("session:exited", { sessionId, exitCode });
     });
 
     this.persistState();
@@ -1122,6 +1345,7 @@ export class CliLauncher {
     if (session) {
       session.state = "exited";
       session.exitCode = -1;
+      this.releaseCodexWsPort(session);
     }
     this.processes.delete(sessionId);
     this.persistState();
@@ -1165,6 +1389,7 @@ export class CliLauncher {
    * Remove a session from the internal map (after kill or cleanup).
    */
   removeSession(sessionId: string) {
+    this.releaseCodexWsPort(this.sessions.get(sessionId));
     this.sessions.delete(sessionId);
     this.processes.delete(sessionId);
     this.codexWsProxies.delete(sessionId);
@@ -1179,6 +1404,7 @@ export class CliLauncher {
     let pruned = 0;
     for (const [id, session] of this.sessions) {
       if (session.state === "exited") {
+        this.releaseCodexWsPort(session);
         this.sessions.delete(id);
         this.sessionEnvs.delete(id);
         this.codexWsProxies.delete(id);

@@ -17,6 +17,8 @@ const mockApi = {
   regenerateAgentWebhookSecret: vi.fn(),
   listSkills: vi.fn(),
   listEnvs: vi.fn(),
+  getLinearOAuthStatus: vi.fn(),
+  listLinearOAuthConnections: vi.fn(),
 };
 
 vi.mock("../api.js", () => ({
@@ -33,6 +35,8 @@ vi.mock("../api.js", () => ({
       mockApi.regenerateAgentWebhookSecret(...args),
     listSkills: (...args: unknown[]) => mockApi.listSkills(...args),
     listEnvs: (...args: unknown[]) => mockApi.listEnvs(...args),
+    getLinearOAuthStatus: (...args: unknown[]) => mockApi.getLinearOAuthStatus(...args),
+    listLinearOAuthConnections: (...args: unknown[]) => mockApi.listLinearOAuthConnections(...args),
   },
 }));
 
@@ -89,6 +93,8 @@ beforeEach(() => {
   // Default: no skills or envs fetched
   mockApi.listSkills.mockResolvedValue([]);
   mockApi.listEnvs.mockResolvedValue([]);
+  mockApi.getLinearOAuthStatus.mockResolvedValue({ configured: false, hasClientId: false, hasClientSecret: false, hasWebhookSecret: false, hasAccessToken: false });
+  mockApi.listLinearOAuthConnections.mockResolvedValue({ connections: [] });
   window.location.hash = "#/agents";
   // Reset publicUrl mock to empty (no public URL configured)
   mockPublicUrl = "";
@@ -151,7 +157,7 @@ describe("AgentsPage", () => {
   // ── Agent Card Info ────────────────────────────────────────────────────────
 
   it("agent card shows correct info: name, description, and trigger badges", async () => {
-    // Validates that an agent card displays the name, description, enabled status,
+    // Validates that an agent card displays the name, description, status dot,
     // backend badge, and computed trigger badges (Manual is always shown, plus
     // Webhook/Schedule when enabled).
     const agent = makeAgent({
@@ -171,7 +177,9 @@ describe("AgentsPage", () => {
 
     await screen.findByText("Docs Writer");
     expect(screen.getByText("Writes documentation")).toBeInTheDocument();
-    expect(screen.getByText("Enabled")).toBeInTheDocument();
+    // Status dot shows enabled state via green color (not text badge)
+    const statusDot = screen.getByTestId("status-dot");
+    expect(statusDot.className).toContain("bg-cc-success");
 
     // Trigger badges: Manual is always present, Webhook when enabled,
     // and schedule is humanized from the cron expression
@@ -180,14 +188,16 @@ describe("AgentsPage", () => {
     expect(screen.getByText("Daily at 8:00 AM")).toBeInTheDocument();
   });
 
-  it("agent card shows Disabled badge when agent is not enabled", async () => {
-    // Agents can be toggled off. The card should reflect the disabled state.
+  it("agent card shows gray status dot when agent is not enabled", async () => {
+    // Agents can be toggled off. The card should reflect the disabled state
+    // via a gray status dot instead of the green one.
     const agent = makeAgent({ id: "a1", name: "Disabled Agent", enabled: false });
     mockApi.listAgents.mockResolvedValue([agent]);
     render(<AgentsPage route={defaultRoute} />);
 
     await screen.findByText("Disabled Agent");
-    expect(screen.getByText("Disabled")).toBeInTheDocument();
+    const statusDot = screen.getByTestId("status-dot");
+    expect(statusDot.className).toContain("bg-cc-muted");
   });
 
   it("agent card shows Codex backend badge for codex agents", async () => {
@@ -233,9 +243,9 @@ describe("AgentsPage", () => {
     expect(screen.getByText("1 run")).toBeInTheDocument();
   });
 
-  it("agent card shows Copy URL button when webhook is enabled", async () => {
-    // When webhook trigger is enabled, a "Copy URL" button appears next to
-    // the trigger badges, allowing users to copy the webhook URL.
+  it("agent card shows Copy Webhook URL in overflow menu when webhook is enabled", async () => {
+    // When webhook trigger is enabled, the overflow menu includes a
+    // "Copy Webhook URL" option for copying the webhook URL.
     const agent = makeAgent({
       id: "a1",
       name: "Webhook Agent",
@@ -248,7 +258,9 @@ describe("AgentsPage", () => {
     render(<AgentsPage route={defaultRoute} />);
 
     await screen.findByText("Webhook Agent");
-    expect(screen.getByText("Copy URL")).toBeInTheDocument();
+    // Open the overflow menu
+    fireEvent.click(screen.getByLabelText("More actions"));
+    expect(screen.getByText("Copy Webhook URL")).toBeInTheDocument();
   });
 
   // ── Interactive Behavior ───────────────────────────────────────────────────
@@ -296,15 +308,17 @@ describe("AgentsPage", () => {
     });
   });
 
-  it("clicking Edit on an agent card opens the editor in edit mode", async () => {
-    // Clicking the Edit button on an agent card should switch to the editor
-    // with "Edit Agent" heading and "Save" button.
+  it("clicking Edit in overflow menu opens the editor in edit mode", async () => {
+    // Clicking the Edit menu item in the overflow menu should switch to the
+    // editor with "Edit Agent" heading and "Save" button.
     const agent = makeAgent({ id: "a1", name: "Editable Agent", prompt: "Do something" });
     mockApi.listAgents.mockResolvedValue([agent]);
     render(<AgentsPage route={defaultRoute} />);
 
     await screen.findByText("Editable Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
 
     expect(screen.getByText("Edit Agent")).toBeInTheDocument();
     expect(screen.getByText("Save")).toBeInTheDocument();
@@ -350,8 +364,8 @@ describe("AgentsPage", () => {
   });
 
   it("delete button calls deleteAgent after confirmation", async () => {
-    // Clicking the Delete button should trigger a confirm dialog, then call
-    // the deleteAgent API and refresh the agent list.
+    // Clicking the Delete menu item in the overflow menu should trigger a
+    // confirm dialog, then call the deleteAgent API and refresh the agent list.
     const agent = makeAgent({ id: "a1", name: "Delete Me" });
     mockApi.listAgents.mockResolvedValue([agent]);
     mockApi.deleteAgent.mockResolvedValue({});
@@ -359,7 +373,9 @@ describe("AgentsPage", () => {
 
     render(<AgentsPage route={defaultRoute} />);
     await screen.findByText("Delete Me");
-    fireEvent.click(screen.getByTitle("Delete"));
+    // Open overflow menu, then click Delete
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Delete"));
 
     await waitFor(() => {
       expect(window.confirm).toHaveBeenCalledWith("Delete this agent?");
@@ -368,14 +384,16 @@ describe("AgentsPage", () => {
   });
 
   it("toggle button calls toggleAgent API", async () => {
-    // Clicking the toggle button (Enable/Disable) should call the API.
+    // Clicking the Disable/Enable menu item in the overflow menu should call the API.
     const agent = makeAgent({ id: "a1", name: "Toggle Me", enabled: true });
     mockApi.listAgents.mockResolvedValue([agent]);
     mockApi.toggleAgent.mockResolvedValue({});
 
     render(<AgentsPage route={defaultRoute} />);
     await screen.findByText("Toggle Me");
-    fireEvent.click(screen.getByTitle("Disable"));
+    // Open overflow menu, then click Disable
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Disable"));
 
     await waitFor(() => {
       expect(mockApi.toggleAgent).toHaveBeenCalledWith("a1");
@@ -480,7 +498,9 @@ describe("AgentsPage", () => {
     render(<AgentsPage route={defaultRoute} />);
 
     await screen.findByText("Branch Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
 
     // Branch pill should be visible since cwd is set
     expect(screen.getByText("branch")).toBeInTheDocument();
@@ -506,7 +526,9 @@ describe("AgentsPage", () => {
     render(<AgentsPage route={defaultRoute} />);
 
     await screen.findByText("Git Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
 
     // Branch input should be visible with the branch name pre-filled
     expect(screen.getByDisplayValue("feature/test")).toBeInTheDocument();
@@ -584,7 +606,9 @@ describe("AgentsPage", () => {
     render(<AgentsPage route={defaultRoute} />);
 
     await screen.findByText("Advanced Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
 
     // Advanced should be auto-expanded because agent has mcpServers
     expect(screen.getByText("MCP Servers")).toBeInTheDocument();
@@ -789,7 +813,9 @@ describe("AgentsPage", () => {
     render(<AgentsPage route={defaultRoute} />);
 
     await screen.findByText("Full Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
 
     // Verify basic fields
     expect(screen.getByDisplayValue("Full Agent")).toBeInTheDocument();
@@ -971,7 +997,9 @@ describe("AgentsPage", () => {
     await screen.findByText("Old Name");
 
     // Open edit form
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
     expect(screen.getByText("Save")).toBeInTheDocument();
 
     // Change the name
@@ -1144,7 +1172,9 @@ describe("AgentsPage", () => {
     render(<AgentsPage route={defaultRoute} />);
     await screen.findByText("Exportable Agent");
 
-    fireEvent.click(screen.getByTitle("Export JSON"));
+    // Open overflow menu, then click Export JSON
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Export JSON"));
 
     await waitFor(() => {
       expect(mockApi.exportAgent).toHaveBeenCalledWith("export-1");
@@ -1155,115 +1185,6 @@ describe("AgentsPage", () => {
       expect(createObjectURLMock).toHaveBeenCalled();
       expect(revokeObjectURLMock).toHaveBeenCalled();
     });
-  });
-
-  // ── Chat Trigger Section ──────────────────────────────────────────────────
-
-  it("chat trigger pill toggles chat platform config section", async () => {
-    // Clicking the Chat pill in the triggers section should show the chat
-    // platform configuration UI with an "Add platform" button.
-    mockApi.listAgents.mockResolvedValue([]);
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-
-    // Chat pill should be visible
-    expect(screen.getByText("Chat")).toBeInTheDocument();
-
-    // Chat config should NOT be visible yet
-    expect(screen.queryByText("Add platform")).not.toBeInTheDocument();
-
-    // Click Chat to enable it
-    fireEvent.click(screen.getByText("Chat"));
-
-    // Chat platform config should now be visible
-    expect(screen.getByText("Add platform")).toBeInTheDocument();
-    expect(
-      screen.getByText(/Configure which platforms this agent responds on/),
-    ).toBeInTheDocument();
-  });
-
-  it("chat trigger: add and remove platform entries", async () => {
-    // After enabling chat trigger, users can add platform entries with
-    // adapter selection, mention pattern, and multi-turn checkbox.
-    mockApi.listAgents.mockResolvedValue([]);
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Chat"));
-
-    // Add a platform
-    fireEvent.click(screen.getByText("Add platform"));
-
-    // A platform row should appear with a select defaulting to "Linear"
-    // and a mention pattern input, plus a multi-turn checkbox
-    expect(screen.getByText("Multi-turn")).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("Mention pattern (regex, optional)")).toBeInTheDocument();
-
-    // Remove the platform using the X button
-    fireEvent.click(screen.getByTitle("Remove platform"));
-
-    // Platform row should be gone
-    expect(screen.queryByText("Multi-turn")).not.toBeInTheDocument();
-  });
-
-  it("editing an agent with existing chat platforms renders them", async () => {
-    // When editing an agent that already has chat platforms configured,
-    // the chat trigger section should auto-show the platforms.
-    const agent = makeAgent({
-      id: "chat-1",
-      name: "Chat Agent",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [
-            { adapter: "github", mentionPattern: "@bot", autoSubscribe: false },
-          ],
-        },
-      },
-    });
-    mockApi.listAgents.mockResolvedValue([agent]);
-    render(<AgentsPage route={defaultRoute} />);
-
-    await screen.findByText("Chat Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
-
-    // Chat platform config should be visible with the existing platform data
-    expect(screen.getByDisplayValue("@bot")).toBeInTheDocument();
-    expect(screen.getByText("Multi-turn")).toBeInTheDocument();
-  });
-
-  it("agent card shows Chat trigger badge with platform count", async () => {
-    // When an agent has chat trigger enabled with platforms, the card should
-    // show a "Chat (N)" badge where N is the number of platforms.
-    const agent = makeAgent({
-      id: "chat-badge",
-      name: "Chat Badge Agent",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [
-            { adapter: "linear", autoSubscribe: true },
-            { adapter: "github", autoSubscribe: true },
-          ],
-        },
-      },
-    });
-    mockApi.listAgents.mockResolvedValue([agent]);
-    render(<AgentsPage route={defaultRoute} />);
-
-    await screen.findByText("Chat Badge Agent");
-    expect(screen.getByText("Chat (2)")).toBeInTheDocument();
   });
 
   // ── Error Handling ────────────────────────────────────────────────────────
@@ -1309,7 +1230,9 @@ describe("AgentsPage", () => {
     render(<AgentsPage route={defaultRoute} />);
     await screen.findByText("Fail Agent");
 
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
     fireEvent.click(screen.getByText("Save"));
 
     await waitFor(() => {
@@ -1513,7 +1436,9 @@ describe("AgentsPage", () => {
     render(<AgentsPage route={defaultRoute} />);
 
     await screen.findByText("One-Time Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
 
     // Should show datetime input, not cron presets
     const datetimeInput = document.querySelector('input[type="datetime-local"]');
@@ -1749,77 +1674,6 @@ describe("AgentsPage", () => {
     });
   });
 
-  // ── Chat Platform Adapter/Mention/Subscribe Editing ───────────────────────
-
-  it("chat platform: changing adapter, mention pattern, and auto-subscribe updates form", async () => {
-    // Tests the full interaction with a chat platform entry: changing
-    // the adapter select, typing a mention pattern, and toggling auto-subscribe.
-    mockApi.listAgents.mockResolvedValue([]);
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Chat"));
-    fireEvent.click(screen.getByText("Add platform"));
-
-    // Change adapter from Linear (default) to Slack
-    const adapterSelect = screen.getByDisplayValue("Linear");
-    fireEvent.change(adapterSelect, { target: { value: "slack" } });
-
-    // Type a mention pattern
-    const mentionInput = screen.getByPlaceholderText("Mention pattern (regex, optional)");
-    fireEvent.change(mentionInput, { target: { value: "@mybot" } });
-    expect(screen.getByDisplayValue("@mybot")).toBeInTheDocument();
-
-    // Toggle auto-subscribe (Multi-turn checkbox) - it's checked by default
-    const multiTurnCheckbox = screen.getByRole("checkbox");
-    expect(multiTurnCheckbox).toBeChecked();
-    fireEvent.click(multiTurnCheckbox);
-    expect(multiTurnCheckbox).not.toBeChecked();
-  });
-
-  // ── Save with chat platforms serialization ────────────────────────────────
-
-  it("save serializes chat platforms into payload when chat trigger is enabled", async () => {
-    // When saving an agent with chat trigger enabled and platforms configured,
-    // the payload should include the chat trigger config with platform entries.
-    mockApi.listAgents.mockResolvedValue([]);
-    mockApi.createAgent.mockResolvedValue(makeAgent({ id: "chat-save" }));
-
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-
-    // Fill required fields
-    fireEvent.change(screen.getByPlaceholderText("Agent name *"), {
-      target: { value: "Chat Saver" },
-    });
-    fireEvent.change(screen.getByPlaceholderText(/System prompt/), {
-      target: { value: "Chat prompt" },
-    });
-
-    // Enable chat trigger and add a platform
-    fireEvent.click(screen.getByText("Chat"));
-    fireEvent.click(screen.getByText("Add platform"));
-
-    // Submit
-    fireEvent.click(screen.getByText("Create"));
-
-    await waitFor(() => {
-      expect(mockApi.createAgent).toHaveBeenCalledTimes(1);
-    });
-
-    const payload = mockApi.createAgent.mock.calls[0][0];
-    expect(payload.triggers.chat.enabled).toBe(true);
-    expect(payload.triggers.chat.platforms).toHaveLength(1);
-    expect(payload.triggers.chat.platforms[0].adapter).toBe("linear");
-    expect(payload.triggers.chat.platforms[0].autoSubscribe).toBe(true);
-  });
 
   // ── Delete cancellation ───────────────────────────────────────────────────
 
@@ -1832,7 +1686,9 @@ describe("AgentsPage", () => {
 
     render(<AgentsPage route={defaultRoute} />);
     await screen.findByText("Keep Me");
-    fireEvent.click(screen.getByTitle("Delete"));
+    // Open overflow menu, then click Delete
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Delete"));
 
     await waitFor(() => {
       expect(window.confirm).toHaveBeenCalledWith("Delete this agent?");
@@ -1995,7 +1851,9 @@ describe("AgentsPage", () => {
 
     render(<AgentsPage route={defaultRoute} />);
     await screen.findByText("Env Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
 
     // Advanced should be auto-expanded because env vars are configured
     expect(screen.getByDisplayValue("API_KEY")).toBeInTheDocument();
@@ -2066,7 +1924,9 @@ describe("AgentsPage", () => {
 
     render(<AgentsPage route={defaultRoute} />);
     await screen.findByText("Tools Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Edit
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Edit"));
 
     // All tools should be visible as tags
     expect(screen.getByText("Read")).toBeInTheDocument();
@@ -2143,7 +2003,9 @@ describe("AgentsPage", () => {
     await screen.findByText("Copy Agent");
 
     // Click "Copy URL"
-    fireEvent.click(screen.getByText("Copy URL"));
+    // Open overflow menu, then click Copy Webhook URL
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Copy Webhook URL"));
 
     await waitFor(() => {
       expect(writeTextMock).toHaveBeenCalledTimes(1);
@@ -2284,32 +2146,6 @@ describe("AgentsPage", () => {
     expect(payload.mcpServers["test-mcp"].command).toBe("npx mcp");
   });
 
-  // ── Chat badge without platforms ──────────────────────────────────────────
-
-  it("agent card shows 'Chat' badge (no count) when chat has no platforms", async () => {
-    // When chat is enabled but no platforms are configured, the badge
-    // should just show "Chat" without a count.
-    const agent = makeAgent({
-      id: "chat-nocount",
-      name: "Chat No Platforms",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [],
-        },
-      },
-    });
-    mockApi.listAgents.mockResolvedValue([agent]);
-    render(<AgentsPage route={defaultRoute} />);
-
-    await screen.findByText("Chat No Platforms");
-    // Should show "Chat" without a number
-    const chatBadges = screen.getAllByText("Chat");
-    expect(chatBadges.length).toBeGreaterThan(0);
-  });
-
   // ── Every N hours cron ────────────────────────────────────────────────────
 
   it("agent card shows 'Every N hours' for multi-hour interval cron", async () => {
@@ -2363,340 +2199,6 @@ describe("AgentsPage", () => {
     expect(screen.getByText("Every hour")).toBeInTheDocument();
   });
 
-  // ── Chat Credential UI ──────────────────────────────────────────────────
-
-  it("chat credential inputs render for Linear adapter with correct aria-labels", async () => {
-    // When a Linear platform is added in the chat trigger section, the
-    // credential fields (API Key, OAuth Client ID/Secret, Webhook Secret,
-    // Bot Username) should render with accessible labels.
-    mockApi.listAgents.mockResolvedValue([]);
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Chat"));
-    fireEvent.click(screen.getByText("Add platform"));
-
-    // Linear credential section should be visible
-    expect(screen.getByText("Linear Credentials")).toBeInTheDocument();
-
-    // All credential inputs should have accessible labels
-    expect(screen.getByLabelText("Linear API Key")).toBeInTheDocument();
-    expect(screen.getByLabelText("Linear OAuth Client ID")).toBeInTheDocument();
-    expect(screen.getByLabelText("Linear OAuth Client Secret")).toBeInTheDocument();
-    expect(screen.getByLabelText("Linear Webhook Secret")).toBeInTheDocument();
-    expect(screen.getByLabelText("Linear Bot Username")).toBeInTheDocument();
-  });
-
-  it("chat credential inputs render for GitHub adapter with correct aria-labels", async () => {
-    // When the adapter is switched to GitHub, the GitHub-specific credential
-    // fields should render instead of Linear fields.
-    mockApi.listAgents.mockResolvedValue([]);
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Chat"));
-    fireEvent.click(screen.getByText("Add platform"));
-
-    // Switch adapter to GitHub
-    const select = screen.getByDisplayValue("Linear");
-    fireEvent.change(select, { target: { value: "github" } });
-
-    // GitHub credential section should be visible
-    expect(screen.getByText("GitHub Credentials")).toBeInTheDocument();
-    expect(screen.queryByText("Linear Credentials")).not.toBeInTheDocument();
-
-    // All GitHub credential inputs should have accessible labels
-    expect(screen.getByLabelText("GitHub Personal Access Token")).toBeInTheDocument();
-    expect(screen.getByLabelText("GitHub App ID")).toBeInTheDocument();
-    expect(screen.getByLabelText("GitHub App Private Key")).toBeInTheDocument();
-    expect(screen.getByLabelText("GitHub Webhook Secret")).toBeInTheDocument();
-    expect(screen.getByLabelText("GitHub Bot Username")).toBeInTheDocument();
-  });
-
-  it("Slack/Discord adapters show 'coming soon' message instead of credential fields", async () => {
-    // Slack and Discord adapters don't have credential inputs yet, so they
-    // should show a placeholder message instead.
-    mockApi.listAgents.mockResolvedValue([]);
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Chat"));
-    fireEvent.click(screen.getByText("Add platform"));
-
-    // Switch to Slack
-    const select = screen.getByDisplayValue("Linear");
-    fireEvent.change(select, { target: { value: "slack" } });
-    expect(screen.getByText("Slack adapter coming soon.")).toBeInTheDocument();
-    expect(screen.queryByText("Linear Credentials")).not.toBeInTheDocument();
-  });
-
-  it("editing agent with existing credentials populates credential fields", async () => {
-    // When editing an agent that has per-binding credentials (masked in API
-    // response), the credential fields should be pre-populated with the
-    // masked values from the API.
-    const agent = makeAgent({
-      id: "cred-agent",
-      name: "Credentialed Agent",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [
-            {
-              adapter: "linear",
-              autoSubscribe: true,
-              credentials: {
-                apiKey: "lin_****",
-                webhookSecret: "whs_abc123",
-                userName: "my-bot",
-              },
-            },
-          ],
-        },
-      },
-    });
-    mockApi.listAgents.mockResolvedValue([agent]);
-    render(<AgentsPage route={defaultRoute} />);
-
-    await screen.findByText("Credentialed Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
-
-    // Masked API key should show placeholder text and the field should have
-    // the masked value loaded
-    const apiKeyInput = screen.getByLabelText("Linear API Key") as HTMLInputElement;
-    expect(apiKeyInput.value).toBe("lin_****");
-
-    // Webhook secret should be editable so users can paste their platform's signing secret
-    const webhookInput = screen.getByLabelText("Linear Webhook Secret") as HTMLInputElement;
-    expect(webhookInput.value).toBe("whs_abc123");
-    expect(webhookInput.readOnly).toBeFalsy();
-
-    // Bot username should be pre-filled
-    const userInput = screen.getByLabelText("Linear Bot Username") as HTMLInputElement;
-    expect(userInput.value).toBe("my-bot");
-  });
-
-  it("webhook secret field is editable and updates form state for Linear", async () => {
-    // Linear generates its own signing secret, so users need to paste it
-    // into Companion. The field must be editable, not read-only.
-    const agent = makeAgent({
-      id: "ws-edit",
-      name: "WS Edit Agent",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [
-            {
-              adapter: "linear",
-              autoSubscribe: true,
-              credentials: {
-                apiKey: "lin_****",
-                webhookSecret: "old_secret",
-                userName: "bot",
-              },
-            },
-          ],
-        },
-      },
-    });
-    mockApi.listAgents.mockResolvedValue([agent]);
-    render(<AgentsPage route={defaultRoute} />);
-
-    await screen.findByText("WS Edit Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
-
-    const webhookInput = screen.getByLabelText("Linear Webhook Secret") as HTMLInputElement;
-    expect(webhookInput.value).toBe("old_secret");
-
-    // Simulate pasting a new signing secret from Linear
-    fireEvent.change(webhookInput, { target: { value: "new_linear_signing_secret" } });
-    expect(webhookInput.value).toBe("new_linear_signing_secret");
-  });
-
-  it("webhook secret field is editable for GitHub platform", async () => {
-    // GitHub also generates its own webhook secret, so the field must be editable.
-    const agent = makeAgent({
-      id: "gh-ws-edit",
-      name: "GH WS Edit Agent",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [
-            {
-              adapter: "github",
-              autoSubscribe: false,
-              credentials: {
-                token: "ghp_****",
-                webhookSecret: "gh_old_secret",
-                userName: "bot",
-              },
-            },
-          ],
-        },
-      },
-    });
-    mockApi.listAgents.mockResolvedValue([agent]);
-    render(<AgentsPage route={defaultRoute} />);
-
-    await screen.findByText("GH WS Edit Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
-
-    const webhookInput = screen.getByLabelText("GitHub Webhook Secret") as HTMLInputElement;
-    expect(webhookInput.value).toBe("gh_old_secret");
-    expect(webhookInput.readOnly).toBeFalsy();
-
-    fireEvent.change(webhookInput, { target: { value: "new_gh_secret" } });
-    expect(webhookInput.value).toBe("new_gh_secret");
-  });
-
-  it("shows placeholder instead of masked dots for configured webhook secret", async () => {
-    // When the backend returns a masked webhookSecret (e.g. "whs_****"), the input
-    // should render an empty value so the placeholder text is visible instead of
-    // opaque password dots.
-    const agent = makeAgent({
-      id: "masked-ws",
-      name: "Masked WS Agent",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [
-            {
-              adapter: "linear",
-              autoSubscribe: true,
-              credentials: {
-                apiKey: "lin_****",
-                webhookSecret: "whs_****",
-                userName: "bot",
-              },
-            },
-          ],
-        },
-      },
-    });
-    mockApi.listAgents.mockResolvedValue([agent]);
-    render(<AgentsPage route={defaultRoute} />);
-
-    await screen.findByText("Masked WS Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
-
-    const webhookInput = screen.getByLabelText("Linear Webhook Secret") as HTMLInputElement;
-    // Value should be empty so the placeholder is visible
-    expect(webhookInput.value).toBe("");
-    expect(webhookInput.placeholder).toContain("Configured");
-  });
-
-  it("webhook URL is displayed for saved agents with credentials", async () => {
-    // When editing an existing agent that has chat credentials configured,
-    // the webhook URL should be displayed with a copy button.
-    const agent = makeAgent({
-      id: "url-agent",
-      name: "URL Agent",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [
-            {
-              adapter: "linear",
-              autoSubscribe: true,
-              credentials: {
-                apiKey: "lin_****",
-                webhookSecret: "whs_test",
-              },
-            },
-          ],
-        },
-      },
-    });
-    mockApi.listAgents.mockResolvedValue([agent]);
-    render(<AgentsPage route={defaultRoute} />);
-
-    await screen.findByText("URL Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
-
-    // Webhook URL should be visible since agent is saved and has credentials
-    expect(screen.getByText("Webhook URL:")).toBeInTheDocument();
-    expect(screen.getByText(/\/api\/agents\/url-agent\/chat\/webhooks\/linear/)).toBeInTheDocument();
-  });
-
-  it("agent card shows chat webhook URL copy buttons for platforms with credentials", async () => {
-    // When an agent has chat platforms with credentials, the agent card
-    // should show per-platform copy-URL buttons.
-    const agent = makeAgent({
-      id: "card-cred",
-      name: "Card Cred Agent",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [
-            {
-              adapter: "linear",
-              autoSubscribe: true,
-              credentials: {
-                apiKey: "lin_****",
-                webhookSecret: "whs_test",
-              },
-            },
-          ],
-        },
-      },
-    });
-    mockApi.listAgents.mockResolvedValue([agent]);
-    render(<AgentsPage route={defaultRoute} />);
-
-    await screen.findByText("Card Cred Agent");
-    // The card should have a platform-specific URL copy button
-    expect(screen.getByTitle("Copy linear chat webhook URL")).toBeInTheDocument();
-  });
-
-  it("passes axe accessibility checks in editor with chat credentials visible", async () => {
-    // The editor with chat platform credentials expanded should pass
-    // accessibility checks — credential inputs have aria-labels.
-    const { axe } = await import("vitest-axe");
-    mockApi.listAgents.mockResolvedValue([]);
-    const { container } = render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Chat"));
-    fireEvent.click(screen.getByText("Add platform"));
-
-    // Verify credential section is visible before running axe
-    expect(screen.getByText("Linear Credentials")).toBeInTheDocument();
-
-    const axeRules = {
-      rules: {
-        label: { enabled: false },
-        "heading-order": { enabled: false },
-        "button-name": { enabled: false },
-        "select-name": { enabled: false },
-      },
-    };
-    const results = await axe(container, axeRules);
-    expect(results).toHaveNoViolations();
-  });
-
   // ── Public URL & Webhook URL Tests ────────────────────────────────────────
 
   it("webhook URL uses publicUrl from store when set", async () => {
@@ -2724,7 +2226,9 @@ describe("AgentsPage", () => {
     await screen.findByText("Public URL Agent");
 
     // Click "Copy URL" on the agent card
-    fireEvent.click(screen.getByText("Copy URL"));
+    // Open overflow menu, then click Copy Webhook URL
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Copy Webhook URL"));
 
     await waitFor(() => {
       expect(writeTextMock).toHaveBeenCalledTimes(1);
@@ -2758,7 +2262,9 @@ describe("AgentsPage", () => {
     render(<AgentsPage route={defaultRoute} />);
     await screen.findByText("Fallback Agent");
 
-    fireEvent.click(screen.getByText("Copy URL"));
+    // Open overflow menu, then click Copy Webhook URL
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Copy Webhook URL"));
 
     await waitFor(() => {
       expect(writeTextMock).toHaveBeenCalledTimes(1);
@@ -2770,104 +2276,174 @@ describe("AgentsPage", () => {
     expect(copiedUrl).toContain("/api/agents/fallback-agent/webhook/fb-secret");
   });
 
-  // ── Linear Chat Setup Guide Tests ─────────────────────────────────────────
+  // ── Filter Tabs ──────────────────────────────────────────────────────────
 
-  it("Linear setup guide renders when adding a Linear chat platform", async () => {
-    // When a Linear platform is added in the chat trigger section, a
-    // collapsible "Linear Chat Setup Guide" should appear with step-by-step
-    // instructions for configuring the Linear integration.
-    mockApi.listAgents.mockResolvedValue([]);
+  it("filter tabs appear when agents exist", async () => {
+    // When agents are loaded, filter tabs (All, Linear, Scheduled, Webhook)
+    // should appear with counts.
+    const agents = [
+      makeAgent({ id: "a1", name: "Agent 1" }),
+      makeAgent({
+        id: "a2",
+        name: "Linear Agent",
+        triggers: { linear: { enabled: true, oauthClientId: "c1", hasAccessToken: true } },
+      }),
+    ];
+    mockApi.listAgents.mockResolvedValue(agents);
     render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
 
-    fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Chat"));
-    fireEvent.click(screen.getByText("Add platform"));
+    await screen.findByText("Agent 1");
+    const tabs = screen.getByTestId("filter-tabs");
+    expect(tabs).toBeInTheDocument();
 
-    // The Linear Chat Setup Guide should be visible
-    expect(screen.getByText("Linear Chat Setup Guide")).toBeInTheDocument();
+    // Tab labels with counts
+    expect(screen.getByText("All (2)")).toBeInTheDocument();
+    expect(screen.getByText("Linear (1)")).toBeInTheDocument();
   });
 
-  it("HTTPS warning shown when webhook URL does not start with https://", async () => {
-    // When editing a saved Linear agent and the generated webhook URL
-    // does not start with "https://", an amber warning about HTTPS
-    // requirements should appear below the URL.
-    mockPublicUrl = "http://not-secure.example.com";
+  it("filter tabs do not appear when no agents exist", async () => {
+    // When there are no agents, filter tabs should not be rendered.
+    mockApi.listAgents.mockResolvedValue([]);
+    render(<AgentsPage route={defaultRoute} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("No agents yet")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("filter-tabs")).not.toBeInTheDocument();
+  });
+
+  it("clicking Linear filter shows only Linear agents", async () => {
+    // When the Linear filter tab is clicked, only agents with linear
+    // triggers should be displayed.
+    const agents = [
+      makeAgent({ id: "a1", name: "Regular Agent" }),
+      makeAgent({
+        id: "a2",
+        name: "My Linear Bot",
+        triggers: { linear: { enabled: true, oauthClientId: "c1", hasAccessToken: true } },
+      }),
+    ];
+    mockApi.listAgents.mockResolvedValue(agents);
+    render(<AgentsPage route={defaultRoute} />);
+
+    await screen.findByText("Regular Agent");
+    expect(screen.getByText("My Linear Bot")).toBeInTheDocument();
+
+    // Click the "Linear" filter tab
+    fireEvent.click(screen.getByText("Linear (1)"));
+
+    // Only the Linear-triggered agent should be visible
+    expect(screen.getByText("My Linear Bot")).toBeInTheDocument();
+    expect(screen.queryByText("Regular Agent")).not.toBeInTheDocument();
+  });
+
+  it("Linear agents appear only once (no duplication)", async () => {
+    // Previous bug: Linear agents appeared both in LinearAgentSection and
+    // in the regular agent list. With the unified design, each agent
+    // should appear exactly once.
+    const agents = [
+      makeAgent({
+        id: "linear-1",
+        name: "My Linear Agent",
+        triggers: { linear: { enabled: true, oauthClientId: "c1", hasAccessToken: true } },
+      }),
+    ];
+    mockApi.listAgents.mockResolvedValue(agents);
+    render(<AgentsPage route={defaultRoute} />);
+
+    await screen.findByText("My Linear Agent");
+    // Should appear exactly once
+    const matches = screen.getAllByText("My Linear Agent");
+    expect(matches).toHaveLength(1);
+  });
+
+  it("filter empty state shows setup CTA for Linear filter", async () => {
+    // When the Linear filter is active and there are no Linear agents,
+    // a specific empty state with "Setup Linear Agent" CTA should appear.
+    const agents = [
+      makeAgent({ id: "a1", name: "Regular Agent" }),
+    ];
+    mockApi.listAgents.mockResolvedValue(agents);
+    render(<AgentsPage route={defaultRoute} />);
+
+    await screen.findByText("Regular Agent");
+
+    // Click the "Linear" filter tab
+    fireEvent.click(screen.getByText("Linear (0)"));
+
+    // Empty state for Linear filter
+    expect(screen.getByText("No Linear agents")).toBeInTheDocument();
+    expect(screen.getByText("Setup Linear Agent")).toBeInTheDocument();
+  });
+
+  it("filter empty state shows message for Scheduled filter", async () => {
+    // When the Scheduled filter is active and there are no scheduled agents,
+    // a message should appear.
+    const agents = [
+      makeAgent({ id: "a1", name: "Regular Agent" }),
+    ];
+    mockApi.listAgents.mockResolvedValue(agents);
+    render(<AgentsPage route={defaultRoute} />);
+
+    await screen.findByText("Regular Agent");
+
+    // Click the "Scheduled" filter tab
+    fireEvent.click(screen.getByText("Scheduled (0)"));
+
+    expect(screen.getByText("No scheduled agents")).toBeInTheDocument();
+  });
+
+  it("clicking All filter tab shows all agents again", async () => {
+    // After filtering, clicking "All" should show all agents.
+    const agents = [
+      makeAgent({ id: "a1", name: "Agent One" }),
+      makeAgent({
+        id: "a2",
+        name: "My Linear Bot",
+        triggers: { linear: { enabled: true, oauthClientId: "c1", hasAccessToken: true } },
+      }),
+    ];
+    mockApi.listAgents.mockResolvedValue(agents);
+    render(<AgentsPage route={defaultRoute} />);
+
+    await screen.findByText("Agent One");
+
+    // Filter to Linear only
+    fireEvent.click(screen.getByText("Linear (1)"));
+    expect(screen.queryByText("Agent One")).not.toBeInTheDocument();
+
+    // Switch back to All
+    fireEvent.click(screen.getByText("All (2)"));
+    expect(screen.getByText("Agent One")).toBeInTheDocument();
+    expect(screen.getByText("My Linear Bot")).toBeInTheDocument();
+  });
+
+  // ── Delete confirmation for Linear agents ─────────────────────────────────
+
+  it("delete confirmation uses Linear-specific message for Linear agents", async () => {
+    // When deleting a Linear agent, the confirmation message should
+    // mention that the agent will no longer respond to @mentions.
     const agent = makeAgent({
-      id: "https-warn",
-      name: "HTTPS Warn Agent",
-      triggers: {
-        webhook: { enabled: false, secret: "" },
-        schedule: { enabled: false, expression: "0 8 * * *", recurring: true },
-        chat: {
-          enabled: true,
-          platforms: [
-            {
-              adapter: "linear",
-              autoSubscribe: true,
-              credentials: {
-                apiKey: "lin_test",
-                webhookSecret: "whs_test",
-              },
-            },
-          ],
-        },
-      },
+      id: "linear-del",
+      name: "Linear Delete",
+      triggers: { linear: { enabled: true, oauthClientId: "c1", hasAccessToken: true } },
     });
     mockApi.listAgents.mockResolvedValue([agent]);
+    mockApi.deleteAgent.mockResolvedValue({});
+    window.confirm = vi.fn().mockReturnValue(true);
+
     render(<AgentsPage route={defaultRoute} />);
+    await screen.findByText("Linear Delete");
 
-    await screen.findByText("HTTPS Warn Agent");
-    fireEvent.click(screen.getByTitle("Edit"));
+    // Open overflow menu, then click Delete
+    fireEvent.click(screen.getByLabelText("More actions"));
+    fireEvent.click(screen.getByText("Delete"));
 
-    // The HTTPS warning should be visible because the URL starts with http://
     await waitFor(() => {
-      expect(screen.getByText(/Linear requires HTTPS/)).toBeInTheDocument();
+      expect(window.confirm).toHaveBeenCalledWith(
+        "Delete this Linear agent? It will no longer respond to @mentions in Linear.",
+      );
     });
   });
 
-  it("public URL warning shown inside Linear setup guide when publicUrl is empty", async () => {
-    // When no publicUrl is configured (empty string), the Linear Chat Setup
-    // Guide should show a warning that the webhook URL uses the browser
-    // address which may not be reachable from Linear.
-    mockPublicUrl = "";
-    mockApi.listAgents.mockResolvedValue([]);
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Chat"));
-    fireEvent.click(screen.getByText("Add platform"));
-
-    // The setup guide should be visible
-    expect(screen.getByText("Linear Chat Setup Guide")).toBeInTheDocument();
-
-    // The public URL warning within the setup guide should be visible
-    expect(screen.getByText(/No public URL configured/)).toBeInTheDocument();
-  });
-
-  it("public URL warning hidden inside Linear setup guide when publicUrl is set", async () => {
-    // When a publicUrl IS configured, the "No public URL configured" warning
-    // should NOT appear inside the Linear Chat Setup Guide.
-    mockPublicUrl = "https://public.example.com";
-    mockApi.listAgents.mockResolvedValue([]);
-    render(<AgentsPage route={defaultRoute} />);
-    await waitFor(() => {
-      expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
-    });
-
-    fireEvent.click(screen.getByText("+ New Agent"));
-    fireEvent.click(screen.getByText("Chat"));
-    fireEvent.click(screen.getByText("Add platform"));
-
-    // The setup guide should be visible
-    expect(screen.getByText("Linear Chat Setup Guide")).toBeInTheDocument();
-
-    // The public URL warning should NOT be present
-    expect(screen.queryByText(/No public URL configured/)).not.toBeInTheDocument();
-  });
 });

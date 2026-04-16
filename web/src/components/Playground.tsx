@@ -18,12 +18,14 @@ import { api } from "../api.js";
 import type {
   PermissionRequest,
   ChatMessage,
-  ContentBlock,
   SessionState,
   McpServerDetail,
 } from "../types.js";
 import { AiValidationBadge } from "./AiValidationBadge.js";
 import { AiValidationToggle } from "./AiValidationToggle.js";
+import { ToolExecutionBar } from "./ToolExecutionBar.js";
+import { ToolTurnSummary } from "./ToolTurnSummary.js";
+import type { ToolActivityEntry } from "../store/tasks-slice.js";
 import type { TaskItem } from "../types.js";
 import type {
   UpdateInfo,
@@ -40,6 +42,7 @@ import { LinearLogo } from "./LinearLogo.js";
 import { SessionCreationProgress } from "./SessionCreationProgress.js";
 import { SessionLaunchOverlay } from "./SessionLaunchOverlay.js";
 import { PlaygroundUpdateOverlay } from "./UpdateOverlay.js";
+import { PlaygroundDockerUpdateDialog } from "./DockerUpdateDialog.js";
 import { SessionItem } from "./SessionItem.js";
 import type { CreationProgressEvent } from "../types.js";
 import type { SessionItem as SessionItemType } from "../utils/project-grouping.js";
@@ -214,6 +217,15 @@ const PERM_AI_DANGEROUS = mockPermission({
   },
 });
 
+// Enriched permission fields (display_name, title, decision_reason) — v2.1.81+
+const PERM_ENRICHED = mockPermission({
+  tool_name: "Edit",
+  display_name: "File Editor",
+  title: "Edit a TypeScript file",
+  decision_reason: "File is outside trusted directories",
+  input: { file_path: "/workspace/src/app.ts", new_string: "const x = 1;", old_string: "const x = 0;" },
+});
+
 const PERM_ASK_SINGLE = mockPermission({
   tool_name: "AskUserQuestion",
   input: {
@@ -369,6 +381,15 @@ const MSG_ASSISTANT_STREAMING: ChatMessage = {
   timestamp: Date.now() - 35000,
 };
 
+const MSG_ASSISTANT_STREAMING_THINKING: ChatMessage = {
+  id: "msg-streaming-thinking",
+  role: "assistant",
+  content: "Let me analyze the codebase to understand the authentication architecture. I should look at the middleware, session store, and token validation...",
+  isStreaming: true,
+  streamingPhase: "thinking",
+  timestamp: Date.now() - 34000,
+};
+
 const MSG_SYSTEM: ChatMessage = {
   id: "msg-6",
   role: "system",
@@ -460,6 +481,21 @@ const MOCK_SUBAGENT_TOOL_ITEMS = [
     name: "Grep",
     input: { pattern: "session.userId", path: "src/" },
   },
+];
+
+// Tool Activity mock data
+const MOCK_TOOL_ACTIVITY_OK: ToolActivityEntry[] = [
+  { toolUseId: "ta-1", toolName: "Bash", preview: "bun run test", startedAt: Date.now() - 7200, completedAt: Date.now() - 400, elapsedSeconds: 6.8, isError: false },
+  { toolUseId: "ta-2", toolName: "Read", preview: "src/ws.ts", startedAt: Date.now() - 500, completedAt: Date.now() - 400, elapsedSeconds: 0.1, isError: false },
+  { toolUseId: "ta-3", toolName: "Edit", preview: "src/ws.ts", startedAt: Date.now() - 400, completedAt: Date.now() - 100, elapsedSeconds: 1.4, isError: false },
+];
+const MOCK_TOOL_ACTIVITY_ERROR: ToolActivityEntry[] = [
+  { toolUseId: "ta-4", toolName: "Bash", preview: "npm run build", startedAt: Date.now() - 5000, completedAt: Date.now() - 1000, elapsedSeconds: 4.0, isError: true },
+  { toolUseId: "ta-5", toolName: "Read", preview: "package.json", startedAt: Date.now() - 900, completedAt: Date.now() - 800, elapsedSeconds: 0.1, isError: false },
+];
+const MOCK_TOOL_ACTIVITY_RUNNING: ToolActivityEntry[] = [
+  { toolUseId: "ta-6", toolName: "Bash", preview: "bun run test", startedAt: Date.now() - 3000, elapsedSeconds: 3.0, isError: false },
+  { toolUseId: "ta-7", toolName: "Grep", preview: "TODO", startedAt: Date.now() - 1000, completedAt: Date.now() - 500, elapsedSeconds: 0.5, isError: false },
 ];
 
 // GitHub PR mock data
@@ -782,7 +818,7 @@ export function Playground() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-cc-bg text-cc-fg font-sans-ui">
+    <div className="fixed inset-0 bg-cc-bg text-cc-fg font-sans-ui overflow-y-auto">
       {/* Header */}
       <header className="sticky top-0 z-50 bg-cc-sidebar border-b border-cc-border">
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
@@ -855,6 +891,10 @@ export function Playground() {
             />
             <PermissionBanner
               permission={PERM_DYNAMIC}
+              sessionId={MOCK_SESSION_ID}
+            />
+            <PermissionBanner
+              permission={PERM_ENRICHED}
               sessionId={MOCK_SESSION_ID}
             />
           </div>
@@ -937,8 +977,8 @@ export function Playground() {
             <Card label="Per-session toggle (enabled)">
               <PlaygroundAiValidationToggle enabled={true} />
             </Card>
-            <Card label="Auto-resolved badges">
-              <div className="border border-cc-border rounded-xl overflow-hidden bg-cc-card divide-y divide-cc-border">
+            <Card label="Auto-resolved badge (with dismiss)">
+              <div className="border border-cc-border rounded-xl overflow-hidden bg-cc-card">
                 <AiValidationBadge
                   entry={{
                     request: mockPermission({
@@ -949,7 +989,12 @@ export function Playground() {
                     reason: "Read is a read-only tool",
                     timestamp: Date.now(),
                   }}
+                  onDismiss={() => alert("Dismissed!")}
                 />
+              </div>
+            </Card>
+            <Card label="Auto-resolved badge (denied, with dismiss)">
+              <div className="border border-cc-border rounded-xl overflow-hidden bg-cc-card">
                 <AiValidationBadge
                   entry={{
                     request: mockPermission({
@@ -960,7 +1005,12 @@ export function Playground() {
                     reason: "Recursive delete of root directory",
                     timestamp: Date.now(),
                   }}
+                  onDismiss={() => alert("Dismissed!")}
                 />
+              </div>
+            </Card>
+            <Card label="Auto-resolved badge (no dismiss)">
+              <div className="border border-cc-border rounded-xl overflow-hidden bg-cc-card">
                 <AiValidationBadge
                   entry={{
                     request: mockPermission({
@@ -997,6 +1047,9 @@ export function Playground() {
             </Card>
             <Card label="Assistant message (streaming)">
               <MessageBubble message={MSG_ASSISTANT_STREAMING} />
+            </Card>
+            <Card label="Assistant message (streaming thinking phase)">
+              <MessageBubble message={MSG_ASSISTANT_STREAMING_THINKING} />
             </Card>
             <Card label="Assistant message (thinking block)">
               <MessageBubble message={MSG_ASSISTANT_THINKING} />
@@ -1228,6 +1281,54 @@ export function Playground() {
                   role: "system",
                   content:
                     "Read 4 files, searched 12 matches across 3 directories",
+                  timestamp: Date.now(),
+                }}
+              />
+            </Card>
+          </div>
+        </Section>
+
+        <Section
+          title="Interesting Events"
+          description="Event summaries that are worth surfacing in the chat feed"
+        >
+          <div className="space-y-4 max-w-3xl">
+            <Card label="Context compacted">
+              <MessageBubble
+                message={{
+                  id: "event-compact",
+                  role: "system",
+                  content: "Context compacted (auto, pre-tokens: 182344).",
+                  timestamp: Date.now(),
+                }}
+              />
+            </Card>
+            <Card label="Background task completed">
+              <MessageBubble
+                message={{
+                  id: "event-task",
+                  role: "system",
+                  content: "Task completed: a1b2c3d. Build finished successfully.",
+                  timestamp: Date.now(),
+                }}
+              />
+            </Card>
+            <Card label="Files persisted">
+              <MessageBubble
+                message={{
+                  id: "event-files",
+                  role: "system",
+                  content: "Persisted 3 file(s).",
+                  timestamp: Date.now(),
+                }}
+              />
+            </Card>
+            <Card label="Hook outcome">
+              <MessageBubble
+                message={{
+                  id: "event-hook",
+                  role: "system",
+                  content: "Hook success: lint (post_tool_use) (exit 0).",
                   timestamp: Date.now(),
                 }}
               />
@@ -1742,7 +1843,35 @@ export function Playground() {
           description="Connection and session status banners"
         >
           <div className="space-y-3 max-w-3xl">
-            <Card label="Disconnected warning">
+            <Card label="CLI Disconnected">
+              <div className="px-4 py-2 bg-cc-warning/10 border border-cc-warning/20 rounded-lg text-center flex items-center justify-center gap-3">
+                <span className="text-xs text-cc-warning font-medium">
+                  CLI disconnected
+                </span>
+                <span className="text-xs font-medium px-3 py-1.5 rounded-md bg-cc-warning/20 text-cc-warning cursor-pointer">
+                  Reconnect
+                </span>
+              </div>
+            </Card>
+            <Card label="CLI Reconnecting">
+              <div className="px-4 py-2 bg-cc-warning/10 border border-cc-warning/20 rounded-lg text-center flex items-center justify-center gap-3">
+                <span className="w-3 h-3 rounded-full border-2 border-cc-warning/30 border-t-cc-warning animate-spin" />
+                <span className="text-xs text-cc-warning font-medium">
+                  Reconnecting&hellip;
+                </span>
+              </div>
+            </Card>
+            <Card label="Reconnection Error">
+              <div className="px-4 py-2 bg-cc-warning/10 border border-cc-warning/20 rounded-lg text-center flex items-center justify-center gap-3">
+                <span className="text-xs text-cc-error font-medium">
+                  Reconnection failed
+                </span>
+                <span className="text-xs font-medium px-3 py-1.5 rounded-md bg-cc-error/15 text-cc-error cursor-pointer">
+                  Retry
+                </span>
+              </div>
+            </Card>
+            <Card label="WS Disconnected">
               <div className="px-4 py-2 bg-cc-warning/10 border border-cc-warning/20 rounded-lg text-center">
                 <span className="text-xs text-cc-warning font-medium">
                   Reconnecting to session...
@@ -2061,6 +2190,43 @@ export function Playground() {
           </div>
         </Section>
 
+        {/* ─── Prompt Suggestions ──────────────────────────────── */}
+        <Section
+          title="Prompt Suggestions"
+          description="Suggestion chips from the CLI for predicted next user prompts"
+        >
+          <div className="max-w-3xl space-y-4">
+            <Card label="Suggestion chips (idle state)">
+              <div className="flex flex-wrap gap-2 p-3">
+                {["Fix the failing test", "Add error handling", "Refactor to use async/await"].map((suggestion) => (
+                  <button
+                    key={suggestion}
+                    type="button"
+                    className="px-3 py-1.5 text-sm rounded-full border border-cc-border bg-cc-card text-cc-fg hover:bg-cc-hover transition-colors"
+                    onClick={() => alert(`Selected: ${suggestion}`)}
+                  >
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            </Card>
+            <Card label="Suggestion chips (after completion)">
+              <div className="flex flex-wrap gap-2 p-3">
+                {["Run the test suite", "Deploy to staging", "Update the README"].map((suggestion) => (
+                  <button
+                    key={suggestion}
+                    type="button"
+                    className="px-3 py-1.5 text-sm rounded-full border border-cc-primary/30 bg-cc-primary/5 text-cc-primary hover:bg-cc-primary/10 transition-colors"
+                    onClick={() => alert(`Selected: ${suggestion}`)}
+                  >
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            </Card>
+          </div>
+        </Section>
+
         {/* ─── Streaming Indicator ──────────────────────────────── */}
         <Section
           title="Streaming Indicator"
@@ -2150,6 +2316,18 @@ export function Playground() {
                 receiverCount={2}
                 items={MOCK_SUBAGENT_TOOL_ITEMS}
               />
+            </Card>
+          </div>
+        </Section>
+
+        {/* ─── Activity Tray ──────────────────────────────── */}
+        <Section
+          title="Activity Tray"
+          description="Floating pill + expandable panel showing background agents and tasks — appears bottom-right of the chat area"
+        >
+          <div className="space-y-4 max-w-3xl">
+            <Card label="With running agents + tasks (interactive)">
+              <PlaygroundActivityTray />
             </Card>
           </div>
         </Section>
@@ -2525,6 +2703,26 @@ export function Playground() {
             </Card>
           </div>
         </Section>
+        {/* ─── Docker Update Dialog ─────────────────────────── */}
+        <Section
+          title="Docker Update Dialog"
+          description="Post-update dialog asking whether to also update the sandbox Docker image"
+        >
+          <div className="space-y-4">
+            <Card label="Prompt phase">
+              <PlaygroundDockerUpdateDialog phase="prompt" />
+            </Card>
+            <Card label="Pulling phase">
+              <PlaygroundDockerUpdateDialog phase="pulling" />
+            </Card>
+            <Card label="Done phase">
+              <PlaygroundDockerUpdateDialog phase="done" />
+            </Card>
+            <Card label="Error phase">
+              <PlaygroundDockerUpdateDialog phase="error" />
+            </Card>
+          </div>
+        </Section>
         {/* ─── CLAUDE.md Editor ──────────────────────────────── */}
         <Section
           title="CLAUDE.md Editor"
@@ -2546,6 +2744,134 @@ export function Playground() {
         >
           <PlaygroundSessionItems />
         </Section>
+        {/* ─── Browser Preview States ────────────────────────────── */}
+        <Section
+          title="Browser Preview"
+          description="Browser preview panel — host mode (HTTP proxy) and container mode (noVNC) — loading, error, and active states"
+        >
+          <div className="space-y-4 max-w-3xl">
+            <Card label="Loading state">
+              <div className="h-48 flex flex-col items-center justify-center gap-3 p-4 bg-cc-bg rounded border border-cc-border">
+                <div className="w-5 h-5 border-2 border-cc-primary border-t-transparent rounded-full animate-spin" />
+                <div className="text-sm text-cc-muted">Starting browser preview...</div>
+              </div>
+            </Card>
+            <Card label="Error state">
+              <div className="h-48 flex items-center justify-center p-4 bg-cc-bg rounded border border-cc-border">
+                <div className="px-4 py-3 rounded-lg bg-cc-error/10 border border-cc-error/30 text-sm text-cc-error max-w-md text-center">
+                  Browser preview unavailable.
+                </div>
+              </div>
+            </Card>
+            <Card label="Host mode (proxy — before navigation)">
+              <div className="h-48 flex flex-col bg-cc-bg rounded border border-cc-border overflow-hidden">
+                <div className="shrink-0 px-3 py-2 border-b border-cc-border flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="flex items-center justify-center w-7 h-7 rounded text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer"
+                    aria-label="Reload browser"
+                    title="Reload"
+                  >
+                    <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                      <path d="M13.65 2.35a1 1 0 0 0-1.3 0L11 3.7A5.99 5.99 0 0 0 2 8a1 1 0 1 0 2 0 4 4 0 0 1 6.29-3.29L8.65 6.35a1 1 0 0 0 .7 1.7H13a1 1 0 0 0 1-1V3.4a1 1 0 0 0-.35-.7z M14 8a1 1 0 1 0-2 0 4 4 0 0 1-6.29 3.29l1.64-1.64a1 1 0 0 0-.7-1.7H3.05a1 1 0 0 0-1 1v3.65a1 1 0 0 0 1.7.7L5 11.7A5.99 5.99 0 0 0 14 8z" />
+                    </svg>
+                  </button>
+                  <input
+                    type="text"
+                    defaultValue="http://localhost:3000"
+                    className="flex-1 px-2 py-1 text-xs rounded bg-cc-bg border border-cc-border text-cc-fg placeholder:text-cc-muted focus:outline-none focus:border-cc-primary"
+                    aria-label="Navigate URL"
+                    readOnly
+                  />
+                  <button
+                    type="button"
+                    className="px-3 py-1 rounded text-xs font-medium bg-cc-primary text-white hover:bg-cc-primary-hover transition-colors cursor-pointer"
+                  >
+                    Go
+                  </button>
+                </div>
+                <div className="flex-1 flex items-center justify-center text-xs text-cc-muted">
+                  Enter a URL and click Go to preview.
+                </div>
+              </div>
+            </Card>
+            <Card label="Container mode (noVNC — active)">
+              <div className="h-48 flex flex-col bg-cc-bg rounded border border-cc-border overflow-hidden">
+                <div className="shrink-0 px-3 py-2 border-b border-cc-border flex items-center gap-2">
+                  <button
+                    type="button"
+                    className="flex items-center justify-center w-7 h-7 rounded text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer"
+                    aria-label="Reload browser"
+                    title="Reload"
+                  >
+                    <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                      <path d="M13.65 2.35a1 1 0 0 0-1.3 0L11 3.7A5.99 5.99 0 0 0 2 8a1 1 0 1 0 2 0 4 4 0 0 1 6.29-3.29L8.65 6.35a1 1 0 0 0 .7 1.7H13a1 1 0 0 0 1-1V3.4a1 1 0 0 0-.35-.7z M14 8a1 1 0 1 0-2 0 4 4 0 0 1-6.29 3.29l1.64-1.64a1 1 0 0 0-.7-1.7H3.05a1 1 0 0 0-1 1v3.65a1 1 0 0 0 1.7.7L5 11.7A5.99 5.99 0 0 0 14 8z" />
+                    </svg>
+                  </button>
+                  <input
+                    type="text"
+                    defaultValue="http://localhost:3000"
+                    className="flex-1 px-2 py-1 text-xs rounded bg-cc-bg border border-cc-border text-cc-fg placeholder:text-cc-muted focus:outline-none focus:border-cc-primary"
+                    aria-label="Navigate URL"
+                    readOnly
+                  />
+                  <button
+                    type="button"
+                    className="px-3 py-1 rounded text-xs font-medium bg-cc-primary text-white hover:bg-cc-primary-hover transition-colors cursor-pointer"
+                  >
+                    Go
+                  </button>
+                </div>
+                <div className="flex-1 flex items-center justify-center text-xs text-cc-muted">
+                  noVNC iframe would render here
+                </div>
+              </div>
+            </Card>
+          </div>
+        </Section>
+
+        {/* ─── Tool Activity ──────────────────────────────── */}
+        <Section
+          title="Tool Activity"
+          description="Live execution bar and post-turn summary strip"
+        >
+          <div className="space-y-6">
+            <Card label="ToolExecutionBar — 1 tool running">
+              <div className="bg-cc-bg p-2 rounded">
+                <ToolExecutionBar tools={[{ toolName: "Bash", elapsedSeconds: 3 }]} />
+              </div>
+            </Card>
+            <Card label="ToolExecutionBar — 3 tools running">
+              <div className="bg-cc-bg p-2 rounded">
+                <ToolExecutionBar tools={[
+                  { toolName: "Bash", elapsedSeconds: 7 },
+                  { toolName: "Read", elapsedSeconds: 1 },
+                  { toolName: "Edit", elapsedSeconds: 4 },
+                ]} />
+              </div>
+            </Card>
+            <Card label="ToolExecutionBar — empty (renders nothing)">
+              <div className="bg-cc-bg p-2 rounded min-h-[24px]">
+                <ToolExecutionBar tools={[]} />
+              </div>
+            </Card>
+            <Card label="ToolTurnSummary — collapsed (3 tools, no errors)">
+              <div className="bg-cc-bg p-2 rounded">
+                <ToolTurnSummary entries={MOCK_TOOL_ACTIVITY_OK} />
+              </div>
+            </Card>
+            <Card label="ToolTurnSummary — collapsed (with error)">
+              <div className="bg-cc-bg p-2 rounded">
+                <ToolTurnSummary entries={MOCK_TOOL_ACTIVITY_ERROR} />
+              </div>
+            </Card>
+            <Card label="ToolTurnSummary — collapsed (with running tool)">
+              <div className="bg-cc-bg p-2 rounded">
+                <ToolTurnSummary entries={MOCK_TOOL_ACTIVITY_RUNNING} />
+              </div>
+            </Card>
+          </div>
+        </Section>
       </div>
     </div>
   );
@@ -2565,6 +2891,7 @@ function mockSession(overrides: Partial<SessionItemType>): SessionItemType {
     linesAdded: 0,
     linesRemoved: 0,
     isConnected: false,
+    isReconnecting: false,
     status: null,
     sdkState: null,
     createdAt: Date.now(),
@@ -2662,6 +2989,20 @@ function PlaygroundSessionItems() {
             })}
             isActive={false}
             sessionName="Review PR #42"
+            permCount={0}
+            isRecentlyRenamed={false}
+            {...noopSessionItemProps}
+          />
+        </div>
+      </Card>
+
+      {/* Reconnecting */}
+      <Card label="Reconnecting — CLI restarting">
+        <div className="bg-cc-sidebar rounded-lg p-1">
+          <SessionItem
+            session={mockSession({ isReconnecting: true })}
+            isActive={false}
+            sessionName="Debug auth flow"
             permCount={0}
             isRecentlyRenamed={false}
             {...noopSessionItemProps}
@@ -3478,7 +3819,7 @@ function PlaygroundAiValidationToggle({ enabled }: { enabled: boolean }) {
       total_lines_removed: 0,
       aiValidationEnabled: enabled,
       aiValidationAutoApprove: true,
-      aiValidationAutoDeny: true,
+      aiValidationAutoDeny: false,
       ...prev,
     });
     return () => {
@@ -3503,6 +3844,154 @@ function PlaygroundAiValidationToggle({ enabled }: { enabled: boolean }) {
     <div className="flex items-center gap-2 p-2">
       <AiValidationToggle sessionId={PLAYGROUND_AI_VALIDATION_SESSION} />
       <span className="text-xs text-cc-muted">Click to toggle</span>
+    </div>
+  );
+}
+
+// ─── Activity Tray Playground Mock ──────────────────────────────────────────
+
+/**
+ * Self-contained playground mock of the ActivityTray component.
+ * Uses local state instead of the Zustand store so it works in isolation.
+ * Simulates background agents completing over time to demonstrate the UI.
+ */
+function PlaygroundActivityTray() {
+  const [expanded, setExpanded] = useState(true);
+  const [agentStatus, setAgentStatus] = useState<"running" | "completed">("running");
+
+  const mockAgents = [
+    { name: "Explore codebase", agentType: "Explore", status: agentStatus, startedAt: Date.now() - 12000, completedAt: agentStatus === "completed" ? Date.now() : undefined },
+    { name: "Research auth patterns", agentType: "general-purpose", status: "completed" as const, startedAt: Date.now() - 45000, completedAt: Date.now() - 3000 },
+  ];
+
+  const mockTasks: TaskItem[] = [
+    { id: "1", subject: "Implement ActivityTray component", description: "", status: "completed" },
+    { id: "2", subject: "Wire into ChatView layout", description: "", status: "completed" },
+    { id: "3", subject: "Add background agent detection", description: "", status: "in_progress", activeForm: "Detecting Agent tool_use" },
+    { id: "4", subject: "Write tests", description: "", status: "pending" },
+  ];
+
+  const runningAgents = mockAgents.filter((a) => a.status === "running").length;
+  const completedTasks = mockTasks.filter((t) => t.status === "completed").length;
+  const hasRunningWork = runningAgents > 0 || mockTasks.some((t) => t.status === "in_progress");
+
+  function formatElapsed(startedAt: number, completedAt?: number): string {
+    const elapsed = Math.round(((completedAt || Date.now()) - startedAt) / 1000);
+    if (elapsed < 60) return `${elapsed}s`;
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
+  }
+
+  return (
+    <div className="relative h-48 bg-cc-bg rounded-lg border border-cc-border/30 overflow-hidden">
+      {/* Simulated chat area background */}
+      <div className="absolute inset-0 flex items-center justify-center">
+        <span className="text-[10px] text-cc-muted/20">Chat area</span>
+      </div>
+
+      {/* Toggle agent status button */}
+      <div className="absolute top-2 left-2 z-30">
+        <button
+          type="button"
+          onClick={() => setAgentStatus((s) => (s === "running" ? "completed" : "running"))}
+          className="text-[10px] px-2 py-1 rounded bg-cc-surface border border-cc-border text-cc-muted hover:text-cc-fg cursor-pointer"
+        >
+          Toggle agent: {agentStatus}
+        </button>
+      </div>
+
+      {/* Activity tray - bottom right */}
+      <div className="absolute bottom-3 right-3 z-20">
+        {expanded && (
+          <div className="mb-1.5 w-72 max-w-[calc(100vw-2rem)] max-h-52 overflow-y-auto rounded-xl border border-cc-border/60 bg-cc-surface/95 backdrop-blur-xl shadow-lg shadow-black/20 animate-[fadeSlideIn_0.2s_ease-out]">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-cc-border/40">
+              <span className="text-[11px] font-semibold text-cc-fg/70 uppercase tracking-wider" role="heading" aria-level={3}>Activity</span>
+              <button
+                type="button"
+                onClick={() => setExpanded(false)}
+                className="flex items-center justify-center w-7 h-7 -mr-1 rounded-md text-cc-muted/40 hover:text-cc-muted/70 hover:bg-cc-hover/50 transition-colors cursor-pointer"
+                aria-label="Close activity tray"
+              >
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
+                  <path d="M4.646 4.646a.5.5 0 01.708 0L8 7.293l2.646-2.647a.5.5 0 01.708.708L8.707 8l2.647 2.646a.5.5 0 01-.708.708L8 8.707l-2.646 2.647a.5.5 0 01-.708-.708L7.293 8 4.646 5.354a.5.5 0 010-.708z" />
+                </svg>
+              </button>
+            </div>
+            {/* Agents */}
+            <div className="py-1">
+              <div className="px-3 py-1" role="heading" aria-level={4}>
+                <span className="text-[9px] text-cc-muted/40 uppercase tracking-widest font-semibold">Agents</span>
+              </div>
+              {mockAgents.map((agent, i) => (
+                <div key={i} className={`flex items-center gap-2 px-2.5 min-h-[36px] transition-opacity duration-300 ${agent.status !== "running" ? "opacity-60" : ""}`}>
+                  {agent.status === "running" ? (
+                    <span className="relative flex h-1.5 w-1.5 shrink-0">
+                      <span className="absolute inline-flex h-full w-full rounded-full bg-cc-warning opacity-75 animate-ping" />
+                      <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-cc-warning" />
+                    </span>
+                  ) : (
+                    <span className="h-1.5 w-1.5 rounded-full bg-cc-success shrink-0" />
+                  )}
+                  <span className="text-[11px] text-cc-fg/80 truncate flex-1 font-medium">{agent.name}</span>
+                  <span className="text-[9px] text-cc-muted/50 uppercase tracking-wider shrink-0">{agent.agentType}</span>
+                  <span className="text-[10px] text-cc-muted/50 tabular-nums font-mono-code">{formatElapsed(agent.startedAt, agent.completedAt)}</span>
+                </div>
+              ))}
+            </div>
+            <div className="border-t border-cc-border/30 mx-2" role="separator" />
+            {/* Tasks */}
+            <div className="py-1">
+              <div className="px-3 py-1" role="heading" aria-level={4}>
+                <span className="text-[9px] text-cc-muted/40 uppercase tracking-widest font-semibold">Tasks</span>
+              </div>
+              {mockTasks.map((task) => (
+                <div key={task.id} className={`flex items-center gap-2 px-2.5 min-h-[32px] transition-opacity duration-300 ${task.status === "completed" ? "opacity-40" : ""}`}>
+                  <span className="shrink-0 flex items-center justify-center w-3.5 h-3.5">
+                    {task.status === "in_progress" ? (
+                      <svg className="w-3.5 h-3.5 text-cc-primary animate-spin" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5" strokeDasharray="28" strokeDashoffset="8" strokeLinecap="round" /></svg>
+                    ) : task.status === "completed" ? (
+                      <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 text-cc-success"><path fillRule="evenodd" d="M8 15A7 7 0 108 1a7 7 0 000 14zm3.354-9.354a.5.5 0 00-.708-.708L7 8.586 5.354 6.94a.5.5 0 10-.708.708l2 2a.5.5 0 00.708 0l4-4z" clipRule="evenodd" /></svg>
+                    ) : (
+                      <svg viewBox="0 0 16 16" fill="none" className="w-3.5 h-3.5 text-cc-muted/40"><circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5" /></svg>
+                    )}
+                  </span>
+                  <span className={`text-[11px] leading-snug flex-1 truncate ${task.status === "completed" ? "text-cc-muted line-through" : "text-cc-fg/80"}`}>{task.subject}</span>
+                  {task.status === "in_progress" && task.activeForm && (
+                    <span className="text-[10px] text-cc-muted/50 italic truncate max-w-[120px] shrink-0">{task.activeForm}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Pill */}
+        <button
+          type="button"
+          onClick={() => setExpanded(!expanded)}
+          aria-expanded={expanded}
+          className={`flex items-center gap-2 px-3 min-h-[36px] rounded-full border border-cc-border/50 bg-cc-surface/90 backdrop-blur-lg shadow-md shadow-black/15 hover:bg-cc-hover/80 hover:border-cc-border/70 transition-all duration-200 cursor-pointer ${expanded ? "ring-1 ring-cc-primary/30" : ""}`}
+        >
+          {hasRunningWork ? (
+            <span className="relative flex h-2 w-2">
+              <span className="absolute inline-flex h-full w-full rounded-full bg-cc-warning opacity-75 animate-ping" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-cc-warning" />
+            </span>
+          ) : (
+            <span className="h-2 w-2 rounded-full bg-cc-success" />
+          )}
+          {runningAgents > 0
+            ? <span className="text-[11px] text-cc-fg/70 font-medium tabular-nums">{runningAgents} agent{runningAgents !== 1 ? "s" : ""}</span>
+            : <span className="text-[11px] text-cc-fg/70 font-medium tabular-nums">{mockAgents.length} done</span>
+          }
+          <span className="w-0.5 h-0.5 rounded-full bg-cc-muted/30" />
+          <span className="text-[11px] text-cc-fg/70 tabular-nums">{completedTasks}/{mockTasks.length}</span>
+          <svg viewBox="0 0 16 16" fill="currentColor" className={`w-2.5 h-2.5 text-cc-muted/40 transition-transform duration-200 ${expanded ? "rotate-180" : ""}`} aria-hidden>
+            <path d="M4 6l4 4 4-4" />
+          </svg>
+        </button>
+      </div>
     </div>
   );
 }

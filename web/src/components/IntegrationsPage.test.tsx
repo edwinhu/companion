@@ -1,4 +1,16 @@
 // @vitest-environment jsdom
+/**
+ * Tests for IntegrationsPage component.
+ *
+ * Validates:
+ * - Linear Tickets card renders with live connection status
+ * - Linear OAuth Apps card renders with connection/agent counts
+ * - Back button navigation (home vs session)
+ * - Back button hidden when embedded
+ * - Tailscale card with various statuses (checking, active, not installed, error)
+ * - Settings button navigation for each card
+ * - Accessibility
+ */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
 
@@ -11,16 +23,18 @@ let mockState: MockStoreState;
 const mockApi = {
   getSettings: vi.fn(),
   getLinearConnection: vi.fn(),
-  listAgents: vi.fn(),
   getTailscaleStatus: vi.fn(),
+  listAgents: vi.fn(),
+  listLinearOAuthConnections: vi.fn(),
 };
 
 vi.mock("../api.js", () => ({
   api: {
     getSettings: (...args: unknown[]) => mockApi.getSettings(...args),
     getLinearConnection: (...args: unknown[]) => mockApi.getLinearConnection(...args),
-    listAgents: (...args: unknown[]) => mockApi.listAgents(...args),
     getTailscaleStatus: (...args: unknown[]) => mockApi.getTailscaleStatus(...args),
+    listAgents: (...args: unknown[]) => mockApi.listAgents(...args),
+    listLinearOAuthConnections: (...args: unknown[]) => mockApi.listLinearOAuthConnections(...args),
   },
 }));
 
@@ -37,6 +51,13 @@ vi.mock("../utils/routing.js", () => ({
   navigateToSession: (...args: unknown[]) => mockNavigateToSession(...args),
 }));
 
+// Mock LinearLogo to avoid SVG import issues
+vi.mock("./LinearLogo.js", () => ({
+  LinearLogo: ({ className }: { className?: string }) => (
+    <span data-testid="linear-logo" className={className} />
+  ),
+}));
+
 import { IntegrationsPage } from "./IntegrationsPage.js";
 
 beforeEach(() => {
@@ -44,7 +65,7 @@ beforeEach(() => {
   mockState = { currentSessionId: null };
   mockApi.getSettings.mockResolvedValue({
     anthropicApiKeyConfigured: false,
-    anthropicModel: "claude-sonnet-4.6",
+    anthropicModel: "claude-sonnet-4-6",
     linearApiKeyConfigured: true,
   });
   mockApi.getLinearConnection.mockResolvedValue({
@@ -54,7 +75,6 @@ beforeEach(() => {
     teamName: "Engineering",
     teamKey: "ENG",
   });
-  mockApi.listAgents.mockResolvedValue([]);
   mockApi.getTailscaleStatus.mockResolvedValue({
     installed: false,
     binaryPath: null,
@@ -64,69 +84,99 @@ beforeEach(() => {
     funnelUrl: null,
     error: null,
   });
+  mockApi.listAgents.mockResolvedValue([]);
+  mockApi.listLinearOAuthConnections.mockResolvedValue({ connections: [] });
   window.location.hash = "#/integrations";
 });
 
-/** Helper: builds a mock agent with chat trigger and platform bindings */
-function buildAgentWithChat(
-  id: string,
-  platforms: Array<{ adapter: string; credentials?: Record<string, string> }>,
-) {
-  return {
-    id,
-    version: 1,
-    name: `Agent ${id}`,
-    description: "test agent",
-    backendType: "claude",
-    model: "claude-sonnet-4.6",
-    permissionMode: "default",
-    cwd: "/tmp",
-    prompt: "test",
-    triggers: {
-      chat: {
-        enabled: true,
-        platforms: platforms.map((p) => ({
-          adapter: p.adapter,
-          autoSubscribe: false,
-          credentials: p.credentials,
-        })),
-      },
-    },
-  };
-}
-
 describe("IntegrationsPage", () => {
-  it("shows Linear card with live status", async () => {
+  // ─── Linear Tickets card ───────────────────────────────────────────────────
+
+  it("shows Linear Tickets card with live status", async () => {
+    // Verifies the Tickets card renders with workspace info and connected indicator
     render(<IntegrationsPage />);
 
     expect(mockApi.getSettings).toHaveBeenCalledTimes(1);
-    await screen.findByText("Linear");
+    await screen.findByText("Linear Tickets");
     await screen.findByLabelText("Connected");
-    expect(screen.getByText("Ada • Engineering")).toBeInTheDocument();
+    expect(screen.getByText("Ada \u2022 Engineering")).toBeInTheDocument();
   });
 
-  it("opens dedicated Linear settings page from card", async () => {
+  it("opens dedicated Linear Tickets settings page from card", async () => {
+    // Verifies clicking the settings gear navigates to the tickets settings page
     render(<IntegrationsPage />);
 
-    await screen.findByRole("button", { name: "Open Linear settings" });
-    fireEvent.click(screen.getByRole("button", { name: "Open Linear settings" }));
+    await screen.findByRole("button", { name: "Open Linear Tickets settings" });
+    fireEvent.click(screen.getByRole("button", { name: "Open Linear Tickets settings" }));
 
     await waitFor(() => {
       expect(window.location.hash).toBe("#/integrations/linear");
     });
   });
 
-  // ------------------------------------------------------------------
-  // Back button (lines 78-87): only shown when embedded=false
-  // ------------------------------------------------------------------
+  // ─── Linear OAuth Apps card ────────────────────────────────────────────────
+
+  it("shows Linear OAuth Apps card with no connections", async () => {
+    // Verifies the OAuth card renders with empty state
+    render(<IntegrationsPage />);
+
+    await screen.findByText("Linear OAuth Apps");
+    expect(screen.getByText("No OAuth apps configured")).toBeInTheDocument();
+  });
+
+  it("shows OAuth connection and agent counts", async () => {
+    // Verifies the OAuth card displays counts when connections/agents exist
+    mockApi.listLinearOAuthConnections.mockResolvedValue({
+      connections: [
+        { id: "c1", name: "App 1", status: "connected" },
+        { id: "c2", name: "App 2", status: "disconnected" },
+      ],
+    });
+    mockApi.listAgents.mockResolvedValue([
+      { id: "a1", name: "Agent 1", triggers: { linear: { enabled: true } } },
+    ]);
+
+    render(<IntegrationsPage />);
+
+    await screen.findByText("Linear OAuth Apps");
+    // "2 apps, 1 connected · 1 agent"
+    await waitFor(() => {
+      expect(screen.getByText(/2 apps, 1 connected/)).toBeInTheDocument();
+    });
+  });
+
+  it("navigates to OAuth settings page from card", async () => {
+    // Verifies clicking the settings gear on OAuth card navigates correctly
+    render(<IntegrationsPage />);
+
+    await screen.findByRole("button", { name: "Open Linear OAuth settings" });
+    fireEvent.click(screen.getByRole("button", { name: "Open Linear OAuth settings" }));
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe("#/integrations/linear-oauth");
+    });
+  });
+
+  it("navigates to agent setup wizard from OAuth card", async () => {
+    // Verifies clicking Setup Agent navigates to the wizard entry point
+    render(<IntegrationsPage />);
+
+    await screen.findByRole("button", { name: "Set up Linear Agent" });
+    fireEvent.click(screen.getByRole("button", { name: "Set up Linear Agent" }));
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe("#/agents?setup=linear");
+    });
+  });
+
+  // ─── Back button ──────────────────────────────────────────────────────────
 
   it("renders Back button when not embedded and navigates home when no session", async () => {
     // No currentSessionId in state, so clicking Back should call navigateHome
     mockState = { currentSessionId: null };
     render(<IntegrationsPage />);
 
-    // Wait for async effects to settle (settings fetch)
-    await screen.findByText("Linear");
+    await screen.findByText("Linear Tickets");
 
     const backBtn = screen.getByRole("button", { name: "Back" });
     expect(backBtn).toBeInTheDocument();
@@ -142,7 +192,7 @@ describe("IntegrationsPage", () => {
     mockState = { currentSessionId: "session-xyz" };
     render(<IntegrationsPage />);
 
-    await screen.findByText("Linear");
+    await screen.findByText("Linear Tickets");
 
     const backBtn = screen.getByRole("button", { name: "Back" });
     fireEvent.click(backBtn);
@@ -155,118 +205,12 @@ describe("IntegrationsPage", () => {
     // When embedded=true the Back button should be absent
     render(<IntegrationsPage embedded />);
 
-    await screen.findByText("Linear");
+    await screen.findByText("Linear Tickets");
 
     expect(screen.queryByRole("button", { name: "Back" })).not.toBeInTheDocument();
   });
 
-  // ------------------------------------------------------------------
-  // Chat Platforms summary section (lines 147-183)
-  // ------------------------------------------------------------------
-
-  it("renders Chat Platforms section when agents have chat bindings with configured credentials", async () => {
-    // One agent with a slack platform that has credentials configured
-    mockApi.listAgents.mockResolvedValue([
-      buildAgentWithChat("agent-1", [
-        { adapter: "slack", credentials: { botToken: "xoxb-abc" } },
-      ]),
-    ]);
-
-    render(<IntegrationsPage />);
-
-    // Wait for the Chat Platforms heading to appear
-    const heading = await screen.findByText("Chat Platforms");
-    expect(heading).toBeInTheDocument();
-
-    // Platform name (capitalized via CSS, but text content is lowercase)
-    expect(screen.getByText("slack")).toBeInTheDocument();
-
-    // Agent count: "1 agent" (singular)
-    expect(screen.getByText("1 agent")).toBeInTheDocument();
-
-    // Configured badge: "1 configured"
-    expect(screen.getByText("1 configured")).toBeInTheDocument();
-
-    // "Using env vars" badge should NOT be present
-    expect(screen.queryByText("Using env vars")).not.toBeInTheDocument();
-  });
-
-  it("shows 'Using env vars' badge when platform binding has no credentials", async () => {
-    // Agent with a discord platform but NO credentials
-    mockApi.listAgents.mockResolvedValue([
-      buildAgentWithChat("agent-2", [
-        { adapter: "discord" },
-      ]),
-    ]);
-
-    render(<IntegrationsPage />);
-
-    await screen.findByText("Chat Platforms");
-
-    expect(screen.getByText("discord")).toBeInTheDocument();
-    expect(screen.getByText("1 agent")).toBeInTheDocument();
-
-    // Should show "Using env vars" since no credentials are configured
-    expect(screen.getByText("Using env vars")).toBeInTheDocument();
-
-    // "configured" badge should NOT be present
-    expect(screen.queryByText("1 configured")).not.toBeInTheDocument();
-  });
-
-  it("aggregates multiple agents on the same platform", async () => {
-    // Two agents both using slack: one with credentials, one without
-    mockApi.listAgents.mockResolvedValue([
-      buildAgentWithChat("agent-a", [
-        { adapter: "slack", credentials: { botToken: "xoxb-111" } },
-      ]),
-      buildAgentWithChat("agent-b", [
-        { adapter: "slack" },
-      ]),
-    ]);
-
-    render(<IntegrationsPage />);
-
-    await screen.findByText("Chat Platforms");
-
-    // Slack row should show 2 agents (plural)
-    expect(screen.getByText("2 agents")).toBeInTheDocument();
-
-    // 1 out of 2 has credentials configured
-    expect(screen.getByText("1 configured")).toBeInTheDocument();
-  });
-
-  it("Configure button navigates to agents page", async () => {
-    mockApi.listAgents.mockResolvedValue([
-      buildAgentWithChat("agent-3", [{ adapter: "github" }]),
-    ]);
-
-    render(<IntegrationsPage />);
-
-    // Wait for the Chat Platforms section to render
-    await screen.findByText("Chat Platforms");
-
-    const configureBtn = screen.getByRole("button", { name: "Configure" });
-    fireEvent.click(configureBtn);
-
-    // Clicking Configure should navigate to the agents page
-    await waitFor(() => {
-      expect(window.location.hash).toBe("#/agents");
-    });
-  });
-
-  it("does not render Chat Platforms section when no agents have chat bindings", async () => {
-    // Default: listAgents returns empty array
-    render(<IntegrationsPage />);
-
-    await screen.findByText("Linear");
-
-    // Chat Platforms heading should not appear
-    expect(screen.queryByText("Chat Platforms")).not.toBeInTheDocument();
-  });
-
-  // ------------------------------------------------------------------
-  // Tailscale card (renders status and navigates to settings page)
-  // ------------------------------------------------------------------
+  // ─── Tailscale card ──────────────────────────────────────────────────────
 
   it("renders Tailscale card with 'Checking...' while status loads", async () => {
     // getTailscaleStatus returns a pending promise that never resolves during this test
@@ -274,7 +218,7 @@ describe("IntegrationsPage", () => {
 
     render(<IntegrationsPage />);
 
-    await screen.findByText("Linear");
+    await screen.findByText("Linear Tickets");
 
     // Tailscale card should show "Checking..." while status is loading
     expect(screen.getByText("Tailscale")).toBeInTheDocument();
@@ -295,7 +239,7 @@ describe("IntegrationsPage", () => {
 
     render(<IntegrationsPage />);
 
-    await screen.findByText("Linear");
+    await screen.findByText("Linear Tickets");
 
     // Should show the funnel URL and the active indicator
     expect(screen.getByText("https://my-machine.ts.net")).toBeInTheDocument();
@@ -306,7 +250,7 @@ describe("IntegrationsPage", () => {
     // Default mock already returns installed: false — just verify it renders
     render(<IntegrationsPage />);
 
-    await screen.findByText("Linear");
+    await screen.findByText("Linear Tickets");
 
     // Wait for the Tailscale status to resolve
     await screen.findByText("Not installed");
@@ -318,7 +262,7 @@ describe("IntegrationsPage", () => {
 
     render(<IntegrationsPage />);
 
-    await screen.findByText("Linear");
+    await screen.findByText("Linear Tickets");
 
     // Should show "Not installed" (fallback status) instead of staying on "Checking..."
     await screen.findByText("Not installed");
@@ -327,7 +271,7 @@ describe("IntegrationsPage", () => {
   it("navigates to Tailscale settings page when gear button is clicked", async () => {
     render(<IntegrationsPage />);
 
-    await screen.findByText("Linear");
+    await screen.findByText("Linear Tickets");
 
     const tailscaleSettingsBtn = screen.getByRole("button", { name: "Open Tailscale settings" });
     fireEvent.click(tailscaleSettingsBtn);

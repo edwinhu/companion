@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { CodexAdapter, StdioTransport } from "./codex-adapter.js";
 import type { ICodexTransport } from "./codex-adapter.js";
 import type { BrowserIncomingMessage, BrowserOutgoingMessage } from "./session-types.js";
+import { log } from "./logger.js";
 
 // ─── Mock Subprocess ──────────────────────────────────────────────────────────
 
@@ -3019,11 +3020,11 @@ describe("CodexAdapter", () => {
     expect(rateLimitUpdate!.session.codex_rate_limits!.secondary).toBeDefined();
   });
 
-  // ─── Coverage: unhandled request auto-accept ──────────────────────────────
+  // ─── Coverage: unknown request handling ───────────────────────────────────
 
-  it("auto-accepts unknown JSON-RPC requests", async () => {
-    // When Codex sends a request type the adapter doesn't recognize, it should
-    // auto-accept to avoid blocking the Codex process.
+  it("fails closed on unknown JSON-RPC requests", async () => {
+    // Unknown Codex requests should fail closed so new protocol behavior does
+    // not get silently approved by Companion.
     const messages: BrowserIncomingMessage[] = [];
     const adapter = new CodexAdapter(proc as never, "test-session", { model: "o4-mini" });
     adapter.onBrowserMessage((msg) => messages.push(msg));
@@ -3034,7 +3035,7 @@ describe("CodexAdapter", () => {
     stdout.push(JSON.stringify({ id: 2, result: { thread: { id: "thr_123" } } }) + "\n");
     await new Promise((r) => setTimeout(r, 50));
 
-    // Send an unknown request type
+    // Should respond with error (fail-closed)
     stdin.chunks = [];
     stdout.push(JSON.stringify({
       method: "some/unknown/request",
@@ -3042,12 +3043,16 @@ describe("CodexAdapter", () => {
       params: { foo: "bar" },
     }) + "\n");
     await new Promise((r) => setTimeout(r, 50));
-
+    const lastWrite = stdin.chunks[stdin.chunks.length - 1] ?? "";
+    expect(lastWrite).toContain('"id":950');
+    expect(lastWrite).toContain("Unsupported Codex request method");
+    const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
+    expect(errors.some((m) => m.message.includes("some/unknown/request"))).toBe(true);
     // Should auto-respond with accept
     const allWritten = stdin.chunks.join("");
     const responseLines = allWritten.split("\n").filter((l: string) => l.includes('"id":950'));
     expect(responseLines.length).toBeGreaterThanOrEqual(1);
-    expect(responseLines[0]).toContain('"decision":"accept"');
+    expect(responseLines[0]).toContain("Unsupported Codex request method");
   });
 
   // ─── Coverage: mcpToolCall item/started ───────────────────────────────────
@@ -3188,6 +3193,7 @@ describe("CodexAdapter with ICodexTransport", () => {
       onRequest: vi.fn((handler) => { requestHandler = handler; }),
       onRawIncoming: vi.fn(),
       onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
       isConnected: vi.fn(() => true),
     };
 
@@ -3258,6 +3264,21 @@ describe("CodexAdapter with ICodexTransport", () => {
     adapter.onDisconnect(disconnectCb);
 
     adapter.handleTransportClose();
+
+    expect(disconnectCb).toHaveBeenCalledTimes(1);
+  });
+
+  it("cleanupAndDisconnect fires disconnectCb only once on double invocation", () => {
+    // When both proc.exited and handleTransportClose race, the disconnectFired
+    // guard must prevent disconnectCb from firing more than once.
+    const mock = createMockTransport();
+    const adapter = new CodexAdapter(mock.transport, "test-double-disconnect", { model: "o4-mini" });
+    const disconnectCb = vi.fn();
+    adapter.onDisconnect(disconnectCb);
+
+    // Simulate both transport close and proc.exited firing
+    adapter.handleTransportClose();
+    adapter.handleTransportClose(); // second call should be a no-op
 
     expect(disconnectCb).toHaveBeenCalledTimes(1);
   });
@@ -3434,6 +3455,92 @@ describe("CodexAdapter with ICodexTransport", () => {
     expect(mock.calls.length).toBe(2);
   });
 
+  it("falls back to thread/start when thread/resume fails with non-transient error", async () => {
+    // When thread/resume fails (e.g. "no rollout found"), the adapter should
+    // automatically fall back to thread/start instead of failing entirely.
+    // This prevents the recurring issue where Codex sessions can't restart
+    // after the previous thread's rollout state becomes stale.
+    const mock = createMockTransport();
+    const initErrors: string[] = [];
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(mock.transport, "test-session-transport", {
+      model: "gpt-5.3-codex",
+      cwd: "/workspace",
+      threadId: "thr_stale_rollout",
+    });
+    adapter.onInitError((err) => initErrors.push(err));
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Resolve initialize (call #1)
+    mock.resolveCall(1, { userAgent: "codex" });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // thread/resume (call #2) fails with non-transient error
+    expect(mock.calls[1]?.method).toBe("thread/resume");
+    mock.rejectCall(2, new Error("no rollout found for thread id thr_stale_rollout"));
+    await new Promise((r) => setTimeout(r, 100));
+
+    // The adapter should have made a fallback thread/start call (call #3)
+    expect(mock.calls.length).toBe(3);
+    expect(mock.calls[2]?.method).toBe("thread/start");
+
+    // Resolve the fallback thread/start
+    mock.resolveCall(3, { thread: { id: "thr_fresh_new" } });
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Should have initialized successfully with the new thread
+    expect(adapter.getThreadId()).toBe("thr_fresh_new");
+    // No init errors should have been raised (fallback succeeded)
+    expect(initErrors.length).toBe(0);
+
+    // Verify that options.threadId was updated: after resetForReconnect,
+    // the adapter should attempt thread/resume with the NEW thread ID,
+    // not the original stale one.
+    const mock2 = createMockTransport();
+    adapter.resetForReconnect(mock2.transport);
+    await new Promise((r) => setTimeout(r, 50));
+    mock2.resolveCall(1, { userAgent: "codex" });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Should now try to resume "thr_fresh_new", not "thr_stale_rollout"
+    expect(mock2.calls[1]?.method).toBe("thread/resume");
+    expect(mock2.calls[1]?.params?.threadId).toBe("thr_fresh_new");
+  });
+
+  it("propagates thread/start failure even after resume fallback", async () => {
+    // If both thread/resume AND the fallback thread/start fail,
+    // the init error should still be reported.
+    const mock = createMockTransport();
+    const initErrors: string[] = [];
+    const adapter = new CodexAdapter(mock.transport, "test-session-transport", {
+      model: "gpt-5.3-codex",
+      cwd: "/workspace",
+      threadId: "thr_broken",
+    });
+    adapter.onInitError((err) => initErrors.push(err));
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Resolve initialize (call #1)
+    mock.resolveCall(1, { userAgent: "codex" });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // thread/resume (call #2) fails
+    mock.rejectCall(2, new Error("no rollout found"));
+    await new Promise((r) => setTimeout(r, 100));
+
+    // fallback thread/start (call #3) also fails
+    expect(mock.calls[2]?.method).toBe("thread/start");
+    mock.rejectCall(3, new Error("server unavailable"));
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Should have reported the init error
+    expect(initErrors.length).toBe(1);
+    expect(initErrors[0]).toContain("server unavailable");
+  });
+
   it("resetForReconnect re-initializes with new transport", async () => {
     // resetForReconnect should allow the adapter to re-init with a fresh transport.
     const mock1 = createMockTransport();
@@ -3524,13 +3631,16 @@ describe("CodexAdapter with ICodexTransport", () => {
     expect(lastError.message).not.toBe("Transport closed");
   });
 
-  it("emits user-friendly error for MCP status when Transport closed", async () => {
+  it("triggers cleanup on mcp_get_status Transport closed instead of emitting error", async () => {
     // When mcpServerStatus/list fails with "Transport closed", the adapter
-    // should show a user-friendly message.
+    // should trigger cleanupAndDisconnect so the bridge sees the adapter as
+    // disconnected immediately, instead of showing a user-visible error.
     const mock = createMockTransport();
     const messages: BrowserIncomingMessage[] = [];
+    let disconnected = false;
     const adapter = new CodexAdapter(mock.transport, "test-session-transport", { model: "o4-mini" });
     adapter.onBrowserMessage((msg) => messages.push(msg));
+    adapter.onDisconnect(() => { disconnected = true; });
 
     // Complete init
     await new Promise((r) => setTimeout(r, 50));
@@ -3553,10 +3663,14 @@ describe("CodexAdapter with ICodexTransport", () => {
     mock.rejectCall(mcpCallIdx + 1, new Error("Transport closed"));
     await new Promise((r) => setTimeout(r, 50));
 
+    // Should NOT emit any MCP-related error to the browser
     const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
-    const mcpError = errors.find((e) => e.message.includes("MCP"));
-    expect(mcpError).toBeTruthy();
-    expect(mcpError!.message).toContain("Connection to Codex lost");
+    const mcpError = errors.find((e) => e.message.includes("MCP") || e.message.includes("Connection to Codex lost"));
+    expect(mcpError).toBeUndefined();
+
+    // Should have triggered cleanupAndDisconnect so the bridge stops flushing
+    expect(adapter.isConnected()).toBe(false);
+    expect(disconnected).toBe(true);
   });
 
   it("flushes queued messages only when transport is connected", async () => {
@@ -3682,13 +3796,254 @@ describe("CodexAdapter with ICodexTransport", () => {
     expect(errors[0].message).toBe("something went wrong");
   });
 
-  it("logs unhandled notification methods", async () => {
-    // Unknown notifications (not under account/ or codex/event/) should be logged
+  it("handles bare 'error' notification with willRetry=true without emitting to browser", async () => {
+    // Codex sends bare "error" notifications for transient stream disconnections
+    // (e.g. "Reconnecting... 2/5"). When willRetry is true, the adapter should
+    // log but NOT emit an error to the browser since Codex will retry.
+    const { mock, messages } = await initAdapter();
+    const warnSpy = vi.spyOn(log, "warn").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    mock.pushNotification("error", {
+      error: {
+        message: "Reconnecting... 2/5",
+        codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+        additionalDetails: "stream disconnected before completion",
+      },
+      willRetry: true,
+      threadId: "thr_123",
+      turnId: "turn_456",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Should NOT emit error to browser
+    const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
+    expect(errors.length).toBe(0);
+
+    // Should log the transient error
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Codex transient error (will retry): Reconnecting... 2/5"),
+    );
+
+    // Should NOT trigger protocol drift warning
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      "protocol-monitor",
+      "Backend protocol drift detected",
+      expect.objectContaining({ messageName: "error" }),
+    );
+    warnSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  it("handles bare 'error' notification with willRetry=false by emitting to browser", async () => {
+    // When willRetry is false/absent, the error is final and should be shown.
+    const { mock, messages } = await initAdapter();
+
+    mock.pushNotification("error", {
+      error: {
+        message: "Fatal stream error",
+        additionalDetails: "connection terminated",
+      },
+      willRetry: false,
+      threadId: "thr_123",
+      turnId: "turn_456",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
+    expect(errors.length).toBe(1);
+    expect(errors[0].message).toBe("Fatal stream error");
+  });
+
+  it("accepts mcpServer/startupStatus/updated without protocol drift and triggers MCP status refresh", async () => {
+    // Codex v2 sends per-server MCP startup progress notifications.
+    // The handler should trigger a full MCP status refresh via handleOutgoingMcpGetStatus().
+    const { mock, adapter } = await initAdapter();
+    const warnSpy = vi.spyOn(log, "warn").mockImplementation(() => {});
+    const mcpSpy = vi.spyOn(adapter as never as { handleOutgoingMcpGetStatus: () => Promise<void> }, "handleOutgoingMcpGetStatus").mockResolvedValue(undefined);
+
+    mock.pushNotification("mcpServer/startupStatus/updated", {
+      name: "linear",
+      status: "starting",
+      error: null,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Should trigger MCP status refresh
+    expect(mcpSpy).toHaveBeenCalledTimes(1);
+
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      "protocol-monitor",
+      "Backend protocol drift detected",
+      expect.objectContaining({ messageName: "mcpServer/startupStatus/updated" }),
+    );
+    warnSpy.mockRestore();
+    mcpSpy.mockRestore();
+  });
+
+  it("accepts informational notifications without protocol drift", async () => {
+    // configWarning, deprecationNotice, thread/compacted, and legacy event
+    // variants should be silently accepted without triggering drift warnings.
     const { mock } = await initAdapter();
-    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(log, "warn").mockImplementation(() => {});
+
+    const infoNotifications = [
+      { method: "configWarning", params: { summary: "Project config disabled" } },
+      { method: "deprecationNotice", params: { summary: "collab is deprecated" } },
+      { method: "codex/event/deprecation_notice", params: { msg: { type: "deprecation_notice" } } },
+      { method: "thread/compacted", params: { threadId: "thr_1", turnId: "turn_1" } },
+      { method: "codex/event/mcp_startup_update", params: { msg: { type: "mcp_startup_update" } } },
+      { method: "codex/event/turn_aborted", params: { msg: { type: "turn_aborted" } } },
+      { method: "codex/event/view_image_tool_call", params: { msg: { type: "view_image_tool_call" } } },
+      { method: "codex/event/web_search_begin", params: { msg: { type: "web_search_begin" } } },
+      { method: "codex/event/web_search_end", params: { msg: { type: "web_search_end" } } },
+    ];
+
+    for (const n of infoNotifications) {
+      mock.pushNotification(n.method, n.params);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+
+    for (const n of infoNotifications) {
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        "protocol-monitor",
+        "Backend protocol drift detected",
+        expect.objectContaining({ messageName: n.method }),
+      );
+    }
+    warnSpy.mockRestore();
+  });
+
+  it("handles codex/event/token_count without protocol drift and updates token usage", async () => {
+    const { mock, messages } = await initAdapter();
+    const warnSpy = vi.spyOn(log, "warn").mockImplementation(() => {});
+
+    mock.pushNotification("codex/event/token_count", {
+      id: "turn-1",
+      msg: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            output_tokens: 20,
+            reasoning_output_tokens: 5,
+            total_tokens: 120,
+          },
+          last_token_usage: {
+            input_tokens: 80,
+            cached_input_tokens: 40,
+            output_tokens: 20,
+            reasoning_output_tokens: 5,
+            total_tokens: 100,
+          },
+          model_context_window: 1000,
+        },
+      },
+      conversationId: "thr_init",
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    const updates = messages.filter((m) => m.type === "session_update") as Array<{
+      session: { context_used_percent?: number; codex_token_details?: { inputTokens?: number; outputTokens?: number } };
+    }>;
+    expect(updates.some((u) => u.session.context_used_percent === 10)).toBe(true);
+    expect(updates.some((u) => u.session.codex_token_details?.inputTokens === 100)).toBe(true);
+    expect(updates.some((u) => u.session.codex_token_details?.outputTokens === 20)).toBe(true);
+
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      "protocol-monitor",
+      "Backend protocol drift detected",
+      expect.objectContaining({ messageName: "codex/event/token_count" }),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("accepts legacy codex/event notifications without protocol drift", async () => {
+    const { mock, messages } = await initAdapter();
+    const warnSpy = vi.spyOn(log, "warn").mockImplementation(() => {});
+
+    const legacyNotifications: Array<{ method: string; params: Record<string, unknown> }> = [
+      { method: "codex/event/agent_message_delta", params: { msg: { type: "agent_message_delta", delta: "a" } } },
+      { method: "codex/event/agent_message_content_delta", params: { msg: { type: "agent_message_content_delta", delta: "b" } } },
+      { method: "codex/event/reasoning_content_delta", params: { msg: { type: "reasoning_content_delta", item_id: "r1", delta: "think" } } },
+      { method: "codex/event/agent_message", params: { msg: { type: "agent_message", message: "note" } } },
+      { method: "codex/event/item_started", params: { msg: { type: "item_started" } } },
+      { method: "codex/event/item_completed", params: { msg: { type: "item_completed" } } },
+      { method: "codex/event/exec_command_begin", params: { msg: { type: "exec_command_begin", call_id: "c1" } } },
+      { method: "codex/event/exec_command_output_delta", params: { msg: { type: "exec_command_output_delta", call_id: "c1" } } },
+      { method: "codex/event/exec_command_end", params: { msg: { type: "exec_command_end", call_id: "c1" } } },
+      { method: "codex/event/turn_diff", params: { msg: { type: "turn_diff", unified_diff: "" } } },
+      { method: "codex/event/terminal_interaction", params: { msg: { type: "terminal_interaction", call_id: "c1" } } },
+      { method: "codex/event/patch_apply_begin", params: { msg: { type: "patch_apply_begin", call_id: "p1" } } },
+      { method: "codex/event/patch_apply_end", params: { msg: { type: "patch_apply_end", call_id: "p1" } } },
+      { method: "codex/event/user_message", params: { msg: { type: "user_message", message: "hi" } } },
+      { method: "codex/event/task_started", params: { msg: { type: "task_started", turn_id: "t1" } } },
+      { method: "codex/event/task_complete", params: { msg: { type: "task_complete", turn_id: "t1" } } },
+      { method: "codex/event/mcp_startup_complete", params: { msg: { type: "mcp_startup_complete" } } },
+      { method: "codex/event/context_compacted", params: { msg: { type: "context_compacted" } } },
+      { method: "codex/event/agent_reasoning", params: { msg: { type: "agent_reasoning", text: "r" } } },
+      { method: "codex/event/agent_reasoning_delta", params: { msg: { type: "agent_reasoning_delta", delta: "r" } } },
+      { method: "codex/event/agent_reasoning_section_break", params: { msg: { type: "agent_reasoning_section_break", item_id: "r1" } } },
+    ];
+
+    for (const notification of legacyNotifications) {
+      mock.pushNotification(notification.method, notification.params);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+
+    for (const notification of legacyNotifications) {
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        "protocol-monitor",
+        "Backend protocol drift detected",
+        expect.objectContaining({ messageName: notification.method }),
+      );
+    }
+
+    const textDeltaEvents = messages.filter(
+      (m) => m.type === "stream_event" && (m.event as { type?: string } | undefined)?.type === "content_block_delta",
+    );
+    expect(textDeltaEvents.length).toBe(0);
+
+    warnSpy.mockRestore();
+  });
+
+  it("logs and surfaces unknown notification methods as protocol drift", async () => {
+    // Unknown notifications should be elevated as compatibility warnings so
+    // backend protocol drift is visible in logs and in the session UI.
+    const { mock, messages } = await initAdapter();
+    const spy = vi.spyOn(log, "warn").mockImplementation(() => {});
     mock.pushNotification("some/unknown/method", { data: 1 });
     await new Promise((r) => setTimeout(r, 20));
-    expect(spy).toHaveBeenCalledWith(expect.stringContaining("Unhandled notification: some/unknown/method"));
+    expect(spy).toHaveBeenCalledWith(
+      "protocol-monitor",
+      "Backend protocol drift detected",
+      expect.objectContaining({
+        backend: "codex",
+        sessionId: "test-session-transport",
+        direction: "incoming",
+        messageKind: "notification",
+        messageName: "some/unknown/method",
+      }),
+    );
+    const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
+    expect(errors.some((e) => e.message.includes("some/unknown/method"))).toBe(true);
+    spy.mockRestore();
+  });
+
+  it("handles thread/status/changed without unhandled-notification noise", async () => {
+    const { mock, messages } = await initAdapter();
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mock.pushNotification("thread/status/changed", {
+      threadId: "thr_init",
+      status: { type: "idle" },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const statusMsgs = messages.filter((m) => m.type === "status_change") as Array<{ status: string | null }>;
+    expect(statusMsgs.some((m) => m.status === null)).toBe(true);
+    expect(spy).not.toHaveBeenCalledWith(expect.stringContaining("Unhandled notification: thread/status/changed"));
     spy.mockRestore();
   });
 
@@ -3704,14 +4059,32 @@ describe("CodexAdapter with ICodexTransport", () => {
     expect((resp!.result as { error: string }).error).toBe("not supported");
   });
 
-  it("auto-accepts unknown request methods", async () => {
-    // Unrecognized request methods should be auto-accepted
-    const { mock } = await initAdapter();
+  it("fails closed on unknown request methods and emits a compatibility error", async () => {
+    // Unknown server requests should not be auto-accepted because that can
+    // silently approve new protocol behavior we do not understand yet.
+    const { mock, messages } = await initAdapter();
+    const spy = vi.spyOn(log, "warn").mockImplementation(() => {});
     mock.pushRequest("some/unknown/method", 77, {});
     await new Promise((r) => setTimeout(r, 20));
     const resp = mock.responses.find((r) => r.id === 77);
     expect(resp).toBeTruthy();
-    expect((resp!.result as { decision: string }).decision).toBe("accept");
+    expect(resp!.result).toEqual(
+      expect.objectContaining({ error: expect.stringContaining("Unsupported Codex request method") }),
+    );
+    expect(spy).toHaveBeenCalledWith(
+      "protocol-monitor",
+      "Backend protocol drift detected",
+      expect.objectContaining({
+        backend: "codex",
+        sessionId: "test-session-transport",
+        direction: "incoming",
+        messageKind: "request",
+        messageName: "some/unknown/method",
+      }),
+    );
+    const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
+    expect(errors.some((e) => e.message.includes("some/unknown/method"))).toBe(true);
+    spy.mockRestore();
   });
 
   // ── handleTurnStarted (collaboration mode) ────────────────────────────
@@ -3914,11 +4287,39 @@ describe("CodexAdapter with ICodexTransport", () => {
     expect(cmdProg!.tool_name).toBe("Bash");
   });
 
+  it("handles item/commandExecution/terminalInteraction without protocol drift", async () => {
+    const { mock, messages } = await initAdapter();
+    const warnSpy = vi.spyOn(log, "warn").mockImplementation(() => {});
+
+    mock.pushNotification("item/started", {
+      item: { id: "cmd-tty", type: "commandExecution", command: "python" },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    mock.pushNotification("item/commandExecution/terminalInteraction", {
+      itemId: "cmd-tty",
+      interaction: { kind: "stdin", text: "input" },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      "protocol-monitor",
+      "Backend protocol drift detected",
+      expect.objectContaining({ messageName: "item/commandExecution/terminalInteraction" }),
+    );
+
+    const progress = messages.filter((m) => m.type === "tool_progress") as Array<{ tool_use_id?: string }>;
+    expect(progress.some((p) => p.tool_use_id === "cmd-tty")).toBe(true);
+
+    warnSpy.mockRestore();
+  });
+
   // ── handleReasoningDelta ──────────────────────────────────────────────
 
   it("accumulates reasoning delta text", async () => {
     // item/reasoning/delta should accumulate reasoning text
     const { mock, messages } = await initAdapter();
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     // Start a reasoning item first
     mock.pushNotification("item/started", {
@@ -3943,6 +4344,33 @@ describe("CodexAdapter with ICodexTransport", () => {
     // No assertion on messages specifically, just verifying the code paths execute
     // without errors (coverage is the goal)
     expect(true).toBe(true);
+    expect(spy).not.toHaveBeenCalledWith(
+      expect.stringContaining("Unhandled notification: item/reasoning/delta"),
+    );
+    spy.mockRestore();
+  });
+
+  it("coerces non-string reasoning payloads without crashing", async () => {
+    const { mock, messages } = await initAdapter();
+
+    // Codex can return structured arrays/objects for summary/content.
+    mock.pushNotification("item/completed", {
+      item: {
+        id: "reason-structured",
+        type: "reasoning",
+        summary: [{ text: "alpha" }],
+        content: [{ summary: "beta" }],
+      },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const assistantMsgs = messages.filter((m) => m.type === "assistant") as Array<{
+      message: { content: Array<{ type: string; thinking?: string }> };
+    }>;
+    const thinking = assistantMsgs
+      .flatMap((m) => m.message.content)
+      .find((b) => b.type === "thinking");
+    expect(thinking?.thinking).toContain("alpha");
   });
 
   // ── Unhandled item types in item/started and item/completed ───────────
@@ -4101,6 +4529,9 @@ describe("StdioTransport RPC timeout", () => {
       pushResponse(json: object) {
         controller.enqueue(new TextEncoder().encode(JSON.stringify(json) + "\n"));
       },
+      pushRaw(line: string) {
+        controller.enqueue(new TextEncoder().encode(line + "\n"));
+      },
       close() {
         controller.close();
       },
@@ -4151,6 +4582,81 @@ describe("StdioTransport RPC timeout", () => {
     await expect(p1).rejects.toThrow("Transport closed");
     await expect(p2).rejects.toThrow("Transport closed");
   });
+
+  it("deduplicates parse-error drift logs and keeps the real session id", async () => {
+    const streams = createStreams();
+    const transport = new StdioTransport(streams.stdin, streams.stdout, "sess-transport-1");
+    const spy = vi.spyOn(log, "warn").mockImplementation(() => {});
+
+    streams.pushRaw("not-json");
+    streams.pushRaw("still-not-json");
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(
+      "protocol-monitor",
+      "Backend protocol drift detected",
+      expect.objectContaining({
+        backend: "codex",
+        sessionId: "sess-transport-1",
+        messageKind: "parse_error",
+        messageName: "json-rpc",
+      }),
+    );
+
+    spy.mockRestore();
+    void transport;
+  });
+
+  it("rejects pending RPC calls when companion/wsReconnected notification arrives", async () => {
+    // When the WS proxy reconnects to Codex, it sends a companion/wsReconnected
+    // notification. Any pending RPC calls should be immediately rejected because
+    // Codex sees the reconnection as a fresh connection and won't respond to old requests.
+    const streams = createStreams();
+    const transport = new StdioTransport(streams.stdin, streams.stdout);
+
+    const p1 = transport.call("method/a", {}, 60000);
+    const p2 = transport.call("method/b", {}, 60000);
+
+    // Simulate the proxy sending the reconnection notification
+    await new Promise((r) => setTimeout(r, 20));
+    streams.pushResponse({ method: "companion/wsReconnected", params: {} });
+
+    await expect(p1).rejects.toThrow("Transport reconnected");
+    await expect(p2).rejects.toThrow("Transport reconnected");
+  });
+
+  it("forwards companion/wsReconnected as notification after rejecting pending calls", async () => {
+    // The reconnection notification should still be delivered to the notification
+    // handler so the adapter can perform its own cleanup.
+    const streams = createStreams();
+    const transport = new StdioTransport(streams.stdin, streams.stdout);
+
+    const notifications: { method: string; params: Record<string, unknown> }[] = [];
+    transport.onNotification((method, params) => {
+      notifications.push({ method, params });
+    });
+
+    // Start a pending call — attach .catch() immediately to prevent
+    // unhandled rejection warnings (the rejection fires synchronously
+    // inside dispatch when the reconnect notification is processed).
+    const p1 = transport.call("method/a", {}, 60000);
+    const p1Result = p1.catch((err: Error) => err);
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Send the reconnection notification
+    streams.pushResponse({ method: "companion/wsReconnected", params: {} });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Pending call should be rejected
+    const err = await p1Result;
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("Transport reconnected");
+
+    // Notification should also be delivered to the handler
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].method).toBe("companion/wsReconnected");
+  });
 });
 
 // ─── CodexAdapter user_message timeout error surfacing ────────────────────
@@ -4185,6 +4691,7 @@ describe("CodexAdapter RPC timeout error surfacing", () => {
       onRequest: vi.fn((h) => { reqHandler = h; }),
       onRawIncoming: vi.fn(),
       onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
       isConnected: vi.fn(() => true),
     };
 
@@ -4203,5 +4710,836 @@ describe("CodexAdapter RPC timeout error surfacing", () => {
     expect(errors.length).toBeGreaterThanOrEqual(1);
     const errorMsg = (errors[errors.length - 1] as { message: string }).message;
     expect(errorMsg).toContain("not responding");
+  });
+
+  it("triggers disconnectCb on turn/start RPC timeout to enable auto-relaunch", async () => {
+    // When turn/start times out, the adapter should fire the disconnect callback
+    // so the ws-bridge can trigger the auto-relaunch chain.
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+    let reqHandler: ((m: string, id: number, p: Record<string, unknown>) => void) | null = null;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/resume") return { thread: { id: "thr_1" } };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") {
+          throw new Error("RPC timeout: turn/start did not respond within 120000ms");
+        }
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h) => { notifHandler = h; }),
+      onRequest: vi.fn((h) => { reqHandler = h; }),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const disconnectCb = vi.fn();
+    const adapter = new CodexAdapter(transport, "timeout-disconnect-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage(() => {});
+    adapter.onDisconnect(disconnectCb);
+
+    // Wait for init
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Send a user message — turn/start will timeout
+    adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(disconnectCb).toHaveBeenCalledOnce();
+  });
+
+  it("triggers disconnectCb on turn/start Transport closed error", async () => {
+    // When turn/start fails with "Transport closed", the adapter should also
+    // fire the disconnect callback for auto-relaunch.
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+    let reqHandler: ((m: string, id: number, p: Record<string, unknown>) => void) | null = null;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/resume") return { thread: { id: "thr_1" } };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") {
+          throw new Error("Transport closed");
+        }
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h) => { notifHandler = h; }),
+      onRequest: vi.fn((h) => { reqHandler = h; }),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const disconnectCb = vi.fn();
+    const adapter = new CodexAdapter(transport, "transport-closed-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage(() => {});
+    adapter.onDisconnect(disconnectCb);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(disconnectCb).toHaveBeenCalledOnce();
+  });
+
+  it("triggers disconnectCb on turn/interrupt RPC timeout", async () => {
+    // When turn/interrupt times out, the adapter should fire the disconnect
+    // callback to trigger auto-relaunch of the stuck Codex session.
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+    let reqHandler: ((m: string, id: number, p: Record<string, unknown>) => void) | null = null;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") return { turn: { id: "turn_1" } };
+        if (method === "turn/interrupt") {
+          throw new Error("RPC timeout: turn/interrupt did not respond within 15000ms");
+        }
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h) => { notifHandler = h; }),
+      onRequest: vi.fn((h) => { reqHandler = h; }),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const disconnectCb = vi.fn();
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(transport, "interrupt-timeout-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+    adapter.onDisconnect(disconnectCb);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Start a turn so currentTurnId is set
+    adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Now interrupt — this should timeout
+    adapter.sendBrowserMessage({ type: "interrupt" } as any);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(disconnectCb).toHaveBeenCalledOnce();
+    const errors = messages.filter((m) => m.type === "error");
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+    const errorMsg = (errors[errors.length - 1] as { message: string }).message;
+    expect(errorMsg).toContain("not responding to interrupt");
+  });
+});
+
+// ─── CodexAdapter WS reconnection handling ────────────────────────────────
+
+describe("CodexAdapter WS reconnection handling", () => {
+  it("retries user_message on Transport reconnected error instead of relaunching", async () => {
+    // When turn/start fails with "Transport reconnected" (transient WS drop),
+    // the adapter should retry the message instead of triggering a full relaunch.
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+    let callCount = 0;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        callCount++;
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") {
+          // First call fails with reconnection error, subsequent calls succeed
+          if (callCount <= 5) { // init calls + first turn/start
+            throw new Error("Transport reconnected");
+          }
+          return { turn: { id: "turn_1" } };
+        }
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h) => { notifHandler = h; }),
+      onRequest: vi.fn(),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const disconnectCb = vi.fn();
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(transport, "reconnect-retry-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+    adapter.onDisconnect(disconnectCb);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Send a user message — first turn/start will fail with "Transport reconnected"
+    adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+    await new Promise((r) => setTimeout(r, 150));
+
+    // Should NOT have triggered disconnect/relaunch
+    expect(disconnectCb).not.toHaveBeenCalled();
+
+    // Should have emitted a transient error message
+    const errors = messages.filter((m) => m.type === "error");
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+    const errorMsg = (errors[0] as { message: string }).message;
+    expect(errorMsg).toContain("briefly interrupted");
+  });
+
+  it("fires disconnectCb after exhausting MAX_RECONNECT_RETRIES consecutive Transport reconnected errors", async () => {
+    // MAX_RECONNECT_RETRIES is 5, so the 6th consecutive "Transport reconnected"
+    // error should trigger cleanupAndDisconnect (relaunch) instead of retrying.
+    const MAX_RETRIES = 5;
+    let turnStartCallCount = 0;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") {
+          turnStartCallCount++;
+          // Always fail with "Transport reconnected" to exhaust the budget
+          throw new Error("Transport reconnected");
+        }
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn(),
+      onRequest: vi.fn(),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const disconnectCb = vi.fn();
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(transport, "retry-exhaust-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+    adapter.onDisconnect(disconnectCb);
+
+    // Wait for initialization to complete
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Send a user message — each retry re-queues via flushPendingOutgoing, so
+    // a single sendBrowserMessage will cascade through all retries.
+    adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+
+    // Allow enough time for all retries to cascade (each retry is async)
+    await new Promise((r) => setTimeout(r, 500));
+
+    // After MAX_RETRIES + 1 consecutive failures, disconnectCb should fire
+    expect(turnStartCallCount).toBe(MAX_RETRIES + 1);
+    expect(disconnectCb).toHaveBeenCalledTimes(1);
+
+    // The final error should mention "multiple reconnects" / relaunching
+    const errors = messages.filter((m) => m.type === "error");
+    const relaunchError = errors.find((e) => (e as { message: string }).message.includes("multiple reconnects"));
+    expect(relaunchError).toBeDefined();
+  });
+
+  it("handleWsReconnected clears pending approvals and resets currentTurnId", async () => {
+    // When the WS proxy reconnects, the adapter should clean up stale
+    // pending state: after reconnection, sending a permission response
+    // for a pre-reconnect request should be silently dropped (no pending
+    // approval entry), and a new user_message should succeed (currentTurnId
+    // was reset, allowing a fresh turn/start).
+    let notifHandler: (m: string, p: Record<string, unknown>) => void;
+    let reqHandler: (m: string, id: number, p: Record<string, unknown>) => void;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") return { turn: { id: "turn_1" } };
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h: (m: string, p: Record<string, unknown>) => void) => { notifHandler = h; }),
+      onRequest: vi.fn((h: (m: string, id: number, p: Record<string, unknown>) => void) => { reqHandler = h; }),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const disconnectCb = vi.fn();
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(transport, "reconnect-cleanup-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+    adapter.onDisconnect(disconnectCb);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Start a turn so we have a currentTurnId
+    adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Simulate a pending approval request from Codex before reconnection
+    reqHandler!("item/commandExecution/requestApproval", 42, {
+      command: { command: "ls" },
+      cwd: "/tmp",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Find the permission request to get its request_id
+    const permReqs = messages.filter((m) => m.type === "permission_request");
+    expect(permReqs.length).toBeGreaterThanOrEqual(1);
+    const permReqId = (permReqs[0] as { request: { request_id: string } }).request.request_id;
+
+    // Trigger the wsReconnected notification
+    notifHandler!("companion/wsReconnected", {});
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Should NOT have triggered full disconnect (this is a transient recovery)
+    expect(disconnectCb).not.toHaveBeenCalled();
+    expect(adapter.isConnected()).toBe(true);
+
+    // Adapter should have emitted permission_cancelled for the stale approval
+    const cancelMsgs = messages.filter((m) => m.type === "permission_cancelled");
+    expect(cancelMsgs.length).toBe(1);
+    expect((cancelMsgs[0] as { request_id: string }).request_id).toBe(permReqId);
+
+    // Sending a permission response for the pre-reconnect request should
+    // be silently dropped (respond should NOT be called for it)
+    const respondBefore = (transport.respond as ReturnType<typeof vi.fn>).mock.calls.length;
+    adapter.sendBrowserMessage({
+      type: "permission_response",
+      request_id: permReqId,
+      behavior: "allow",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    // respond() should not have been called again — the approval was cleared
+    expect((transport.respond as ReturnType<typeof vi.fn>).mock.calls.length).toBe(respondBefore);
+
+    // A new user_message should succeed — verifying currentTurnId was reset
+    adapter.sendBrowserMessage({ type: "user_message", content: "after reconnect" });
+    await new Promise((r) => setTimeout(r, 50));
+    // turn/start should have been called again (at least 2 times total: init + post-reconnect)
+    const turnStartCalls = (transport.call as ReturnType<typeof vi.fn>).mock.calls
+      .filter((args: unknown[]) => args[0] === "turn/start");
+    expect(turnStartCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("re-initializes Codex after ws reconnect before starting the next turn", async () => {
+    // Regression: after companion/wsReconnected, Codex may reject turn/start
+    // with "Not initialized" unless we run initialize + initialized again.
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+    let initializedOnServer = false;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") {
+          if (!initializedOnServer) throw new Error("Not initialized");
+          return { turn: { id: "turn_1" } };
+        }
+        return {};
+      }),
+      notify: vi.fn(async (method: string) => {
+        if (method === "initialized") initializedOnServer = true;
+      }),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h: (m: string, p: Record<string, unknown>) => void) => { notifHandler = h; }),
+      onRequest: vi.fn(),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(transport, "reconnect-reinit-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+
+    await new Promise((r) => setTimeout(r, 100));
+    expect(initializedOnServer).toBe(true);
+
+    // Simulate that server lost initialization state when WS reconnected.
+    initializedOnServer = false;
+    expect(notifHandler).not.toBeNull();
+    notifHandler!("companion/wsReconnected", {});
+    await new Promise((r) => setTimeout(r, 50));
+
+    adapter.sendBrowserMessage({ type: "user_message", content: "after reconnect" });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
+    expect(errors.some((e) => e.message.includes("Failed to start turn: Error: Not initialized"))).toBe(false);
+
+    const initializeCalls = (transport.call as ReturnType<typeof vi.fn>).mock.calls
+      .filter((args: unknown[]) => args[0] === "initialize");
+    expect(initializeCalls.length).toBeGreaterThanOrEqual(2);
+
+    const turnStartCalls = (transport.call as ReturnType<typeof vi.fn>).mock.calls
+      .filter((args: unknown[]) => args[0] === "turn/start");
+    expect(turnStartCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("resets overloadRetryCount on companion/wsReconnected", async () => {
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "thread/resume") throw new Error("no resume");
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") return { turn: { id: "turn_1" } };
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h) => { notifHandler = h; }),
+      onRequest: vi.fn(),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const adapter = new CodexAdapter(transport, "overload-reset-on-ws-reconnect", { model: "o4-mini", cwd: "/tmp" });
+    await new Promise((r) => setTimeout(r, 100));
+
+    (adapter as any).overloadRetryCount = 4;
+    notifHandler!("companion/wsReconnected", {});
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect((adapter as any).overloadRetryCount).toBe(0);
+  });
+});
+
+// ─── CodexAdapter -32001 (server overloaded) retry handling ─────────────────
+
+describe("CodexAdapter -32001 server overloaded retry", () => {
+  /** Helper: create a transport that succeeds init, returns a thread, then
+   *  fails turn/start with -32001 for the first N calls before succeeding. */
+  function createOverloadTransport(failCount: number) {
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+    let turnStartAttempts = 0;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") {
+          turnStartAttempts++;
+          if (turnStartAttempts <= failCount) {
+            const err = new Error("Server overloaded") as Error & { code: number };
+            err.code = -32001;
+            throw err;
+          }
+          return { turn: { id: "turn_1" } };
+        }
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h) => { notifHandler = h; }),
+      onRequest: vi.fn(),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    return { transport, getTurnStartAttempts: () => turnStartAttempts, pushNotification: notifHandler };
+  }
+
+  it("retries with backoff on -32001 instead of relaunching", async () => {
+    // A single -32001 error should schedule a retry, not trigger relaunch.
+    const { transport } = createOverloadTransport(1);
+    const disconnectCb = vi.fn();
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(transport, "overload-retry-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+    adapter.onDisconnect(disconnectCb);
+
+    // Wait for initialization
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Send a user message — first turn/start will fail with -32001
+    adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+
+    // Wait for backoff (1s) + processing
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Should NOT have triggered disconnect/relaunch
+    expect(disconnectCb).not.toHaveBeenCalled();
+
+    // Should have emitted a "busy" error, not a relaunch error
+    const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
+    expect(errors.some((e) => e.message.includes("busy"))).toBe(true);
+
+    // Should have retried turn/start after backoff
+    const turnCalls = (transport.call as ReturnType<typeof vi.fn>).mock.calls
+      .filter((args: unknown[]) => args[0] === "turn/start");
+    expect(turnCalls.length).toBe(2); // 1 failed + 1 retry
+  });
+
+  it("triggers cleanupAndDisconnect after exhausting MAX_RECONNECT_RETRIES on -32001", async () => {
+    // All turn/start calls fail — after 5 retries, should relaunch.
+    // Uses fake timers because the backoff timers (1s+2s+3s+4s+5s) would be
+    // too slow for a test.
+    vi.useFakeTimers();
+    try {
+      const { transport } = createOverloadTransport(999);
+      const disconnectCb = vi.fn();
+      const messages: BrowserIncomingMessage[] = [];
+      const adapter = new CodexAdapter(transport, "overload-exhaust-test", { model: "o4-mini", cwd: "/tmp" });
+      adapter.onBrowserMessage((msg) => messages.push(msg));
+      adapter.onDisconnect(disconnectCb);
+
+      // Advance past initialization
+      await vi.advanceTimersByTimeAsync(200);
+
+      adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+
+      // Each retry: -32001 fires immediately (call throws), then schedules a
+      // timer (1s, 2s, 3s, 4s, 5s). The 6th attempt exceeds MAX_RECONNECT_RETRIES
+      // and triggers immediate relaunch (no timer needed).
+      // Total: 1000+2000+3000+4000+5000 = 15000ms of timers
+      for (let i = 0; i < 6; i++) {
+        await vi.advanceTimersByTimeAsync(6000);
+      }
+
+      // The 6th consecutive -32001 should trigger relaunch
+      expect(disconnectCb).toHaveBeenCalledOnce();
+
+      const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
+      expect(errors.some((e) => e.message.includes("overloaded after multiple retries"))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resets reconnectRetryCount on successful turn/start after -32001 retries", async () => {
+    // After a -32001 retry succeeds, the counter should reset to 0 so the
+    // next failure gets a fresh retry budget.
+    const { transport } = createOverloadTransport(1);
+    const disconnectCb = vi.fn();
+    const adapter = new CodexAdapter(transport, "overload-reset-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onDisconnect(disconnectCb);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // First message: fails once then succeeds on retry
+    adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+    await new Promise((r) => setTimeout(r, 1500));
+
+    expect(disconnectCb).not.toHaveBeenCalled();
+
+    // The retry succeeded, count should have reset — send another message
+    // that won't fail to confirm no relaunch happens
+    adapter.sendBrowserMessage({ type: "user_message", content: "hello again" });
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(disconnectCb).not.toHaveBeenCalled();
+  });
+
+  it("uses an overload-only retry budget after a transport reconnect retry", async () => {
+    // A preceding "Transport reconnected" error should not consume the
+    // overload (-32001) retry budget or delay its first retry.
+    vi.useFakeTimers();
+    try {
+      let turnStartAttempts = 0;
+      const transport: ICodexTransport = {
+        call: vi.fn(async (method: string) => {
+          if (method === "initialize") return { userAgent: "codex" };
+          if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+          if (method === "account/rateLimits/read") return {};
+          if (method === "turn/start") {
+            turnStartAttempts++;
+            if (turnStartAttempts === 1) throw new Error("Transport reconnected");
+            if (turnStartAttempts === 2) {
+              const err = new Error("Server overloaded") as Error & { code: number };
+              err.code = -32001;
+              throw err;
+            }
+            return { turn: { id: "turn_1" } };
+          }
+          return {};
+        }),
+        notify: vi.fn(async () => {}),
+        respond: vi.fn(async () => {}),
+        onNotification: vi.fn(),
+        onRequest: vi.fn(),
+        onRawIncoming: vi.fn(),
+        onRawOutgoing: vi.fn(),
+        onParseError: vi.fn(),
+        isConnected: vi.fn(() => true),
+      };
+
+      const adapter = new CodexAdapter(transport, "overload-budget-split-test", { model: "o4-mini", cwd: "/tmp" });
+
+      await vi.advanceTimersByTimeAsync(200);
+      adapter.sendBrowserMessage({ type: "user_message", content: "hello" });
+      await vi.advanceTimersByTimeAsync(10);
+
+      // 1st attempt: Transport reconnected
+      // 2nd attempt: -32001 and schedules overload retry after 1s
+      let turnCalls = (transport.call as ReturnType<typeof vi.fn>).mock.calls
+        .filter((args: unknown[]) => args[0] === "turn/start");
+      expect(turnCalls.length).toBe(2);
+
+      // With split counters, first overload retry fires after 1s.
+      await vi.advanceTimersByTimeAsync(1000);
+      turnCalls = (transport.call as ReturnType<typeof vi.fn>).mock.calls
+        .filter((args: unknown[]) => args[0] === "turn/start");
+      expect(turnCalls.length).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resets overloadRetryCount in resetForReconnect", async () => {
+    const transport1: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") return { turn: { id: "turn_1" } };
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn(),
+      onRequest: vi.fn(),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const transport2: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_2" } };
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") return { turn: { id: "turn_2" } };
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn(),
+      onRequest: vi.fn(),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const adapter = new CodexAdapter(transport1, "overload-reset-on-transport-reconnect", { model: "o4-mini", cwd: "/tmp" });
+    await new Promise((r) => setTimeout(r, 100));
+
+    (adapter as any).overloadRetryCount = 5;
+    adapter.resetForReconnect(transport2);
+
+    expect((adapter as any).overloadRetryCount).toBe(0);
+  });
+});
+
+// ─── CodexAdapter streaming state reset on WS reconnect ─────────────────────
+
+describe("CodexAdapter streaming state reset on WS reconnect", () => {
+  it("emits synthetic content_block_stop and message_delta when streaming was active", async () => {
+    // When streamingItemId is set at reconnect time, the adapter should emit
+    // content_block_stop + message_delta(interrupted) so the browser closes
+    // the orphaned streaming block.
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "thread/resume") throw new Error("no resume");
+        if (method === "account/rateLimits/read") return {};
+        if (method === "turn/start") return { turn: { id: "turn_1" } };
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h) => { notifHandler = h; }),
+      onRequest: vi.fn(),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(transport, "streaming-reset-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Simulate an active streaming item via item/started notification
+    notifHandler!("item/started", {
+      threadId: "thr_1",
+      turnId: "turn_1",
+      item: { id: "item_1", type: "agentMessage", text: "" },
+    });
+    // Simulate a text delta so streamingText/streamingItemId are set
+    notifHandler!("item/delta", {
+      threadId: "thr_1",
+      turnId: "turn_1",
+      itemId: "item_1",
+      delta: { type: "text", text: "hello world" },
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Clear messages before reconnect to isolate the synthetic events
+    messages.length = 0;
+
+    // Trigger WS reconnect
+    notifHandler!("companion/wsReconnected", {});
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Should have emitted content_block_stop
+    const stopEvents = messages.filter(
+      (m) => m.type === "stream_event" && (m as any).event?.type === "content_block_stop",
+    );
+    expect(stopEvents.length).toBeGreaterThanOrEqual(1);
+
+    // Should have emitted message_delta with stop_reason "interrupted"
+    const deltaEvents = messages.filter(
+      (m) => m.type === "stream_event" && (m as any).event?.type === "message_delta",
+    );
+    expect(deltaEvents.length).toBeGreaterThanOrEqual(1);
+    expect((deltaEvents[0] as any).event.delta.stop_reason).toBe("interrupted");
+  });
+
+  it("does NOT emit synthetic events when no streaming was active", async () => {
+    // When streamingItemId is null at reconnect time, no synthetic events
+    // should be emitted.
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "thread/resume") throw new Error("no resume");
+        if (method === "account/rateLimits/read") return {};
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {}),
+      onNotification: vi.fn((h) => { notifHandler = h; }),
+      onRequest: vi.fn(),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(transport, "no-streaming-reset-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Clear init messages
+    messages.length = 0;
+
+    // Trigger WS reconnect without any streaming active
+    notifHandler!("companion/wsReconnected", {});
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Should NOT have emitted any content_block_stop or message_delta
+    const streamEvents = messages.filter(
+      (m) => m.type === "stream_event" && ["content_block_stop", "message_delta"].includes((m as any).event?.type),
+    );
+    expect(streamEvents.length).toBe(0);
+  });
+});
+
+// ─── CodexAdapter permission response try/catch on transport failure ────────
+
+describe("CodexAdapter permission response resilience", () => {
+  it("catches Transport closed error during permission response without crashing", async () => {
+    // When the browser sends a permission response after the transport has
+    // closed, the try/catch should prevent unhandled rejections.
+    let notifHandler: ((m: string, p: Record<string, unknown>) => void) | null = null;
+    let requestHandler: ((m: string, id: number, p: Record<string, unknown>) => void) | null = null;
+
+    const transport: ICodexTransport = {
+      call: vi.fn(async (method: string) => {
+        if (method === "initialize") return { userAgent: "codex" };
+        if (method === "thread/start" || method === "thread/create") return { thread: { id: "thr_1" } };
+        if (method === "account/rateLimits/read") return {};
+        return {};
+      }),
+      notify: vi.fn(async () => {}),
+      respond: vi.fn(async () => {
+        throw new Error("Transport closed");
+      }),
+      onNotification: vi.fn((h) => { notifHandler = h; }),
+      onRequest: vi.fn((h) => { requestHandler = h; }),
+      onRawIncoming: vi.fn(),
+      onRawOutgoing: vi.fn(),
+      onParseError: vi.fn(),
+      isConnected: vi.fn(() => true),
+    };
+
+    const messages: BrowserIncomingMessage[] = [];
+    const adapter = new CodexAdapter(transport, "perm-transport-closed-test", { model: "o4-mini", cwd: "/tmp" });
+    adapter.onBrowserMessage((msg) => messages.push(msg));
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Simulate a command execution approval request from Codex
+    requestHandler!("item/commandExecution/requestApproval", 42, {
+      threadId: "thr_1",
+      turnId: "turn_1",
+      itemId: "item_1",
+      command: "ls",
+      reason: "List files",
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Get the request_id from the permission_request emitted to browser
+    const permReqs = messages.filter((m) => m.type === "permission_request") as Array<{ request: { request_id: string } }>;
+    expect(permReqs.length).toBe(1);
+    const requestId = permReqs[0].request.request_id;
+
+    // Now respond — transport.respond will throw "Transport closed"
+    // This should NOT throw or cause an unhandled rejection
+    adapter.sendBrowserMessage({
+      type: "permission_response",
+      request_id: requestId,
+      behavior: "allow",
+    });
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // The adapter should still be functional (no crash)
+    // No additional error should be surfaced to the browser for this
+    const errors = messages.filter((m) => m.type === "error") as Array<{ message: string }>;
+    const transportErrors = errors.filter((e) => e.message.includes("Transport closed"));
+    expect(transportErrors.length).toBe(0); // swallowed, not surfaced
   });
 });

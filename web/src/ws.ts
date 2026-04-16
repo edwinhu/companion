@@ -1,7 +1,9 @@
 import { useStore } from "./store.js";
-import type { BrowserIncomingMessage, BrowserOutgoingMessage, ContentBlock, ChatMessage, TaskItem, ProcessItem, ProcessStatus, SdkSessionInfo, McpServerConfig } from "./types.js";
+import type { BrowserIncomingMessage, BrowserOutgoingMessage, ContentBlock, ChatMessage, TaskItem, ProcessItem, ProcessStatus, SdkSessionInfo, McpServerConfig, BackgroundAgentItem } from "./types.js";
 import { generateUniqueSessionName } from "./utils/names.js";
 import { playNotificationSound } from "./utils/notification-sound.js";
+import { getPreview } from "./components/ToolBlock.js";
+import type { ToolActivityEntry } from "./store/tasks-slice.js";
 
 const WS_RECONNECT_DELAY_MS = 2000;
 const sockets = new Map<string, WebSocket>();
@@ -10,8 +12,69 @@ const lastSeqBySession = new Map<string, number>();
 const taskCounters = new Map<string, number>();
 const streamingPhaseBySession = new Map<string, "thinking" | "text">();
 const streamingDraftMessageIdBySession = new Map<string, string>();
+const pendingOutgoingBySession = new Map<string, BrowserOutgoingMessage[]>();
 /** Track processed tool_use IDs to prevent duplicate task creation */
 const processedToolUseIds = new Map<string, Set<string>>();
+
+function isSocketUsable(ws: WebSocket | undefined): boolean {
+  return !!ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING);
+}
+
+function shouldReconnectSession(sessionId: string): boolean {
+  const store = useStore.getState();
+  const sdkSession = store.sdkSessions.find((s) => s.sessionId === sessionId);
+  if (sdkSession) return !sdkSession.archived;
+  // Fallback for freshly-created sessions that may not be in sdkSessions yet.
+  return store.currentSessionId === sessionId;
+}
+
+function getReconnectCandidates(): string[] {
+  const store = useStore.getState();
+  const ids = new Set<string>();
+  for (const s of store.sdkSessions) {
+    if (!s.archived) ids.add(s.sessionId);
+  }
+  if (store.currentSessionId) ids.add(store.currentSessionId);
+  return Array.from(ids);
+}
+
+// ── Page visibility handling ─────────────────────────────────────────────────
+// Mobile browsers (Android Chrome, iOS Safari) aggressively kill WebSocket
+// connections when the page is backgrounded. Without this handler, the frontend
+// enters a rapid connect/disconnect cycle: WS opens, browser kills it, 2s
+// reconnect timer fires, WS opens again, browser kills it again...
+//
+// Solution: when the page becomes hidden, pause all reconnect attempts. When
+// the page becomes visible again, immediately reconnect all active sessions.
+let pageHidden = typeof document !== "undefined" ? document.hidden : false;
+
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      pageHidden = true;
+      // Cancel all pending reconnect timers — no point reconnecting while hidden
+      for (const [sessionId, timer] of reconnectTimers) {
+        clearTimeout(timer);
+        reconnectTimers.delete(sessionId);
+      }
+    } else {
+      pageHidden = false;
+      // Page is visible again — reconnect all known active sessions.
+      for (const sessionId of getReconnectCandidates()) {
+        // Re-check in case sdkSessions changed after candidate collection.
+        if (!shouldReconnectSession(sessionId)) continue;
+        const ws = sockets.get(sessionId);
+        if (!isSocketUsable(ws)) {
+          if (ws) {
+            try { ws.close(); } catch {}
+            sockets.delete(sessionId);
+          }
+          connectSession(sessionId);
+        }
+      }
+    }
+  });
+}
 
 function normalizePath(path: string): string {
   const isAbs = path.startsWith("/");
@@ -28,7 +91,7 @@ function normalizePath(path: string): string {
   return `${isAbs ? "/" : ""}${out.join("/")}`;
 }
 
-export function resolveSessionFilePath(filePath: string, cwd?: string): string {
+function resolveSessionFilePath(filePath: string, cwd?: string): string {
   if (filePath.startsWith("/")) return normalizePath(filePath);
   if (!cwd) return normalizePath(filePath);
   return normalizePath(`${cwd}/${filePath}`);
@@ -190,6 +253,75 @@ function extractProcessesFromBlocks(sessionId: string, blocks: ContentBlock[]) {
   }
 }
 
+/** Pending background Agent calls awaiting their tool_result */
+const pendingBackgroundAgents = new Map<string, Map<string, { name: string; description: string; agentType: string; startedAt: number }>>();
+/** Separate dedup set for background agents (shared processedToolUseIds is consumed by task extraction) */
+const processedAgentIds = new Map<string, Set<string>>();
+
+function extractBackgroundAgentsFromBlocks(sessionId: string, blocks: ContentBlock[]) {
+  const store = useStore.getState();
+  let agentProcessed = processedAgentIds.get(sessionId);
+  if (!agentProcessed) {
+    agentProcessed = new Set();
+    processedAgentIds.set(sessionId, agentProcessed);
+  }
+
+  for (const block of blocks) {
+    // Phase 1: Detect Agent tool_use with run_in_background
+    if (block.type === "tool_use" && block.name === "Agent") {
+      if (block.id && agentProcessed.has(block.id)) continue;
+      const input = block.input as Record<string, unknown>;
+      if (input.run_in_background === true) {
+        if (block.id) agentProcessed.add(block.id);
+        let sessionPending = pendingBackgroundAgents.get(sessionId);
+        if (!sessionPending) {
+          sessionPending = new Map();
+          pendingBackgroundAgents.set(sessionId, sessionPending);
+        }
+        const agentItem: BackgroundAgentItem = {
+          toolUseId: block.id,
+          name: (input.name as string) || (input.description as string) || "Background agent",
+          description: (input.description as string) || "",
+          agentType: (input.subagent_type as string) || "general-purpose",
+          status: "running",
+          startedAt: Date.now(),
+        };
+        sessionPending.set(block.id, {
+          name: agentItem.name,
+          description: agentItem.description,
+          agentType: agentItem.agentType,
+          startedAt: agentItem.startedAt,
+        });
+        store.addBackgroundAgent(sessionId, agentItem);
+      }
+    }
+
+    // Phase 2: Match tool_result to a pending background Agent
+    if (block.type === "tool_result") {
+      const toolUseId = block.tool_use_id;
+      const sessionPending = pendingBackgroundAgents.get(sessionId);
+      const pending = sessionPending?.get(toolUseId);
+      if (sessionPending && pending) {
+        const content = typeof block.content === "string"
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.map((b) => ("text" in b ? (b as { text: string }).text : "")).join("")
+            : "";
+        const isError = block.is_error === true;
+        store.updateBackgroundAgent(sessionId, toolUseId, {
+          status: isError ? "failed" : "completed",
+          completedAt: Date.now(),
+          summary: content.length > 200 ? content.slice(0, 200) + "..." : content,
+        });
+        sessionPending.delete(toolUseId);
+        if (sessionPending.size === 0) {
+          pendingBackgroundAgents.delete(sessionId);
+        }
+      }
+    }
+  }
+}
+
 function sendBrowserNotification(title: string, body: string, tag: string) {
   if (typeof Notification === "undefined") return;
   if (Notification.permission !== "granted") return;
@@ -236,13 +368,37 @@ function nextId(): string {
   return `msg-${Date.now()}-${++idCounter}`;
 }
 
-function setStreamingDraftMessage(sessionId: string, content: string) {
+function enqueueOutgoing(sessionId: string, msg: BrowserOutgoingMessage) {
+  const queued = pendingOutgoingBySession.get(sessionId) || [];
+  queued.push(msg);
+  pendingOutgoingBySession.set(sessionId, queued);
+}
+
+function flushQueuedOutgoing(sessionId: string, ws: WebSocket) {
+  const queued = pendingOutgoingBySession.get(sessionId);
+  if (!queued?.length || ws.readyState !== WebSocket.OPEN) return;
+  pendingOutgoingBySession.delete(sessionId);
+  for (const msg of queued) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+/** Accumulated streaming content per session — thinking and text tracked separately */
+const streamingBlocksBySession = new Map<string, { thinking: string; text: string }>();
+
+function setStreamingDraftMessage(sessionId: string, content: string, phase?: "thinking" | "text") {
   const store = useStore.getState();
   const existing = store.messages.get(sessionId) || [];
-  const messages = [...existing];
   const existingDraftId = streamingDraftMessageIdBySession.get(sessionId);
-  let draftIndex = -1;
 
+  // Remove ALL orphaned streaming drafts (messages with isStreaming that aren't
+  // the tracked draft). This prevents duplicates when message_history merges or
+  // reconnects leave stale drafts in the array.
+  let messages = existing.filter(
+    (m) => !m.isStreaming || m.id === existingDraftId,
+  );
+
+  let draftIndex = -1;
   if (existingDraftId) {
     draftIndex = messages.findIndex((m) => m.id === existingDraftId);
     if (draftIndex === -1) {
@@ -253,61 +409,48 @@ function setStreamingDraftMessage(sessionId: string, content: string) {
   if (draftIndex === -1) {
     const id = `stream-${sessionId}-${nextId()}`;
     streamingDraftMessageIdBySession.set(sessionId, id);
-    messages.push({
+    messages = [...messages, {
       id,
-      role: "assistant",
+      role: "assistant" as const,
       content,
       timestamp: Date.now(),
       isStreaming: true,
-    });
+      streamingPhase: phase,
+    }];
   } else {
+    messages = [...messages];
     const prev = messages[draftIndex];
     messages[draftIndex] = {
       ...prev,
       role: "assistant",
       content,
       isStreaming: true,
+      streamingPhase: phase,
     };
   }
 
   store.setMessages(sessionId, messages);
 }
 
-function finalizeStreamingDraftMessage(sessionId: string, finalMessage: ChatMessage): boolean {
-  const draftId = streamingDraftMessageIdBySession.get(sessionId);
-  if (!draftId) return false;
-
-  const store = useStore.getState();
-  const existing = store.messages.get(sessionId) || [];
-  const draftIndex = existing.findIndex((m) => m.id === draftId);
-  if (draftIndex === -1) {
-    streamingDraftMessageIdBySession.delete(sessionId);
-    return false;
-  }
-
-  const messages = [...existing];
-  messages[draftIndex] = finalMessage;
-  store.setMessages(sessionId, messages);
-  streamingDraftMessageIdBySession.delete(sessionId);
-  return true;
-}
-
 function clearStreamingDraftMessage(sessionId: string) {
-  const draftId = streamingDraftMessageIdBySession.get(sessionId);
-  if (!draftId) return;
+  streamingDraftMessageIdBySession.delete(sessionId);
 
+  // Remove ALL streaming draft messages, not just the tracked one.
+  // This guards against orphaned drafts from reconnects or message_history merges.
   const store = useStore.getState();
   const existing = store.messages.get(sessionId) || [];
-  const next = existing.filter((m) => m.id !== draftId);
+  const next = existing.filter((m) => !m.isStreaming);
   if (next.length !== existing.length) {
     store.setMessages(sessionId, next);
   }
-
-  streamingDraftMessageIdBySession.delete(sessionId);
 }
 
 function nextClientMsgId(): string {
   return `cmsg-${Date.now()}-${++clientMsgCounter}`;
+}
+
+export function createClientMessageId(): string {
+  return nextClientMsgId();
 }
 
 const IDEMPOTENT_OUTGOING_TYPES = new Set<BrowserOutgoingMessage["type"]>([
@@ -372,24 +515,62 @@ function extractTextFromBlocks(blocks: ContentBlock[]): string {
     .join("\n");
 }
 
+/** Stable dedup key for a content block — ignores mutable metadata like `signature`. */
+function contentBlockKey(block: ContentBlock): string {
+  if (block.type === "thinking") return `thinking:${block.thinking}`;
+  if (block.type === "text") return `text:${block.text}`;
+  if (block.type === "tool_use") return `tool_use:${block.id}`;
+  if (block.type === "tool_result") return `tool_result:${block.tool_use_id}`;
+  return JSON.stringify(block);
+}
+
 function mergeContentBlocks(prev?: ContentBlock[], next?: ContentBlock[]): ContentBlock[] | undefined {
   const prevBlocks = prev || [];
   const nextBlocks = next || [];
   if (prevBlocks.length === 0 && nextBlocks.length === 0) return undefined;
 
+  // Build a map of next blocks for in-place replacement of matching prev blocks.
+  const nextByKey = new Map<string, ContentBlock>();
+  for (const block of nextBlocks) {
+    nextByKey.set(contentBlockKey(block), block);
+  }
+
   const merged: ContentBlock[] = [];
   const seen = new Set<string>();
 
-  const pushUnique = (block: ContentBlock) => {
-    const key = JSON.stringify(block);
-    if (seen.has(key)) return;
+  // Prev blocks first (preserves chronological order), replaced by next if matching.
+  for (const block of prevBlocks) {
+    const key = contentBlockKey(block);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(nextByKey.get(key) || block);
+  }
+  // Append any next blocks not already covered by prev.
+  for (const block of nextBlocks) {
+    const key = contentBlockKey(block);
+    if (seen.has(key)) continue;
     seen.add(key);
     merged.push(block);
-  };
-
-  for (const block of prevBlocks) pushUnique(block);
-  for (const block of nextBlocks) pushUnique(block);
+  }
   return merged;
+}
+
+function buildToolActivityEntry(
+  toolUseId: string,
+  toolName: string,
+  input: Record<string, unknown>,
+  startedAt: number,
+  parentToolUseId?: string | null,
+): ToolActivityEntry {
+  return {
+    toolUseId,
+    toolName,
+    preview: getPreview(toolName, input),
+    startedAt,
+    elapsedSeconds: 0,
+    isError: false,
+    parentToolUseId: parentToolUseId || undefined,
+  };
 }
 
 function mergeAssistantMessage(previous: ChatMessage, incoming: ChatMessage): ChatMessage {
@@ -429,6 +610,7 @@ function handleMessage(sessionId: string, event: MessageEvent) {
   try {
     data = JSON.parse(event.data);
   } catch {
+    console.warn(`[ws] Failed to parse incoming message for session ${sessionId}:`, event.data?.substring?.(0, 120));
     return;
   }
 
@@ -463,6 +645,7 @@ function handleParsedMessage(
       const existingSession = store.sessions.get(sessionId);
       store.addSession(data.session);
       store.setCliConnected(sessionId, true);
+      store.setCliReconnecting(sessionId, false);
       if (!existingSession) {
         store.setSessionStatus(sessionId, "idle");
       }
@@ -492,12 +675,19 @@ function handleParsedMessage(
         model: msg.model,
         stopReason: msg.stop_reason,
       };
-      const replacedDraft = finalizeStreamingDraftMessage(sessionId, chatMsg);
-      if (!replacedDraft) {
-        upsertAssistantMessage(sessionId, chatMsg);
-      }
+      // Clear any streaming draft first, then upsert the real message.
+      // Using clearStreamingDraftMessage + upsertAssistantMessage instead of
+      // finalizeStreamingDraftMessage avoids duplicates when the CLI sends
+      // multiple assistant messages for the same turn (e.g. thinking → text →
+      // tool_use) and streaming deltas create new drafts between them.
+      clearStreamingDraftMessage(sessionId);
+      upsertAssistantMessage(sessionId, chatMsg);
       store.setStreaming(sessionId, null);
       streamingPhaseBySession.delete(sessionId);
+      // Reset streaming text accumulators so subsequent deltas in the same
+      // turn don't re-show content that was already committed in the real
+      // assistant message (prevents the "3-4 duplicate lines" streaming bug).
+      streamingBlocksBySession.delete(sessionId);
       // Clear progress only for completed tools (tool_result blocks), not all tools.
       // Blanket clear would cause flickering during concurrent tool execution.
       if (msg.content?.length) {
@@ -514,11 +704,34 @@ function handleParsedMessage(
         store.setStreamingStats(sessionId, { startedAt: Date.now() });
       }
 
+      // Track tool activity for execution timeline
+      if (msg.content?.length) {
+        for (const block of msg.content) {
+          if (block.type === "tool_use") {
+            const input = (block as { input?: Record<string, unknown> }).input || {};
+            store.addToolActivity(sessionId, buildToolActivityEntry(
+              block.id,
+              block.name,
+              input,
+              data.timestamp || Date.now(),
+              data.parent_tool_use_id,
+            ));
+          }
+          if (block.type === "tool_result") {
+            store.updateToolActivity(sessionId, block.tool_use_id, {
+              completedAt: Date.now(),
+              isError: Boolean(block.is_error),
+            });
+          }
+        }
+      }
+
       // Extract tasks and changed files from tool_use content blocks
       if (msg.content?.length) {
         extractTasksFromBlocks(sessionId, msg.content);
         extractChangedFilesFromBlocks(sessionId, msg.content);
         extractProcessesFromBlocks(sessionId, msg.content);
+        extractBackgroundAgentsFromBlocks(sessionId, msg.content);
       }
 
       break;
@@ -530,6 +743,7 @@ function handleParsedMessage(
         // message_start → mark generation start time
         if (evt.type === "message_start") {
           streamingPhaseBySession.delete(sessionId);
+          streamingBlocksBySession.delete(sessionId);
           clearStreamingDraftMessage(sessionId);
           if (!store.streamingStartedAt.has(sessionId)) {
             store.setStreamingStats(sessionId, { startedAt: Date.now(), outputTokens: 0 });
@@ -540,28 +754,28 @@ function handleParsedMessage(
         if (evt.type === "content_block_delta") {
           const delta = evt.delta as Record<string, unknown> | undefined;
           if (delta?.type === "text_delta" && typeof delta.text === "string") {
-            let current = store.streaming.get(sessionId) || "";
-            const thinkingPrefix = "Thinking:\n";
-            const responsePrefix = "\n\nResponse:\n";
-            if (streamingPhaseBySession.get(sessionId) === "thinking" && !current.includes(responsePrefix)) {
-              current += responsePrefix;
+            const parts = streamingBlocksBySession.get(sessionId) || { thinking: "", text: "" };
+            // Reset thinking accumulator on phase transition so that if
+            // thinking resumes later it starts fresh (avoids showing stale
+            // concatenated thinking from a previous block).
+            if (streamingPhaseBySession.get(sessionId) === "thinking") {
+              parts.thinking = "";
             }
+            parts.text += delta.text;
+            streamingBlocksBySession.set(sessionId, parts);
             streamingPhaseBySession.set(sessionId, "text");
-            const nextText = current + delta.text;
-            store.setStreaming(sessionId, nextText);
-            setStreamingDraftMessage(sessionId, nextText);
+            // Show only the response text in the streaming draft
+            store.setStreaming(sessionId, parts.text);
+            setStreamingDraftMessage(sessionId, parts.text, "text");
           }
           if (delta?.type === "thinking_delta" && typeof delta.thinking === "string") {
-            const current = store.streaming.get(sessionId) || "";
-            const prefix = "Thinking:\n";
-            const phase = streamingPhaseBySession.get(sessionId);
-            const base = phase === "thinking"
-              ? (current.startsWith(prefix) ? current : prefix)
-              : prefix;
+            const parts = streamingBlocksBySession.get(sessionId) || { thinking: "", text: "" };
+            parts.thinking += delta.thinking;
+            streamingBlocksBySession.set(sessionId, parts);
             streamingPhaseBySession.set(sessionId, "thinking");
-            const nextText = base + delta.thinking;
-            store.setStreaming(sessionId, nextText);
-            setStreamingDraftMessage(sessionId, nextText);
+            // Show thinking text directly as faded inline text
+            store.setStreaming(sessionId, parts.thinking);
+            setStreamingDraftMessage(sessionId, parts.thinking, "thinking");
           }
         }
 
@@ -580,6 +794,7 @@ function handleParsedMessage(
       // Flush processed tool IDs at end of turn — deduplication only needed
       // within a single turn. Preserves memory in long-running sessions.
       processedToolUseIds.delete(sessionId);
+      processedAgentIds.delete(sessionId);
 
       const r = data.data;
       const sessionUpdates: Partial<{ total_cost_usd: number; num_turns: number; context_used_percent: number; total_lines_added: number; total_lines_removed: number }> = {
@@ -608,6 +823,7 @@ function handleParsedMessage(
       clearStreamingDraftMessage(sessionId);
       store.setStreaming(sessionId, null);
       streamingPhaseBySession.delete(sessionId);
+      streamingBlocksBySession.delete(sessionId);
       store.setStreamingStats(sessionId, null);
       store.clearToolProgress(sessionId);
       store.setSessionStatus(sessionId, "idle");
@@ -651,6 +867,7 @@ function handleParsedMessage(
         extractTasksFromBlocks(sessionId, permBlocks);
         extractChangedFilesFromBlocks(sessionId, permBlocks);
         extractProcessesFromBlocks(sessionId, permBlocks);
+        extractBackgroundAgentsFromBlocks(sessionId, permBlocks);
       }
       break;
     }
@@ -675,16 +892,40 @@ function handleParsedMessage(
         toolName: data.tool_name,
         elapsedSeconds: data.elapsed_time_seconds,
       });
+      // Also update tool activity elapsed time
+      store.updateToolActivity(sessionId, data.tool_use_id, {
+        elapsedSeconds: data.elapsed_time_seconds,
+      });
       break;
     }
 
     case "tool_use_summary": {
+      // For Claude Code, tool_use content blocks in the assistant message
+      // already render the tool call via ToolBlock/EditBlock — rendering a
+      // duplicate system message would be redundant.
+      // For Codex, tool_use blocks may not be present, so we still render.
+      const backend = store.sdkSessions.find(
+        (s) => s.sessionId === sessionId,
+      )?.backendType;
+      if (backend === "codex") {
+        store.appendMessage(sessionId, {
+          id: nextId(),
+          role: "system",
+          content: data.summary,
+          timestamp: Date.now(),
+        });
+      }
+      break;
+    }
+
+    case "user_message": {
       store.appendMessage(sessionId, {
-        id: nextId(),
-        role: "system",
-        content: data.summary,
-        timestamp: Date.now(),
+        id: data.id || nextId(),
+        role: "user",
+        content: data.content,
+        timestamp: data.timestamp || Date.now(),
       });
+      store.clearPromptSuggestions(sessionId);
       break;
     }
 
@@ -743,14 +984,40 @@ function handleParsedMessage(
       break;
     }
 
+    case "session_phase": {
+      const phase = data.phase;
+      if (phase === "terminated") {
+        store.setCliConnected(sessionId, false);
+        store.setCliReconnecting(sessionId, false);
+        store.setSessionStatus(sessionId, null);
+      } else if (phase === "reconnecting") {
+        store.setCliConnected(sessionId, false);
+        store.setCliReconnecting(sessionId, true);
+        store.setSessionStatus(sessionId, null);
+      } else if (phase === "starting" || phase === "initializing") {
+        store.setCliConnected(sessionId, false);
+        store.setCliReconnecting(sessionId, true);
+      } else {
+        store.setCliConnected(sessionId, true);
+        store.setCliReconnecting(sessionId, false);
+        if (phase === "ready") store.setSessionStatus(sessionId, "idle");
+        else if (phase === "streaming") store.setSessionStatus(sessionId, "running");
+        else if (phase === "compacting") store.setSessionStatus(sessionId, "compacting");
+        else if (phase === "awaiting_permission") store.setSessionStatus(sessionId, "running");
+      }
+      break;
+    }
+
     case "cli_disconnected": {
       store.setCliConnected(sessionId, false);
+      store.setCliReconnecting(sessionId, false);
       store.setSessionStatus(sessionId, null);
       break;
     }
 
     case "cli_connected": {
       store.setCliConnected(sessionId, true);
+      store.setCliReconnecting(sessionId, false);
       break;
     }
 
@@ -777,6 +1044,7 @@ function handleParsedMessage(
 
     case "message_history": {
       const chatMessages: ChatMessage[] = [];
+      const toolActivityById = new Map<string, ToolActivityEntry>();
       for (let i = 0; i < data.messages.length; i++) {
         const histMsg = data.messages[i];
         if (histMsg.type === "user_message") {
@@ -810,6 +1078,38 @@ function handleParsedMessage(
             extractTasksFromBlocks(sessionId, msg.content);
             extractChangedFilesFromBlocks(sessionId, msg.content);
             extractProcessesFromBlocks(sessionId, msg.content);
+            extractBackgroundAgentsFromBlocks(sessionId, msg.content);
+            const baseTimestamp = histMsg.timestamp || Date.now();
+            for (const block of msg.content) {
+              if (block.type === "tool_use") {
+                const input = (block as { input?: Record<string, unknown> }).input || {};
+                const existing = toolActivityById.get(block.id);
+                toolActivityById.set(
+                  block.id,
+                  existing ?? buildToolActivityEntry(
+                    block.id,
+                    block.name,
+                    input,
+                    baseTimestamp,
+                    histMsg.parent_tool_use_id,
+                  ),
+                );
+              }
+              if (block.type === "tool_result") {
+                const existing = toolActivityById.get(block.tool_use_id);
+                if (existing) {
+                  toolActivityById.set(block.tool_use_id, {
+                    ...existing,
+                    completedAt: baseTimestamp,
+                    isError: existing.isError || Boolean(block.is_error),
+                    elapsedSeconds: Math.max(
+                      existing.elapsedSeconds,
+                      existing.completedAt ? existing.elapsedSeconds : Math.max(0, (baseTimestamp - existing.startedAt) / 1000),
+                    ),
+                  });
+                }
+              }
+            }
           }
         } else if (histMsg.type === "result") {
           const r = histMsg.data;
@@ -878,6 +1178,7 @@ function handleParsedMessage(
           store.setMessages(sessionId, merged);
         }
       }
+      store.setToolActivity(sessionId, Array.from(toolActivityById.values()).sort((a, b) => a.startedAt - b.startedAt));
       // Fix: if the last history message is a `result`, the session's last turn
       // is complete. Clear any stale streaming state that event_replay might not
       // correct (e.g. when `result` was pruned from the 600-event buffer).
@@ -886,6 +1187,7 @@ function handleParsedMessage(
         clearStreamingDraftMessage(sessionId);
         store.setStreaming(sessionId, null);
         streamingPhaseBySession.delete(sessionId);
+        streamingBlocksBySession.delete(sessionId);
         store.setStreamingStats(sessionId, null);
         store.clearToolProgress(sessionId);
         store.setSessionStatus(sessionId, "idle");
@@ -911,11 +1213,49 @@ function handleParsedMessage(
       }
       break;
     }
+
+    case "prompt_suggestion": {
+      const suggestions = (data as BrowserIncomingMessage & { type: "prompt_suggestion"; suggestions: string[] }).suggestions;
+      store.setPromptSuggestions(sessionId, suggestions);
+      break;
+    }
+
+    case "streamlined_text": {
+      store.appendMessage(sessionId, {
+        id: nextId(),
+        role: "assistant",
+        content: data.text,
+        timestamp: Date.now(),
+      });
+      break;
+    }
+
+    case "streamlined_tool_use_summary": {
+      // Streamlined mode emits summary-only tool activity instead of the richer
+      // assistant/tool_use_summary flow, so surface it as a system message.
+      store.appendMessage(sessionId, {
+        id: nextId(),
+        role: "system",
+        content: data.tool_summary,
+        timestamp: Date.now(),
+      });
+      break;
+    }
+
+    default: {
+      console.debug("[ws] Unhandled message type:", (data as { type: string }).type);
+      break;
+    }
   }
 }
 
 export function connectSession(sessionId: string) {
-  if (sockets.has(sessionId)) return;
+  const existing = sockets.get(sessionId);
+  if (isSocketUsable(existing)) return;
+  if (existing) {
+    try { existing.close(); } catch {}
+    sockets.delete(sessionId);
+  }
 
   const store = useStore.getState();
   store.setConnectionStatus(sessionId, "connecting");
@@ -928,6 +1268,7 @@ export function connectSession(sessionId: string) {
     // proving the subscription succeeded. handleMessage promotes to "connected".
     const lastSeq = getLastSeq(sessionId);
     ws.send(JSON.stringify({ type: "session_subscribe", last_seq: lastSeq }));
+    flushQueuedOutgoing(sessionId, ws);
     // Clear any reconnect timer
     const timer = reconnectTimers.get(sessionId);
     if (timer) {
@@ -939,6 +1280,8 @@ export function connectSession(sessionId: string) {
   ws.onmessage = (event) => handleMessage(sessionId, event);
 
   ws.onclose = () => {
+    // Guard against stale close events from a replaced socket.
+    if (sockets.get(sessionId) !== ws) return;
     sockets.delete(sessionId);
     useStore.getState().setConnectionStatus(sessionId, "disconnected");
     scheduleReconnect(sessionId);
@@ -951,14 +1294,15 @@ export function connectSession(sessionId: string) {
 
 function scheduleReconnect(sessionId: string) {
   if (reconnectTimers.has(sessionId)) return;
+  // Don't schedule reconnect when page is hidden — mobile browsers will just
+  // kill the new connection too, creating a wasteful connect/disconnect cycle.
+  // The visibilitychange handler will reconnect when the page becomes visible.
+  if (pageHidden) return;
   const timer = setTimeout(() => {
     reconnectTimers.delete(sessionId);
-    const store = useStore.getState();
-    // Reconnect any active (non-archived) session
-    const sdkSession = store.sdkSessions.find((s) => s.sessionId === sessionId);
-    if (sdkSession && !sdkSession.archived) {
-      connectSession(sessionId);
-    }
+    // Re-check visibility — page may have been hidden during the delay
+    if (pageHidden) return;
+    if (shouldReconnectSession(sessionId)) connectSession(sessionId);
   }, WS_RECONNECT_DELAY_MS);
   reconnectTimers.set(sessionId, timer);
 }
@@ -974,12 +1318,16 @@ export function disconnectSession(sessionId: string) {
     ws.close();
     sockets.delete(sessionId);
   }
+  useStore.getState().setConnectionStatus(sessionId, "disconnected");
   processedToolUseIds.delete(sessionId);
+  processedAgentIds.delete(sessionId);
   pendingBackgroundBash.delete(sessionId);
   taskCounters.delete(sessionId);
   streamingPhaseBySession.delete(sessionId);
   streamingDraftMessageIdBySession.delete(sessionId);
+  streamingBlocksBySession.delete(sessionId);
   lastSeqBySession.delete(sessionId);
+  pendingOutgoingBySession.delete(sessionId);
 }
 
 export function disconnectAll() {
@@ -989,6 +1337,9 @@ export function disconnectAll() {
 }
 
 export function connectAllSessions(sessions: SdkSessionInfo[]) {
+  // Skip connection attempts when page is hidden — mobile browsers kill
+  // backgrounded WS connections, so connecting here would just cycle.
+  if (pageHidden) return;
   for (const s of sessions) {
     if (!s.archived) {
       connectSession(s.sessionId);
@@ -1016,7 +1367,8 @@ export function waitForConnection(sessionId: string): Promise<void> {
 export function sendToSession(sessionId: string, msg: BrowserOutgoingMessage) {
   const ws = sockets.get(sessionId);
   let outgoing: BrowserOutgoingMessage = msg;
-  if (IDEMPOTENT_OUTGOING_TYPES.has(msg.type)) {
+  const isIdempotent = IDEMPOTENT_OUTGOING_TYPES.has(msg.type);
+  if (isIdempotent) {
     switch (msg.type) {
       case "user_message":
       case "permission_response":
@@ -1034,8 +1386,14 @@ export function sendToSession(sessionId: string, msg: BrowserOutgoingMessage) {
         break;
     }
   }
+
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(outgoing));
+    return;
+  }
+
+  if (isIdempotent) {
+    enqueueOutgoing(sessionId, outgoing);
   }
 }
 

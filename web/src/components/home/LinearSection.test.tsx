@@ -12,6 +12,7 @@ const mockRemoveLinearProjectMapping = vi.fn();
 const mockGetLinearStates = vi.fn();
 const mockGetLinearConnection = vi.fn();
 const mockCreateLinearIssue = vi.fn();
+const mockListLinearConnections = vi.fn();
 
 vi.mock("../../api.js", () => ({
   api: {
@@ -24,6 +25,7 @@ vi.mock("../../api.js", () => ({
     getLinearStates: (...args: unknown[]) => mockGetLinearStates(...args),
     getLinearConnection: (...args: unknown[]) => mockGetLinearConnection(...args),
     createLinearIssue: (...args: unknown[]) => mockCreateLinearIssue(...args),
+    listLinearConnections: (...args: unknown[]) => mockListLinearConnections(...args),
   },
 }));
 
@@ -106,6 +108,25 @@ beforeEach(() => {
   mockGetLinearStates.mockResolvedValue({ teams: [] });
   mockGetLinearConnection.mockResolvedValue({ connected: true, viewerId: "v1", viewerName: "User", viewerEmail: "", teamName: "", teamKey: "" });
   mockCreateLinearIssue.mockResolvedValue({ ok: true, issue: sampleIssue });
+  // Default: single connection (auto-selected, no dropdown shown)
+  mockListLinearConnections.mockResolvedValue({
+    connections: [{
+      id: "conn-1",
+      name: "Default",
+      apiKeyLast4: "1234",
+      workspaceName: "My Workspace",
+      workspaceId: "ws-1",
+      viewerName: "User",
+      viewerEmail: "user@test.com",
+      connected: true,
+      autoTransition: false,
+      autoTransitionStateId: "",
+      autoTransitionStateName: "",
+      archiveTransition: false,
+      archiveTransitionStateId: "",
+      archiveTransitionStateName: "",
+    }],
+  });
 });
 
 describe("LinearSection", () => {
@@ -119,6 +140,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
     expect(container.innerHTML).toBe("");
@@ -134,6 +156,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -156,6 +179,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -179,6 +203,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -204,6 +229,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={onIssueSelect}
         onBranchFromIssue={onBranchFromIssue}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -232,6 +258,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={sampleIssue}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -250,6 +277,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -270,6 +298,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -291,6 +320,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={onIssueSelect}
         onBranchFromIssue={onBranchFromIssue}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -319,6 +349,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -346,6 +377,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -372,6 +404,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={onIssueSelect}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -388,6 +421,10 @@ describe("LinearSection", () => {
 
   it("filters issues by search query in issue browser", async () => {
     // Verifies the inline search filters the displayed issues.
+    // Uses waitFor with increased timeout because the component re-fetches issues
+    // when selectedConnectionId changes (after connections load), which can cause
+    // a brief "Loading recent issues..." state between the two fetches.
+    // On slower CI runners (e.g. Ubuntu), this race is more likely to surface.
     const issues = [
       { ...sampleIssue, id: "i1", identifier: "ENG-1", title: "Fix login" },
       { ...sampleIssue, id: "i2", identifier: "ENG-2", title: "Add dashboard" },
@@ -403,20 +440,25 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
+    // Wait for both ENG-1 and ENG-2 to appear together in the same waitFor
+    // to ensure the final re-fetch (after connectionId is set) has completed.
     await waitFor(() => {
       expect(screen.getByText("ENG-1")).toBeInTheDocument();
-    });
-    expect(screen.getByText("ENG-2")).toBeInTheDocument();
+      expect(screen.getByText("ENG-2")).toBeInTheDocument();
+    }, { timeout: 3000 });
 
     // Filter by "login"
     const searchInput = screen.getByPlaceholderText("Filter issues...");
     fireEvent.change(searchInput, { target: { value: "login" } });
 
-    expect(screen.getByText("ENG-1")).toBeInTheDocument();
-    expect(screen.queryByText("ENG-2")).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText("ENG-1")).toBeInTheDocument();
+      expect(screen.queryByText("ENG-2")).not.toBeInTheDocument();
+    }, { timeout: 3000 });
   });
 
   it("shows loading state while fetching recent issues", async () => {
@@ -432,6 +474,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -457,6 +500,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -482,6 +526,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -508,6 +553,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -542,6 +588,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -551,9 +598,9 @@ describe("LinearSection", () => {
     const searchInput = screen.getByPlaceholderText("ENG-123 or issue title");
     fireEvent.change(searchInput, { target: { value: "fix bug" } });
 
-    // Wait for debounce (400ms) and API call to complete
+    // Wait for debounce (400ms) and API call to complete (includes auto-selected connectionId)
     await waitFor(() => {
-      expect(mockSearchLinearIssues).toHaveBeenCalledWith("fix bug", 8);
+      expect(mockSearchLinearIssues).toHaveBeenCalledWith("fix bug", 8, "conn-1");
     }, { timeout: 3000 });
   });
 
@@ -572,6 +619,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={onIssueSelect}
         onBranchFromIssue={onBranchFromIssue}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -605,6 +653,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -615,8 +664,10 @@ describe("LinearSection", () => {
     // Toggle search all projects
     fireEvent.click(screen.getByText("Search all projects"));
 
-    // Should show the "type 2 characters" prompt
-    expect(screen.getByText("Type at least 2 characters to search all projects...")).toBeInTheDocument();
+    // Should show the "type 2 characters" prompt (may need a re-render cycle)
+    await waitFor(() => {
+      expect(screen.getByText("Type at least 2 characters to search all projects...")).toBeInTheDocument();
+    });
   });
 
   it("removes selected issue when remove button is clicked in issue badge", async () => {
@@ -634,6 +685,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={sampleIssue}
         onIssueSelect={onIssueSelect}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -655,6 +707,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -684,6 +737,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -712,6 +766,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -736,6 +791,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -750,9 +806,9 @@ describe("LinearSection", () => {
     const searchInput = screen.getByPlaceholderText("Search all projects...");
     fireEvent.change(searchInput, { target: { value: "global" } });
 
-    // Wait for debounce + API call
+    // Wait for debounce + API call (includes auto-selected connectionId)
     await waitFor(() => {
-      expect(mockSearchLinearIssues).toHaveBeenCalledWith("global", 10);
+      expect(mockSearchLinearIssues).toHaveBeenCalledWith("global", 10, "conn-1");
     }, { timeout: 3000 });
 
     // Results should appear
@@ -773,6 +829,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={sampleIssue}
         onIssueSelect={onIssueSelect}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -800,6 +857,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={onIssueSelect}
         onBranchFromIssue={onBranchFromIssue}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -811,10 +869,10 @@ describe("LinearSection", () => {
     fireEvent.click(screen.getByText("Create issue"));
     fireEvent.click(screen.getByText("mock-create"));
 
-    // Should have called getLinearProjectIssues again to refresh the list
+    // Should have called getLinearProjectIssues again to refresh the list.
+    // Calls: initial load (connectionId=undefined) + re-fetch after connectionId set + refresh after create = 3 calls
     await waitFor(() => {
-      // Initial load + refresh after create = 2 calls
-      expect(mockGetLinearProjectIssues).toHaveBeenCalledTimes(2);
+      expect(mockGetLinearProjectIssues).toHaveBeenCalledTimes(3);
     });
   });
 
@@ -830,6 +888,7 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
@@ -852,9 +911,274 @@ describe("LinearSection", () => {
         selectedLinearIssue={null}
         onIssueSelect={vi.fn()}
         onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
       />,
     );
 
     expect(screen.getByTitle("Linear settings")).toBeInTheDocument();
+  });
+
+  it("auto-selects single connection and calls onConnectionSelect", async () => {
+    // When only one connection exists, it should be auto-selected without showing a dropdown.
+    const onConnectionSelect = vi.fn();
+
+    render(
+      <LinearSection
+        cwd="/repo"
+        gitRepoInfo={defaultGitRepoInfo}
+        linearConfigured={true}
+        selectedLinearIssue={null}
+        onIssueSelect={vi.fn()}
+        onBranchFromIssue={vi.fn()}
+        onConnectionSelect={onConnectionSelect}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(onConnectionSelect).toHaveBeenCalledWith("conn-1");
+    });
+
+    // No dropdown should be visible with a single connection
+    expect(screen.queryByTitle("Select Linear workspace")).not.toBeInTheDocument();
+  });
+
+  it("shows connection dropdown when multiple connections exist", async () => {
+    // When multiple connections exist, a dropdown should be rendered to pick between them.
+    mockListLinearConnections.mockResolvedValue({
+      connections: [
+        {
+          id: "conn-1",
+          name: "Connection A",
+          apiKeyLast4: "1234",
+          workspaceName: "Workspace A",
+          workspaceId: "ws-1",
+          viewerName: "User",
+          viewerEmail: "user@test.com",
+          connected: true,
+          autoTransition: false,
+          autoTransitionStateId: "",
+          autoTransitionStateName: "",
+          archiveTransition: false,
+          archiveTransitionStateId: "",
+          archiveTransitionStateName: "",
+        },
+        {
+          id: "conn-2",
+          name: "Connection B",
+          apiKeyLast4: "5678",
+          workspaceName: "Workspace B",
+          workspaceId: "ws-2",
+          viewerName: "User2",
+          viewerEmail: "user2@test.com",
+          connected: true,
+          autoTransition: false,
+          autoTransitionStateId: "",
+          autoTransitionStateName: "",
+          archiveTransition: false,
+          archiveTransitionStateId: "",
+          archiveTransitionStateName: "",
+        },
+      ],
+    });
+
+    const onConnectionSelect = vi.fn();
+
+    render(
+      <LinearSection
+        cwd="/repo"
+        gitRepoInfo={defaultGitRepoInfo}
+        linearConfigured={true}
+        selectedLinearIssue={null}
+        onIssueSelect={vi.fn()}
+        onBranchFromIssue={vi.fn()}
+        onConnectionSelect={onConnectionSelect}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTitle("Select Linear workspace")).toBeInTheDocument();
+    });
+
+    // Both workspace names should appear as options
+    const select = screen.getByTitle("Select Linear workspace") as HTMLSelectElement;
+    expect(select.options.length).toBe(2);
+    expect(select.options[0].textContent).toBe("Workspace A");
+    expect(select.options[1].textContent).toBe("Workspace B");
+
+    // First connection should be auto-selected
+    expect(onConnectionSelect).toHaveBeenCalledWith("conn-1");
+  });
+
+  it("switching connection clears search state and re-fetches project issues", async () => {
+    // When the user switches connections, search results should be cleared and project issues re-fetched.
+    mockListLinearConnections.mockResolvedValue({
+      connections: [
+        {
+          id: "conn-1",
+          name: "Connection A",
+          apiKeyLast4: "1234",
+          workspaceName: "Workspace A",
+          workspaceId: "ws-1",
+          viewerName: "User",
+          viewerEmail: "user@test.com",
+          connected: true,
+          autoTransition: false,
+          autoTransitionStateId: "",
+          autoTransitionStateName: "",
+          archiveTransition: false,
+          archiveTransitionStateId: "",
+          archiveTransitionStateName: "",
+        },
+        {
+          id: "conn-2",
+          name: "Connection B",
+          apiKeyLast4: "5678",
+          workspaceName: "Workspace B",
+          workspaceId: "ws-2",
+          viewerName: "User2",
+          viewerEmail: "user2@test.com",
+          connected: true,
+          autoTransition: false,
+          autoTransitionStateId: "",
+          autoTransitionStateName: "",
+          archiveTransition: false,
+          archiveTransitionStateId: "",
+          archiveTransitionStateName: "",
+        },
+      ],
+    });
+
+    mockGetLinearProjectMapping.mockResolvedValue({ mapping: sampleMapping });
+    mockGetLinearProjectIssues.mockResolvedValue({ issues: [sampleIssue] });
+
+    const onConnectionSelect = vi.fn();
+
+    render(
+      <LinearSection
+        cwd="/repo"
+        gitRepoInfo={defaultGitRepoInfo}
+        linearConfigured={true}
+        selectedLinearIssue={null}
+        onIssueSelect={vi.fn()}
+        onBranchFromIssue={vi.fn()}
+        onConnectionSelect={onConnectionSelect}
+      />,
+    );
+
+    // Wait for the dropdown and initial project issues to load
+    await waitFor(() => {
+      expect(screen.getByTitle("Select Linear workspace")).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("My Project")).toBeInTheDocument();
+    });
+
+    // Switch to the second connection
+    const select = screen.getByTitle("Select Linear workspace") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "conn-2" } });
+
+    expect(onConnectionSelect).toHaveBeenCalledWith("conn-2");
+
+    // getLinearProjectIssues should be called again with the new connectionId
+    await waitFor(() => {
+      expect(mockGetLinearProjectIssues).toHaveBeenCalledWith(
+        sampleMapping.projectId,
+        10,
+        "conn-2",
+      );
+    });
+  });
+
+  it("does not show connection dropdown when no connections exist", async () => {
+    // Verifies that when the connections list is empty, no dropdown is rendered.
+    mockListLinearConnections.mockResolvedValue({ connections: [] });
+
+    const onConnectionSelect = vi.fn();
+
+    render(
+      <LinearSection
+        cwd="/repo"
+        gitRepoInfo={defaultGitRepoInfo}
+        linearConfigured={true}
+        selectedLinearIssue={null}
+        onIssueSelect={vi.fn()}
+        onBranchFromIssue={vi.fn()}
+        onConnectionSelect={onConnectionSelect}
+      />,
+    );
+
+    // Wait for the connections to load
+    await waitFor(() => {
+      expect(mockListLinearConnections).toHaveBeenCalled();
+    });
+
+    // No dropdown should be visible
+    expect(screen.queryByTitle("Select Linear workspace")).not.toBeInTheDocument();
+
+    // onConnectionSelect should be called with null
+    expect(onConnectionSelect).toHaveBeenCalledWith(null);
+  });
+
+  it("passes selectedConnectionId to searchLinearIssues", async () => {
+    // Verifies that the selected connection ID is passed to the search API.
+    mockSearchLinearIssues.mockResolvedValue({ issues: [sampleIssue] });
+
+    render(
+      <LinearSection
+        cwd="/repo"
+        gitRepoInfo={defaultGitRepoInfo}
+        linearConfigured={true}
+        selectedLinearIssue={null}
+        onIssueSelect={vi.fn()}
+        onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
+      />,
+    );
+
+    // Wait for connection to be auto-selected
+    await waitFor(() => {
+      expect(mockListLinearConnections).toHaveBeenCalled();
+    });
+
+    // Open search dropdown
+    fireEvent.click(screen.getByText("Linear"));
+    const searchInput = screen.getByPlaceholderText("ENG-123 or issue title");
+    fireEvent.change(searchInput, { target: { value: "fix bug" } });
+
+    // Wait for debounce and API call - should include the connectionId
+    await waitFor(() => {
+      expect(mockSearchLinearIssues).toHaveBeenCalledWith("fix bug", 8, "conn-1");
+    }, { timeout: 3000 });
+  });
+
+  it("passes selectedConnectionId to listLinearProjects", async () => {
+    // Verifies that the selected connection ID is passed when fetching projects.
+    mockListLinearProjects.mockResolvedValue({
+      projects: [{ id: "p1", name: "Project Alpha", state: "active" }],
+    });
+
+    render(
+      <LinearSection
+        cwd="/repo"
+        gitRepoInfo={defaultGitRepoInfo}
+        linearConfigured={true}
+        selectedLinearIssue={null}
+        onIssueSelect={vi.fn()}
+        onBranchFromIssue={vi.fn()}
+        onConnectionSelect={vi.fn()}
+      />,
+    );
+
+    // Wait for connection to be auto-selected
+    await waitFor(() => {
+      expect(mockListLinearConnections).toHaveBeenCalled();
+    });
+
+    fireEvent.click(screen.getByText("Attach project"));
+
+    await waitFor(() => {
+      expect(mockListLinearProjects).toHaveBeenCalledWith("conn-1");
+    });
   });
 });

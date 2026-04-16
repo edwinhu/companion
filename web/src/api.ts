@@ -1,4 +1,4 @@
-import type { SdkSessionInfo } from "./types.js";
+import type { SdkSessionInfo, BackendType } from "./types.js";
 import type { ContentBlock } from "./types.js";
 import { captureEvent, captureException } from "./analytics.js";
 
@@ -221,10 +221,20 @@ export interface CreateSessionOpts {
   branch?: string;
   createBranch?: boolean;
   useWorktree?: boolean;
-  backend?: "claude" | "codex";
+  backend?: BackendType;
+  sandboxEnabled?: boolean;
+  sandboxSlug?: string;
   container?: ContainerCreateOpts;
   resumeSessionAt?: string;
   forkSession?: boolean;
+  linearConnectionId?: string;
+  linearIssue?: {
+    identifier: string;
+    title: string;
+    stateName: string;
+    teamName: string;
+    url: string;
+  };
 }
 
 export interface BackendInfo {
@@ -301,14 +311,13 @@ export interface CompanionEnv {
   name: string;
   slug: string;
   variables: Record<string, string>;
-  dockerfile?: string;
-  imageTag?: string;
-  baseImage?: string;
-  buildStatus?: "idle" | "building" | "success" | "error";
-  buildError?: string;
-  lastBuiltAt?: number;
-  ports?: number[];
-  volumes?: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CompanionSandbox {
+  name: string;
+  slug: string;
   initScript?: string;
   createdAt: number;
   updatedAt: number;
@@ -371,6 +380,13 @@ export interface EditorStartResult {
   message?: string;
 }
 
+export interface BrowserStartResult {
+  available: boolean;
+  mode: "host" | "container";
+  url?: string;
+  message?: string;
+}
+
 /** Keep in sync with web/server/tailscale-manager.ts TailscaleStatus */
 export interface TailscaleStatus {
   installed: boolean;
@@ -387,17 +403,53 @@ export interface TailscaleStatus {
 export interface AppSettings {
   anthropicApiKeyConfigured: boolean;
   anthropicModel: string;
+  claudeCodeOAuthTokenConfigured: boolean;
+  openaiApiKeyConfigured: boolean;
+  codexDeviceAuthConfigured: boolean;
+  onboardingCompleted: boolean;
   linearApiKeyConfigured: boolean;
+  linearConnectionCount: number;
   linearAutoTransition: boolean;
   linearAutoTransitionStateName: string;
   linearArchiveTransition: boolean;
   linearArchiveTransitionStateName: string;
-  editorTabEnabled: boolean;
+  linearOAuthConfigured: boolean;
+  linearOAuthCredentialsSaved: boolean;
   aiValidationEnabled: boolean;
   aiValidationAutoApprove: boolean;
   aiValidationAutoDeny: boolean;
   publicUrl: string;
   updateChannel: "stable" | "prerelease";
+  dockerAutoUpdate: boolean;
+}
+
+export interface LinearOAuthConnectionSummary {
+  id: string;
+  name: string;
+  oauthClientId: string;
+  status: "connected" | "disconnected";
+  hasAccessToken: boolean;
+  hasClientSecret: boolean;
+  hasWebhookSecret: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface LinearConnectionSummary {
+  id: string;
+  name: string;
+  apiKeyLast4: string;
+  workspaceName: string;
+  workspaceId: string;
+  viewerName: string;
+  viewerEmail: string;
+  connected: boolean;
+  autoTransition: boolean;
+  autoTransitionStateId: string;
+  autoTransitionStateName: string;
+  archiveTransition: boolean;
+  archiveTransitionStateId: string;
+  archiveTransitionStateName: string;
 }
 
 export interface ArchiveInfo {
@@ -443,6 +495,7 @@ export interface LinearIssue {
   teamId: string;
   assigneeName?: string;
   updatedAt?: string;
+  connectionId?: string;
 }
 
 export interface LinearConnectionInfo {
@@ -491,6 +544,7 @@ export interface CreateLinearIssueInput {
   projectId?: string;
   assigneeId?: string;
   stateId?: string;
+  connectionId?: string;
 }
 
 export interface GitHubPRInfo {
@@ -519,7 +573,7 @@ export interface CronJobInfo {
   prompt: string;
   schedule: string;
   recurring: boolean;
-  backendType: "claude" | "codex";
+  backendType: BackendType;
   model: string;
   cwd: string;
   envSlug?: string;
@@ -559,7 +613,7 @@ export interface AgentInfo {
   name: string;
   description: string;
   icon?: string;
-  backendType: "claude" | "codex";
+  backendType: BackendType;
   model: string;
   permissionMode: string;
   cwd: string;
@@ -589,30 +643,23 @@ export interface AgentInfo {
       expression: string;
       recurring: boolean;
     };
-    chat?: {
+    /** Linear Agent Interaction SDK trigger (per-agent OAuth app) */
+    linear?: {
       enabled: boolean;
-      platforms: Array<{
-        adapter: "linear" | "github" | "slack" | "discord";
-        mentionPattern?: string;
-        autoSubscribe: boolean;
-        /** Per-binding credentials (masked in API responses) */
-        credentials?: {
-          // Linear
-          apiKey?: string;
-          clientId?: string;
-          clientSecret?: string;
-          accessToken?: string;
-          // GitHub
-          token?: string;
-          appId?: string;
-          privateKey?: string;
-          installationId?: string;
-          botUserId?: string;
-          // Common
-          webhookSecret?: string;
-          userName?: string;
-        };
-      }>;
+      /** Reference to a LinearOAuthConnection by ID (new model) */
+      oauthConnectionId?: string;
+      /** Resolved name of the referenced OAuth connection */
+      oauthConnectionName?: string;
+      /** Resolved status of the referenced OAuth connection */
+      oauthConnectionStatus?: string;
+      /** @deprecated OAuth app client ID (legacy inline model) */
+      oauthClientId?: string;
+      /** Whether the agent has an access token (OAuth connected) */
+      hasAccessToken?: boolean;
+      /** Whether the agent has a client secret configured */
+      hasClientSecret?: boolean;
+      /** Whether the agent has a webhook secret configured */
+      hasWebhookSecret?: boolean;
     };
   };
   enabled: boolean;
@@ -628,7 +675,7 @@ export interface AgentInfo {
 export interface AgentExecution {
   sessionId: string;
   agentId: string;
-  triggerType: "manual" | "webhook" | "schedule" | "chat";
+  triggerType: "manual" | "webhook" | "schedule" | "linear";
   startedAt: number;
   completedAt?: number;
   success?: boolean;
@@ -690,7 +737,7 @@ export interface CreateSessionStreamResult {
   sessionId: string;
   state: string;
   cwd: string;
-  backendType?: "claude" | "codex";
+  backendType?: BackendType;
   resumeSessionAt?: string;
   forkSession?: boolean;
 }
@@ -858,35 +905,37 @@ export const api = {
   listEnvs: () => get<CompanionEnv[]>("/envs"),
   getEnv: (slug: string) =>
     get<CompanionEnv>(`/envs/${encodeURIComponent(slug)}`),
-  createEnv: (name: string, variables: Record<string, string>, docker?: {
-    dockerfile?: string;
-    baseImage?: string;
-    ports?: number[];
-    volumes?: string[];
-    initScript?: string;
-  }) =>
-    post<CompanionEnv>("/envs", { name, variables, ...docker }),
+  createEnv: (name: string, variables: Record<string, string>) =>
+    post<CompanionEnv>("/envs", { name, variables }),
   updateEnv: (
     slug: string,
     data: {
       name?: string;
       variables?: Record<string, string>;
-      dockerfile?: string;
-      baseImage?: string;
-      ports?: number[];
-      volumes?: string[];
-      initScript?: string;
     },
   ) => put<CompanionEnv>(`/envs/${encodeURIComponent(slug)}`, data),
   deleteEnv: (slug: string) => del(`/envs/${encodeURIComponent(slug)}`),
 
-  // Environment Docker builds
-  buildEnvImage: (slug: string) =>
-    post<{ ok: boolean; imageTag: string }>(`/envs/${encodeURIComponent(slug)}/build`),
-  getEnvBuildStatus: (slug: string) =>
-    get<{ buildStatus: string; buildError?: string; lastBuiltAt?: number; imageTag?: string }>(
-      `/envs/${encodeURIComponent(slug)}/build-status`,
+  // Sandboxes
+  listSandboxes: () => get<CompanionSandbox[]>("/sandboxes"),
+  getSandbox: (slug: string) =>
+    get<CompanionSandbox>(`/sandboxes/${encodeURIComponent(slug)}`),
+  createSandbox: (name: string, opts?: { initScript?: string }) =>
+    post<CompanionSandbox>("/sandboxes", { name, ...opts }),
+  updateSandbox: (
+    slug: string,
+    data: {
+      name?: string;
+      initScript?: string;
+    },
+  ) => put<CompanionSandbox>(`/sandboxes/${encodeURIComponent(slug)}`, data),
+  deleteSandbox: (slug: string) => del(`/sandboxes/${encodeURIComponent(slug)}`),
+  testInitScript: (slug: string, cwd: string, initScript?: string) =>
+    post<{ success: boolean; exitCode: number; output: string }>(
+      `/sandboxes/${encodeURIComponent(slug)}/test-init`,
+      { cwd, initScript },
     ),
+
   buildBaseImage: () =>
     post<{ ok: boolean; tag: string }>("/docker/build-base"),
   getBaseImageStatus: () =>
@@ -897,6 +946,9 @@ export const api = {
   updateSettings: (data: {
     anthropicApiKey?: string;
     anthropicModel?: string;
+    claudeCodeOAuthToken?: string;
+    openaiApiKey?: string;
+    onboardingCompleted?: boolean;
     linearApiKey?: string;
     linearAutoTransition?: boolean;
     linearAutoTransitionStateId?: string;
@@ -904,9 +956,12 @@ export const api = {
     linearArchiveTransition?: boolean;
     linearArchiveTransitionStateId?: string;
     linearArchiveTransitionStateName?: string;
-    editorTabEnabled?: boolean;
+    linearOAuthClientId?: string;
+    linearOAuthClientSecret?: string;
+    linearOAuthWebhookSecret?: string;
     publicUrl?: string;
     updateChannel?: "stable" | "prerelease";
+    dockerAutoUpdate?: boolean;
   }) => put<AppSettings>("/settings", data),
   verifyAnthropicKey: (apiKey: string) =>
     post<{ valid: boolean; error?: string }>("/settings/anthropic/verify", { apiKey }),
@@ -916,21 +971,42 @@ export const api = {
   startTailscaleFunnel: () => post<TailscaleStatus>("/tailscale/funnel/start"),
   stopTailscaleFunnel: () => post<TailscaleStatus>("/tailscale/funnel/stop"),
 
-  searchLinearIssues: (query: string, limit = 8) =>
-    get<{ issues: LinearIssue[] }>(
-      `/linear/issues?query=${encodeURIComponent(query)}&limit=${encodeURIComponent(String(limit))}`,
+  // Linear connections CRUD
+  listLinearConnections: () =>
+    get<{ connections: LinearConnectionSummary[] }>("/linear/connections"),
+  createLinearConnection: (data: { name: string; apiKey: string }) =>
+    post<{ connection: LinearConnectionSummary; verified: boolean; error?: string }>(
+      "/linear/connections",
+      data,
     ),
-  getLinearConnection: () => get<LinearConnectionInfo>("/linear/connection"),
-  getLinearStates: () => get<{ teams: LinearTeamStates[] }>("/linear/states"),
-  transitionLinearIssue: (issueId: string) =>
-    post<{ ok: boolean; skipped: boolean }>(
-      `/linear/issues/${encodeURIComponent(issueId)}/transition`,
+  updateLinearConnection: (id: string, data: Record<string, unknown>) =>
+    put<{ connection: LinearConnectionSummary }>(`/linear/connections/${encodeURIComponent(id)}`, data),
+  deleteLinearConnection: (id: string) =>
+    del<{ ok: boolean }>(`/linear/connections/${encodeURIComponent(id)}`),
+  verifyLinearConnection: (id: string) =>
+    post<{ connection: LinearConnectionSummary; verified: boolean; error?: string }>(
+      `/linear/connections/${encodeURIComponent(id)}/verify`,
       {},
     ),
-  listLinearProjects: () => get<{ projects: LinearProject[] }>("/linear/projects"),
-  getLinearProjectIssues: (projectId: string, limit = 15) =>
+
+  searchLinearIssues: (query: string, limit = 8, connectionId?: string) =>
     get<{ issues: LinearIssue[] }>(
-      `/linear/project-issues?projectId=${encodeURIComponent(projectId)}&limit=${encodeURIComponent(String(limit))}`,
+      `/linear/issues?query=${encodeURIComponent(query)}&limit=${encodeURIComponent(String(limit))}${connectionId ? `&connectionId=${encodeURIComponent(connectionId)}` : ""}`,
+    ),
+  getLinearConnection: (connectionId?: string) =>
+    get<LinearConnectionInfo>(`/linear/connection${connectionId ? `?connectionId=${encodeURIComponent(connectionId)}` : ""}`),
+  getLinearStates: (connectionId?: string) =>
+    get<{ teams: LinearTeamStates[] }>(`/linear/states${connectionId ? `?connectionId=${encodeURIComponent(connectionId)}` : ""}`),
+  transitionLinearIssue: (issueId: string, connectionId?: string) =>
+    post<{ ok: boolean; skipped: boolean }>(
+      `/linear/issues/${encodeURIComponent(issueId)}/transition${connectionId ? `?connectionId=${encodeURIComponent(connectionId)}` : ""}`,
+      {},
+    ),
+  listLinearProjects: (connectionId?: string) =>
+    get<{ projects: LinearProject[] }>(`/linear/projects${connectionId ? `?connectionId=${encodeURIComponent(connectionId)}` : ""}`),
+  getLinearProjectIssues: (projectId: string, limit = 15, connectionId?: string) =>
+    get<{ issues: LinearIssue[] }>(
+      `/linear/project-issues?projectId=${encodeURIComponent(projectId)}&limit=${encodeURIComponent(String(limit))}${connectionId ? `&connectionId=${encodeURIComponent(connectionId)}` : ""}`,
     ),
   getLinearProjectMapping: (repoRoot: string) =>
     get<{ mapping: LinearProjectMapping | null }>(
@@ -945,8 +1021,11 @@ export const api = {
     del<{ ok: boolean }>("/linear/project-mappings", { repoRoot }),
 
   // Linear issue <-> session association
-  linkLinearIssue: (sessionId: string, issue: LinearIssue) =>
-    put<{ ok: boolean }>(`/sessions/${encodeURIComponent(sessionId)}/linear-issue`, issue),
+  linkLinearIssue: (sessionId: string, issue: LinearIssue, connectionId?: string) =>
+    put<{ ok: boolean }>(`/sessions/${encodeURIComponent(sessionId)}/linear-issue`, {
+      ...issue,
+      ...(connectionId !== undefined ? { connectionId } : {}),
+    }),
   unlinkLinearIssue: (sessionId: string) =>
     del<{ ok: boolean }>(`/sessions/${encodeURIComponent(sessionId)}/linear-issue`),
   getLinkedLinearIssue: (sessionId: string, refresh = false) =>
@@ -955,10 +1034,10 @@ export const api = {
     ),
   createLinearIssue: (input: CreateLinearIssueInput) =>
     post<{ ok: boolean; issue: LinearIssue }>("/linear/issues", input),
-  addLinearComment: (issueId: string, body: string) =>
+  addLinearComment: (issueId: string, body: string, connectionId?: string) =>
     post<{ ok: boolean; comment: LinearComment }>(
       `/linear/issues/${encodeURIComponent(issueId)}/comments`,
-      { body },
+      { body, connectionId },
     ),
 
   // Git operations
@@ -1025,6 +1104,18 @@ export const api = {
   startEditor: (sessionId: string) =>
     post<EditorStartResult>(
       `/sessions/${encodeURIComponent(sessionId)}/editor/start`,
+    ),
+
+  // Browser preview
+  startBrowser: (sessionId: string, url?: string) =>
+    post<BrowserStartResult>(
+      `/sessions/${encodeURIComponent(sessionId)}/browser/start`,
+      url ? { url } : undefined,
+    ),
+  navigateBrowser: (sessionId: string, url: string) =>
+    post<{ ok?: boolean; error?: string }>(
+      `/sessions/${encodeURIComponent(sessionId)}/browser/navigate`,
+      { url },
     ),
 
   // Editor filesystem
@@ -1126,7 +1217,8 @@ export const api = {
   // Agents
   listAgents: () => get<AgentInfo[]>("/agents"),
   getAgent: (id: string) => get<AgentInfo>(`/agents/${encodeURIComponent(id)}`),
-  createAgent: (data: Partial<AgentInfo>) => post<AgentInfo>("/agents", data),
+  createAgent: (data: Partial<AgentInfo> & { stagingId?: string; cloneFromAgentId?: string }) =>
+    post<AgentInfo>("/agents", data),
   updateAgent: (id: string, data: Partial<AgentInfo>) =>
     put<AgentInfo>(`/agents/${encodeURIComponent(id)}`, data),
   deleteAgent: (id: string) => del(`/agents/${encodeURIComponent(id)}`),
@@ -1152,8 +1244,44 @@ export const api = {
     return get<ExecutionListResult>(`/executions${qs ? `?${qs}` : ""}`);
   },
 
-  // Chat platforms
-  listChatPlatforms: () => get<{ platforms: string[] }>("/chat/platforms"),
+  // Linear OAuth (Agent Interaction SDK)
+  getLinearOAuthStatus: (stagingId?: string) => {
+    const params = new URLSearchParams();
+    if (stagingId) params.set("stagingId", stagingId);
+    const qs = params.toString();
+    return get<{ configured: boolean; hasClientId: boolean; hasClientSecret: boolean; hasWebhookSecret: boolean; hasAccessToken: boolean }>(
+      `/linear/oauth/status${qs ? `?${qs}` : ""}`,
+    );
+  },
+  getLinearOAuthAuthorizeUrl: (returnTo?: string, stagingId?: string) => {
+    const params = new URLSearchParams();
+    if (returnTo) params.set("returnTo", returnTo);
+    if (stagingId) params.set("stagingId", stagingId);
+    const qs = params.toString();
+    return get<{ url: string }>(`/linear/oauth/authorize-url${qs ? `?${qs}` : ""}`);
+  },
+  disconnectLinearOAuth: () =>
+    post<{ ok: boolean }>("/linear/oauth/disconnect"),
+
+  // Linear OAuth staging slots (per-wizard credential storage)
+  createLinearStaging: (creds: { clientId: string; clientSecret: string; webhookSecret: string }) =>
+    post<{ stagingId: string }>("/linear/oauth/staging", creds),
+  getLinearStagingStatus: (id: string) =>
+    get<{ exists: boolean; hasAccessToken: boolean; hasClientId: boolean; hasClientSecret: boolean }>(`/linear/oauth/staging/${encodeURIComponent(id)}/status`),
+  deleteLinearStaging: (id: string) =>
+    del(`/linear/oauth/staging/${encodeURIComponent(id)}`),
+
+  // Linear OAuth connections (standalone OAuth app management)
+  listLinearOAuthConnections: () =>
+    get<{ connections: LinearOAuthConnectionSummary[] }>("/linear/oauth-connections"),
+  createLinearOAuthConnection: (data: { name: string; oauthClientId: string; oauthClientSecret: string; webhookSecret: string }) =>
+    post<{ connection: LinearOAuthConnectionSummary }>("/linear/oauth-connections", data),
+  updateLinearOAuthConnection: (id: string, data: Record<string, unknown>) =>
+    put<{ connection: LinearOAuthConnectionSummary }>(`/linear/oauth-connections/${encodeURIComponent(id)}`, data),
+  deleteLinearOAuthConnection: (id: string) =>
+    del<{ ok: boolean }>(`/linear/oauth-connections/${encodeURIComponent(id)}`),
+  getLinearOAuthConnectionAuthorizeUrl: (id: string, returnTo?: string) =>
+    get<{ url: string }>(`/linear/oauth-connections/${encodeURIComponent(id)}/authorize-url${returnTo ? `?returnTo=${encodeURIComponent(returnTo)}` : ""}`),
 
   // Skills
   listSkills: () =>

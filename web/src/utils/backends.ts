@@ -76,28 +76,44 @@ export const CODEX_AGENT_MODES: ModeOption[] = [
   { value: "default", label: "Supervised" },
 ];
 
+export const GEMINI_MODELS: ModelOption[] = [
+  { value: "gemini-3.1-pro", label: "Gemini 3.1 Pro (High)", icon: "✨" },
+  { value: "gemini-3.1-flash", label: "Gemini 3.1 Flash (Fast)", icon: "⚡" },
+];
+
+export const GEMINI_MODES: ModeOption[] = [
+  { value: "bypassPermissions", label: "Agent" },
+  { value: "plan", label: "Plan" },
+];
+
+export const GEMINI_AGENT_MODES: ModeOption[] = [
+  { value: "bypassPermissions", label: "Full Auto" },
+  { value: "acceptEdits", label: "Auto-Edit" },
+  { value: "default", label: "Supervised" },
+];
+
 // ─── Getters ─────────────────────────────────────────────────────────────────
 
 export function getModelsForBackend(backend: BackendType): ModelOption[] {
-  return backend === "codex" ? CODEX_MODELS : CLAUDE_MODELS;
+  return backend === "gemini" ? GEMINI_MODELS : (backend === "codex" ? CODEX_MODELS : CLAUDE_MODELS);
 }
 
 export function getModesForBackend(backend: BackendType): ModeOption[] {
-  return backend === "codex" ? CODEX_MODES : CLAUDE_MODES;
+  return backend === "gemini" ? GEMINI_MODES : (backend === "codex" ? CODEX_MODES : CLAUDE_MODES);
 }
 
 export function getAgentModesForBackend(backend: BackendType): ModeOption[] {
-  return backend === "codex" ? CODEX_AGENT_MODES : CLAUDE_AGENT_MODES;
+  return backend === "gemini" ? GEMINI_AGENT_MODES : (backend === "codex" ? CODEX_AGENT_MODES : CLAUDE_AGENT_MODES);
 }
 
 export function getDefaultModel(backend: BackendType): string {
-  return backend === "codex" ? CODEX_MODELS[0].value : CLAUDE_MODELS[0].value;
+  return backend === "gemini" ? GEMINI_MODELS[0].value : (backend === "codex" ? CODEX_MODELS[0].value : CLAUDE_MODELS[0].value);
 }
 
 export function getDefaultMode(backend: BackendType): string {
-  return backend === "codex" ? CODEX_MODES[0].value : CLAUDE_MODES[0].value;
+  return backend === "gemini" ? GEMINI_MODES[0].value : (backend === "codex" ? CODEX_MODES[0].value : CLAUDE_MODES[0].value);
 }
 
 export function getDefaultAgentMode(backend: BackendType): string {
-  return backend === "codex" ? CODEX_AGENT_MODES[0].value : CLAUDE_AGENT_MODES[0].value;
+  return backend === "gemini" ? GEMINI_AGENT_MODES[0].value : (backend === "codex" ? CODEX_AGENT_MODES[0].value : CLAUDE_AGENT_MODES[0].value);
 }

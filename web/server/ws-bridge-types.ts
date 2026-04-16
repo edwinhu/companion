@@ -6,7 +6,8 @@ import type {
   SessionState,
   BufferedBrowserEvent,
 } from "./session-types.js";
-import type { CodexAdapter } from "./codex-adapter.js";
+import type { IBackendAdapter } from "./backend-adapter.js";
+import type { SessionStateMachine } from "./session-state-machine.js";
 import { getSettings } from "./settings-manager.js";
 
 export interface CLISocketData {
@@ -26,7 +27,12 @@ export interface TerminalSocketData {
   terminalId: string;
 }
 
-export type SocketData = CLISocketData | BrowserSocketData | TerminalSocketData;
+export interface NoVncSocketData {
+  kind: "novnc";
+  sessionId: string;
+}
+
+export type SocketData = CLISocketData | BrowserSocketData | TerminalSocketData | NoVncSocketData;
 
 /** Tracks a pending control_request sent to CLI that expects a control_response. */
 export interface PendingControlRequest {
@@ -37,12 +43,11 @@ export interface PendingControlRequest {
 export interface Session {
   id: string;
   backendType: BackendType;
-  cliSocket: ServerWebSocket<SocketData> | null;
-  codexAdapter: CodexAdapter | null;
+  /** Unified backend adapter — replaces the former cliSocket (Claude) / codexAdapter (Codex) fields. */
+  backendAdapter: IBackendAdapter | null;
   browserSockets: Set<ServerWebSocket<SocketData>>;
   state: SessionState;
   pendingPermissions: Map<string, PermissionRequest>;
-  pendingControlRequests: Map<string, PendingControlRequest>;
   messageHistory: BrowserIncomingMessage[];
   pendingMessages: string[];
   nextEventSeq: number;
@@ -50,6 +55,12 @@ export interface Session {
   lastAckSeq: number;
   processedClientMessageIds: string[];
   processedClientMessageIdSet: Set<string>;
+  /** Timestamp of last non-keepalive CLI message (for idle detection) */
+  lastCliActivityTs: number;
+  /** Formal session state machine tracking phase and validating transitions. */
+  stateMachine: SessionStateMachine;
+  /** Cleanup function for state machine transition listener — call on session teardown. */
+  unsubscribeStateMachine?: () => void;
 }
 
 export type GitSessionKey =

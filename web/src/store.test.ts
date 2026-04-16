@@ -400,6 +400,31 @@ describe("Permissions", () => {
   });
 });
 
+// ─── AI Resolved Permissions ────────────────────────────────────────────────
+
+describe("AI Resolved Permissions", () => {
+  it("clearAiResolvedPermissions: clears AI-resolved entries for a session", () => {
+    const entry = {
+      request: makePermission({ request_id: "r1", tool_name: "Read" }),
+      behavior: "allow" as const,
+      reason: "read-only",
+      timestamp: Date.now(),
+    };
+    useStore.getState().addAiResolvedPermission("s1", entry);
+    expect(useStore.getState().aiResolvedPermissions.get("s1")).toHaveLength(1);
+
+    // Clear should remove the session key entirely
+    useStore.getState().clearAiResolvedPermissions("s1");
+    expect(useStore.getState().aiResolvedPermissions.get("s1")).toBeUndefined();
+  });
+
+  it("clearAiResolvedPermissions: no-op when session has no entries", () => {
+    // Should not throw when clearing a session with no AI-resolved permissions
+    useStore.getState().clearAiResolvedPermissions("nonexistent");
+    expect(useStore.getState().aiResolvedPermissions.has("nonexistent")).toBe(false);
+  });
+});
+
 // ─── Tasks ──────────────────────────────────────────────────────────────────
 
 describe("Tasks", () => {
@@ -1217,13 +1242,6 @@ describe("Update info", () => {
     expect(useStore.getState().updateOverlayActive).toBe(false);
   });
 
-  it("setEditorTabEnabled: sets the editor tab enabled state", () => {
-    useStore.getState().setEditorTabEnabled(true);
-    expect(useStore.getState().editorTabEnabled).toBe(true);
-
-    useStore.getState().setEditorTabEnabled(false);
-    expect(useStore.getState().editorTabEnabled).toBe(false);
-  });
 });
 
 // ─── Active tab & diff panel ─────────────────────────────────────────────────
@@ -1233,17 +1251,8 @@ describe("Active tab & diff panel", () => {
     useStore.getState().setActiveTab("diff");
     expect(useStore.getState().activeTab).toBe("diff");
 
-    useStore.getState().setActiveTab("terminal");
-    expect(useStore.getState().activeTab).toBe("terminal");
-
     useStore.getState().setActiveTab("chat");
     expect(useStore.getState().activeTab).toBe("chat");
-
-    useStore.getState().setActiveTab("processes");
-    expect(useStore.getState().activeTab).toBe("processes");
-
-    useStore.getState().setActiveTab("editor");
-    expect(useStore.getState().activeTab).toBe("editor");
   });
 
   it("markChatTabReentry: increments tick per session", () => {

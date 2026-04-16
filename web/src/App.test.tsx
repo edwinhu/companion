@@ -46,6 +46,7 @@ const { mockStoreState, mockGetState } = vi.hoisted(() => {
     setTaskPanelOpen: vi.fn(),
     clearCreation: vi.fn(),
     setUpdateInfo: vi.fn(),
+    setDockerUpdateDialogOpen: vi.fn(),
   };
   mockGetState.mockReturnValue(mockStoreState);
   return { mockStoreState, mockGetState };
@@ -125,20 +126,14 @@ vi.mock("./components/SessionLaunchOverlay.js", () => ({
   SessionLaunchOverlay: () => <div data-testid="session-launch-overlay">SessionLaunchOverlay</div>,
 }));
 
-vi.mock("./components/SessionTerminalDock.js", () => ({
-  SessionTerminalDock: ({ children }: { children?: React.ReactNode }) => (
-    <div data-testid="session-terminal-dock">{children}</div>
-  ),
-}));
-
-vi.mock("./components/SessionEditorPane.js", () => ({
-  SessionEditorPane: () => <div data-testid="session-editor-pane">SessionEditorPane</div>,
-}));
-
 vi.mock("./components/UpdateOverlay.js", () => ({
   UpdateOverlay: ({ active }: { active: boolean }) => (
     <div data-testid="update-overlay" data-active={active}>UpdateOverlay</div>
   ),
+}));
+
+vi.mock("./components/DockerUpdateDialog.js", () => ({
+  DockerUpdateDialog: () => <div data-testid="docker-update-dialog">DockerUpdateDialog</div>,
 }));
 
 // Lazy-loaded pages: mock each module so dynamic import() resolves immediately
@@ -166,24 +161,12 @@ vi.mock("./components/EnvManager.js", () => ({
   EnvManager: () => <div data-testid="env-manager">EnvManager</div>,
 }));
 
-vi.mock("./components/DockerBuilderPage.js", () => ({
-  DockerBuilderPage: () => <div data-testid="docker-builder-page">DockerBuilderPage</div>,
-}));
-
 vi.mock("./components/CronManager.js", () => ({
   CronManager: () => <div data-testid="cron-manager">CronManager</div>,
 }));
 
 vi.mock("./components/AgentsPage.js", () => ({
   AgentsPage: () => <div data-testid="agents-page">AgentsPage</div>,
-}));
-
-vi.mock("./components/TerminalPage.js", () => ({
-  TerminalPage: () => <div data-testid="terminal-page">TerminalPage</div>,
-}));
-
-vi.mock("./components/ProcessPanel.js", () => ({
-  ProcessPanel: () => <div data-testid="process-panel">ProcessPanel</div>,
 }));
 
 // ─── Import SUT after mocks ─────────────────────────────────────
@@ -225,10 +208,12 @@ beforeEach(() => {
     setTaskPanelOpen: vi.fn(),
     clearCreation: vi.fn(),
     setUpdateInfo: vi.fn(),
+    setDockerUpdateDialogOpen: vi.fn(),
   });
   mockGetState.mockReturnValue(mockStoreState);
   (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "home" });
   window.location.hash = "";
+  localStorage.removeItem("companion_docker_prompt_pending");
 });
 
 // ─── Tests ───────────────────────────────────────────────────────
@@ -265,55 +250,21 @@ describe("App", () => {
       expect(screen.getByTestId("update-overlay")).toBeInTheDocument();
     });
 
-    it("renders ChatView inside SessionTerminalDock when a session is active", () => {
-      // When currentSessionId is set and route is session, the chat tab should show
-      // ChatView wrapped in SessionTerminalDock.
+    it("renders ChatView when a session is active", () => {
       (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
       setStoreValues({ currentSessionId: "s1" });
       render(<App />);
 
-      expect(screen.getByTestId("session-terminal-dock")).toBeInTheDocument();
       expect(screen.getByTestId("chat-view")).toBeInTheDocument();
       expect(screen.getByText("ChatView:s1")).toBeInTheDocument();
     });
 
     it("renders DiffPanel when activeTab is diff", () => {
-      // With a session active and activeTab set to "diff", the DiffPanel should render
-      // inside the terminal dock instead of ChatView.
       (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
       setStoreValues({ currentSessionId: "s1", activeTab: "diff" });
       render(<App />);
 
       expect(screen.getByTestId("diff-panel")).toBeInTheDocument();
-    });
-
-    it("renders SessionEditorPane when activeTab is editor", () => {
-      // Editor tab should replace the chat view with the editor pane.
-      (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
-      setStoreValues({ currentSessionId: "s1", activeTab: "editor" });
-      render(<App />);
-
-      expect(screen.getByTestId("session-editor-pane")).toBeInTheDocument();
-    });
-
-    it("renders SessionTerminalDock in terminal-only mode when activeTab is terminal", () => {
-      // Terminal tab renders the dock without chat children.
-      (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
-      setStoreValues({ currentSessionId: "s1", activeTab: "terminal" });
-      render(<App />);
-
-      expect(screen.getByTestId("session-terminal-dock")).toBeInTheDocument();
-    });
-
-    it("renders ProcessPanel when activeTab is processes", async () => {
-      // Processes tab should render the lazy-loaded ProcessPanel.
-      (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "session", sessionId: "s1" });
-      setStoreValues({ currentSessionId: "s1", activeTab: "processes" });
-      render(<App />);
-
-      await waitFor(() => {
-        expect(screen.getByTestId("process-panel")).toBeInTheDocument();
-      });
     });
 
     it("renders TaskPanel when session active and taskPanelOpen", () => {
@@ -375,27 +326,11 @@ describe("App", () => {
       });
     });
 
-    it("renders TerminalPage for terminal route", async () => {
-      (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "terminal" });
-      render(<App />);
-      await waitFor(() => {
-        expect(screen.getByTestId("terminal-page")).toBeInTheDocument();
-      });
-    });
-
     it("renders EnvManager for environments route", async () => {
       (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "environments" });
       render(<App />);
       await waitFor(() => {
         expect(screen.getByTestId("env-manager")).toBeInTheDocument();
-      });
-    });
-
-    it("renders DockerBuilderPage for docker-builder route", async () => {
-      (parseHash as ReturnType<typeof vi.fn>).mockReturnValue({ page: "docker-builder" });
-      render(<App />);
-      await waitFor(() => {
-        expect(screen.getByTestId("docker-builder-page")).toBeInTheDocument();
       });
     });
 
@@ -418,6 +353,27 @@ describe("App", () => {
       // Playground route should NOT have sidebar/topbar
       expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument();
       expect(screen.queryByTestId("topbar")).not.toBeInTheDocument();
+    });
+  });
+
+  describe("docker update dialog activation", () => {
+    it("opens DockerUpdateDialog and clears localStorage when companion_docker_prompt_pending is set", () => {
+      // After an app update, the localStorage flag triggers the Docker update dialog.
+      // This useEffect reads the flag, removes it, and opens the dialog via the store.
+      localStorage.setItem("companion_docker_prompt_pending", "1");
+      setStoreValues({ isAuthenticated: true });
+      render(<App />);
+
+      expect(mockStoreState.setDockerUpdateDialogOpen).toHaveBeenCalledWith(true);
+      expect(localStorage.getItem("companion_docker_prompt_pending")).toBeNull();
+    });
+
+    it("does not open DockerUpdateDialog on normal page load", () => {
+      // Without the localStorage flag, the dialog should not be triggered.
+      setStoreValues({ isAuthenticated: true });
+      render(<App />);
+
+      expect(mockStoreState.setDockerUpdateDialogOpen).not.toHaveBeenCalled();
     });
   });
 

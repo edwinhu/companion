@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useStore } from "../store.js";
-import { sendToSession } from "../ws.js";
+import { createClientMessageId, sendToSession } from "../ws.js";
 import { CLAUDE_MODES, CODEX_MODES } from "../utils/backends.js";
 import { api, type SavedPrompt } from "../api.js";
 import type { ModeOption } from "../utils/backends.js";
@@ -10,7 +10,8 @@ import { useMentionMenu } from "../utils/use-mention-menu.js";
 
 import { readFileAsBase64, type ImageAttachment } from "../utils/image.js";
 
-let idCounter = 0;
+/** Stable reference to avoid infinite re-renders in Zustand selectors. */
+const emptyStringArray: string[] = [];
 
 interface CommandItem {
   name: string;
@@ -134,16 +135,18 @@ export function Composer({ sessionId }: { sessionId: string }) {
   function handleSend() {
     const msg = text.trim();
     if (!msg || !isConnected) return;
+    const clientMsgId = createClientMessageId();
 
     sendToSession(sessionId, {
       type: "user_message",
       content: msg,
       session_id: sessionId,
       images: images.length > 0 ? images.map((img) => ({ media_type: img.mediaType, data: img.base64 })) : undefined,
+      client_msg_id: clientMsgId,
     });
 
     useStore.getState().appendMessage(sessionId, {
-      id: `user-${Date.now()}-${++idCounter}`,
+      id: clientMsgId,
       role: "user",
       content: msg,
       images: images.length > 0 ? images.map((img) => ({ media_type: img.mediaType, data: img.base64 })) : undefined,
@@ -331,6 +334,10 @@ export function Composer({ sessionId }: { sessionId: string }) {
     }
   }
 
+  const promptSuggestionsRaw = useStore((s) => s.promptSuggestions.get(sessionId));
+  const promptSuggestions = promptSuggestionsRaw ?? emptyStringArray;
+  const clearPromptSuggestions = useStore((s) => s.clearPromptSuggestions);
+
   const sessionStatus = useStore((s) => s.sessionStatus);
   const isRunning = sessionStatus.get(sessionId) === "running";
   const canSend = text.trim().length > 0 && isConnected;
@@ -373,11 +380,44 @@ export function Composer({ sessionId }: { sessionId: string }) {
           aria-label="Attach images"
         />
 
+        {/* Prompt suggestion chips */}
+        {promptSuggestions.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 px-2 sm:px-4 pb-2">
+            {promptSuggestions.map((suggestion, i) => (
+              <button
+                key={i}
+                onClick={() => {
+                  if (!isConnected || isRunning) return;
+                  const clientMsgId = createClientMessageId();
+                  sendToSession(sessionId, {
+                    type: "user_message",
+                    content: suggestion,
+                    session_id: sessionId,
+                    client_msg_id: clientMsgId,
+                  });
+                  useStore.getState().appendMessage(sessionId, {
+                    id: clientMsgId,
+                    role: "user",
+                    content: suggestion,
+                    timestamp: Date.now(),
+                  });
+                  clearPromptSuggestions(sessionId);
+                }}
+                disabled={!isConnected || isRunning}
+                className="text-xs px-2.5 py-1.5 rounded-lg bg-cc-hover hover:bg-cc-active text-cc-fg border border-cc-border transition-colors cursor-pointer truncate max-w-[280px]"
+                title={suggestion}
+              >
+                {suggestion}
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* Input container: flat separator on mobile, card on desktop */}
-        <div className={`relative overflow-visible transition-colors border-t border-cc-separator sm:border sm:border-cc-border sm:bg-cc-input-bg/95 sm:rounded-[14px] sm:shadow-[0_10px_30px_rgba(0,0,0,0.10)] sm:backdrop-blur-sm ${
+        <div className={`relative overflow-visible transition-all duration-200 border-t border-cc-separator sm:border sm:border-cc-border sm:bg-cc-input-bg/95 sm:rounded-[16px] sm:backdrop-blur-sm composer-card ${
           isPlan
-            ? "sm:border-cc-primary/40"
-            : "sm:focus-within:border-cc-primary/30"
+            ? "sm:border-cc-primary/40 sm:shadow-[0_10px_30px_rgba(217,119,87,0.08)]"
+            : "sm:focus-within:border-cc-primary/25"
         }`}>
           {/* Slash command menu */}
           {slashMenuOpen && filteredCommands.length > 0 && (
@@ -608,9 +648,9 @@ export function Composer({ sessionId }: { sessionId: string }) {
               <button
                 onClick={handleSend}
                 disabled={!canSend}
-                className={`flex items-center justify-center w-10 h-10 rounded-full transition-colors ${
+                className={`flex items-center justify-center w-10 h-10 rounded-full transition-all duration-200 ${
                   canSend
-                    ? "bg-cc-primary hover:bg-cc-primary-hover text-white cursor-pointer shadow-[0_6px_20px_rgba(0,0,0,0.18)]"
+                    ? "bg-cc-primary hover:bg-cc-primary-hover active:scale-95 text-white cursor-pointer shadow-[0_4px_16px_rgba(217,119,87,0.25)]"
                     : "bg-cc-hover text-cc-muted cursor-not-allowed"
                 }`}
                 title="Send message"
@@ -709,9 +749,9 @@ export function Composer({ sessionId }: { sessionId: string }) {
               <button
                 onClick={handleSend}
                 disabled={!canSend}
-                className={`flex items-center justify-center w-9 h-9 rounded-full transition-colors ${
+                className={`flex items-center justify-center w-9 h-9 rounded-full transition-all duration-200 ${
                   canSend
-                    ? "bg-cc-primary hover:bg-cc-primary-hover text-white cursor-pointer shadow-[0_6px_20px_rgba(0,0,0,0.18)]"
+                    ? "bg-cc-primary hover:bg-cc-primary-hover hover:scale-105 text-white cursor-pointer shadow-[0_4px_16px_rgba(217,119,87,0.25)]"
                     : "bg-cc-hover text-cc-muted cursor-not-allowed"
                 }`}
                 title="Send message"

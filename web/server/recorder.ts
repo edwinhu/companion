@@ -1,8 +1,9 @@
-import { mkdirSync, readdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, appendFileSync, statSync, unlinkSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import type { BackendType } from "./session-types.js";
+import { COMPANION_HOME } from "./paths.js";
+import { countFileLines } from "./fs-utils.js";
 
 const DEFAULT_MAX_LINES = 1_000_000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -21,11 +22,22 @@ export interface RecordingHeader {
 export type RecordingDirection = "in" | "out";
 export type RecordingChannel = "cli" | "browser";
 
+export type RecordingLifecycleEvent =
+  | "ws_open"
+  | "ws_close"
+  | "ws_error"
+  | "reconnect_attempt"
+  | "reconnect_success";
+
 export interface RecordingEntry {
   ts: number;
   dir: RecordingDirection;
   raw: string;
   ch: RecordingChannel;
+  /** Optional connection lifecycle event (for disconnection diagnostics). */
+  event?: RecordingLifecycleEvent;
+  /** Optional metadata for lifecycle events (e.g. close code, error message). */
+  meta?: Record<string, unknown>;
 }
 
 export interface RecordingFileMeta {
@@ -47,6 +59,7 @@ export interface RecordingFileMeta {
 export class SessionRecorder {
   readonly filePath: string;
   private closed = false;
+  private _recordWriteErrorLogged = false;
   /** Number of lines written (1 for the header at construction). */
   lineCount = 1;
 
@@ -83,8 +96,39 @@ export class SessionRecorder {
     try {
       appendFileSync(this.filePath, JSON.stringify(entry) + "\n");
       this.lineCount++;
-    } catch {
-      // Never throw — recording must not disrupt normal operation
+    } catch (err) {
+      // Never throw — recording must not disrupt normal operation.
+      // But log once so operators can diagnose disk/permission issues.
+      if (!this._recordWriteErrorLogged) {
+        this._recordWriteErrorLogged = true;
+        console.warn(`[recorder] Write failed for ${this.filePath}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+
+  /** Record a connection lifecycle event (open, close, error, reconnect). */
+  recordEvent(
+    event: RecordingLifecycleEvent,
+    channel: RecordingChannel,
+    meta?: Record<string, unknown>,
+  ): void {
+    if (this.closed) return;
+    const entry: RecordingEntry = {
+      ts: Date.now(),
+      dir: "in",
+      raw: "",
+      ch: channel,
+      event,
+      ...(meta ? { meta } : {}),
+    };
+    try {
+      appendFileSync(this.filePath, JSON.stringify(entry) + "\n");
+      this.lineCount++;
+    } catch (err) {
+      if (!this._recordWriteErrorLogged) {
+        this._recordWriteErrorLogged = true;
+        console.warn(`[recorder] Write failed for ${this.filePath}: ${err instanceof Error ? err.message : err}`);
+      }
     }
   }
 
@@ -123,7 +167,7 @@ export class RecorderManager {
     this.recordingsDir =
       options?.recordingsDir ??
       process.env.COMPANION_RECORDINGS_DIR ??
-      join(homedir(), ".companion", "recordings");
+      join(COMPANION_HOME, "recordings");
     this.maxLines =
       options?.maxLines ??
       (Number(process.env.COMPANION_RECORDINGS_MAX_LINES) || DEFAULT_MAX_LINES);
@@ -194,6 +238,19 @@ export class RecorderManager {
       this.recorders.set(sessionId, recorder);
     }
     recorder.record(dir, raw, channel);
+  }
+
+  /** Record a connection lifecycle event for diagnostics. */
+  recordEvent(
+    sessionId: string,
+    event: RecordingLifecycleEvent,
+    channel: RecordingChannel,
+    meta?: Record<string, unknown>,
+  ): void {
+    const recorder = this.recorders.get(sessionId);
+    if (recorder) {
+      recorder.recordEvent(event, channel, meta);
+    }
   }
 
   stopRecording(sessionId: string): void {
@@ -315,18 +372,3 @@ export class RecorderManager {
   }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Count newlines in a file. Fast: reads raw buffer, counts 0x0A bytes. */
-function countFileLines(path: string): number {
-  try {
-    const buf = readFileSync(path);
-    let count = 0;
-    for (let i = 0; i < buf.length; i++) {
-      if (buf[i] === 0x0a) count++;
-    }
-    return count;
-  } catch {
-    return 0;
-  }
-}

@@ -226,6 +226,31 @@ describe("PromptsPage", () => {
     });
   });
 
+  it("shows validation feedback while editing when project scope has no folders", async () => {
+    // Validates edit mode still surfaces validation errors inside the redesigned editor.
+    mockApi.listPrompts.mockResolvedValueOnce([
+      {
+        id: "p2",
+        name: "local-check",
+        content: "Run local checks",
+        scope: "project",
+        projectPath: "/repo",
+        projectPaths: ["/repo"],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]);
+    render(<PromptsPage embedded />);
+    await screen.findByText("local-check");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    fireEvent.click(screen.getByLabelText("Remove folder /repo"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(screen.getByText("Select at least one project folder")).toBeInTheDocument();
+    expect(mockApi.updatePrompt).not.toHaveBeenCalled();
+  });
+
   it("filters prompts by search query", async () => {
     // Validates in-page filtering over prompt name/content/scope.
     mockApi.listPrompts.mockResolvedValueOnce([

@@ -27,6 +27,8 @@ const { mockApi, createSessionStreamMock, mockStoreState, mockStoreGetState } = 
     linkLinearIssue: vi.fn(),
     transitionLinearIssue: vi.fn(),
     listPrompts: vi.fn(),
+    listLinearConnections: vi.fn(),
+    listSandboxes: vi.fn(),
   },
   createSessionStreamMock: vi.fn(),
   mockStoreState: {
@@ -52,6 +54,7 @@ vi.mock("../store.js", () => {
 
 vi.mock("../ws.js", () => ({
   connectSession: vi.fn(),
+  createClientMessageId: vi.fn(() => "test-client-msg-id"),
   waitForConnection: vi.fn().mockResolvedValue(undefined),
   sendToSession: vi.fn(),
   disconnectSession: vi.fn(),
@@ -144,6 +147,10 @@ describe("HomePage", () => {
     mockApi.searchLinearIssues.mockResolvedValue({ issues: [] });
     mockApi.gitFetch.mockResolvedValue({ ok: true });
     mockApi.listPrompts.mockResolvedValue([]);
+    mockApi.listLinearConnections.mockResolvedValue({ connections: [] });
+    mockApi.listSandboxes.mockResolvedValue([]);
+    mockApi.getImageStatus.mockResolvedValue({ status: "idle" });
+    mockApi.pullImage.mockResolvedValue({ ok: true });
   });
 
   it("auto-sets branch from selected mapped Linear issue", async () => {
@@ -545,8 +552,8 @@ describe("HomePage", () => {
   it("opens environment dropdown and selects an environment", async () => {
     // The env dropdown should list available environments and allow selection.
     const testEnvs = [
-      { slug: "dev", name: "Development", variables: { API_KEY: "xxx" }, baseImage: "", imageTag: "" },
-      { slug: "prod", name: "Production", variables: { A: "1", B: "2" }, baseImage: "", imageTag: "" },
+      { slug: "dev", name: "Development", variables: { API_KEY: "xxx" } },
+      { slug: "prod", name: "Production", variables: { A: "1", B: "2" } },
     ];
     mockApi.listEnvs.mockResolvedValue(testEnvs);
 
@@ -603,7 +610,7 @@ describe("HomePage", () => {
     // Selecting "No environment" should clear the env selection and localStorage value.
     // First select an env through the dropdown, then clear it.
     const testEnvs = [
-      { slug: "dev", name: "Development", variables: { API_KEY: "xxx" }, baseImage: "", imageTag: "" },
+      { slug: "dev", name: "Development", variables: { API_KEY: "xxx" } },
     ];
     mockApi.listEnvs.mockResolvedValue(testEnvs);
 
@@ -1102,6 +1109,11 @@ describe("HomePage", () => {
     render(<HomePage />);
     await screen.findByPlaceholderText("Fix a bug, build a feature, refactor code...");
 
+    // Before opening the panel, API should not have been called yet.
+    // The accordion keeps elements in the DOM but inert, so this guard
+    // ensures the useEffect gating on showBranchingControls is exercised.
+    expect(mockApi.discoverClaudeSessions).not.toHaveBeenCalled();
+
     // Open the branching controls panel
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /branch from session/i }));
@@ -1292,6 +1304,241 @@ describe("HomePage", () => {
 
       // Should replace @rev with the prompt content, keeping the prefix
       expect(textarea.value).toBe("Please Please review this code ");
+    });
+  });
+
+  describe("Sandbox toggle", () => {
+    it("shows sandbox toggle for all backends", async () => {
+      // The sandbox toggle should appear regardless of which backend is selected
+      render(<HomePage />);
+      await screen.findByLabelText("Task description");
+
+      expect(screen.getByText("Sandbox")).toBeInTheDocument();
+    });
+
+    it("shows sandbox toggle for codex backend", async () => {
+      // The sandbox toggle should also appear when the backend is "codex"
+      mockApi.getBackends.mockResolvedValue([
+        { id: "codex", name: "Codex", available: true },
+      ]);
+      mockApi.getBackendModels.mockResolvedValue([]);
+      localStorage.setItem("cc-backend", "codex");
+      render(<HomePage />);
+      await screen.findByLabelText("Task description");
+
+      expect(screen.getByText("Sandbox")).toBeInTheDocument();
+    });
+
+    it("toggles sandbox enabled state on click", async () => {
+      // Clicking the sandbox button opens a dropdown; selecting "Default"
+      // enables sandbox and persists to localStorage.
+      render(<HomePage />);
+      await screen.findByLabelText("Task description");
+
+      const sandboxBtn = screen.getByText("Sandbox").closest("button")!;
+      await act(async () => { fireEvent.click(sandboxBtn); });
+
+      // Dropdown opens — select Default to enable sandbox
+      const defaultOption = await screen.findByText("Default (the-companion:latest)");
+      await act(async () => { fireEvent.click(defaultOption.closest("button")!); });
+
+      expect(localStorage.getItem("cc-sandbox-enabled")).toBe("true");
+    });
+
+    it("shows sandbox dropdown when clicked", async () => {
+      // Clicking the sandbox button should open a dropdown showing
+      // Off, Default, and available sandbox profiles.
+      mockApi.listSandboxes.mockResolvedValue([
+        { slug: "my-sandbox", name: "My Sandbox", createdAt: Date.now(), updatedAt: Date.now() },
+      ]);
+      mockApi.getImageStatus.mockResolvedValue({ status: "ready" });
+      localStorage.setItem("cc-sandbox-enabled", "true");
+      render(<HomePage />);
+      await screen.findByLabelText("Task description");
+
+      // Click the sandbox button to open the dropdown
+      const sandboxBtn = screen.getByText("Sandbox").closest("button")!;
+      await act(async () => { fireEvent.click(sandboxBtn); });
+
+      // The dropdown should show Off, Default, and our sandbox
+      await screen.findByText("Off");
+      await screen.findByText("Default (the-companion:latest)");
+      await screen.findByText("My Sandbox");
+    });
+
+    it("selects a sandbox profile from the dropdown", async () => {
+      // Selecting a specific sandbox profile in the dropdown should update
+      // localStorage and close the dropdown.
+      mockApi.listSandboxes.mockResolvedValue([
+        { slug: "my-sandbox", name: "My Sandbox", createdAt: Date.now(), updatedAt: Date.now() },
+      ]);
+      mockApi.getImageStatus.mockResolvedValue({ status: "ready" });
+      localStorage.setItem("cc-sandbox-enabled", "true");
+      render(<HomePage />);
+      await screen.findByLabelText("Task description");
+
+      // Open sandbox dropdown
+      const sandboxBtn = screen.getByText("Sandbox").closest("button")!;
+      await act(async () => { fireEvent.click(sandboxBtn); });
+
+      // Select "My Sandbox"
+      const mySandbox = await screen.findByText("My Sandbox");
+      await act(async () => { fireEvent.click(mySandbox.closest("button")!); });
+
+      expect(localStorage.getItem("cc-selected-sandbox")).toBe("my-sandbox");
+    });
+
+    it("sends sandbox flags for codex backend when sandbox is enabled", async () => {
+      // When sandbox is enabled in localStorage and the backend is codex,
+      // creating a session should send sandbox flags (sandbox works for all backends).
+      mockApi.getBackends.mockResolvedValue([
+        { id: "codex", name: "Codex", available: true },
+      ]);
+      mockApi.getBackendModels.mockResolvedValue([]);
+      localStorage.setItem("cc-backend", "codex");
+      localStorage.setItem("cc-sandbox-enabled", "true");
+      localStorage.setItem("cc-selected-sandbox", "my-sandbox");
+      createSessionStreamMock.mockReturnValue(new ReadableStream({
+        start(controller) {
+          controller.enqueue(JSON.stringify({ type: "complete", sessionId: "sess-1" }) + "\n");
+          controller.close();
+        },
+      }));
+
+      render(<HomePage />);
+      const textarea = await screen.findByLabelText("Task description");
+      await act(async () => {
+        fireEvent.change(textarea, { target: { value: "test" } });
+      });
+
+      const sendButton = screen.getByTitle("Send message");
+      await act(async () => {
+        fireEvent.click(sendButton);
+      });
+
+      await waitFor(() => {
+        expect(createSessionStreamMock).toHaveBeenCalled();
+      });
+
+      const callArgs = createSessionStreamMock.mock.calls[0][0];
+      expect(callArgs.sandboxEnabled).toBe(true);
+      expect(callArgs.sandboxSlug).toBe("my-sandbox");
+    });
+
+    it("does not send sandbox flags for codex backend when sandbox is disabled", async () => {
+      // When sandbox is explicitly disabled in localStorage, creating a session
+      // with codex backend should NOT send sandbox flags.
+      mockApi.getBackends.mockResolvedValue([
+        { id: "codex", name: "Codex", available: true },
+      ]);
+      mockApi.getBackendModels.mockResolvedValue([]);
+      localStorage.setItem("cc-backend", "codex");
+      localStorage.setItem("cc-sandbox-enabled", "false");
+      createSessionStreamMock.mockReturnValue(new ReadableStream({
+        start(controller) {
+          controller.enqueue(JSON.stringify({ type: "complete", sessionId: "sess-1" }) + "\n");
+          controller.close();
+        },
+      }));
+
+      render(<HomePage />);
+      const textarea = await screen.findByLabelText("Task description");
+      await act(async () => {
+        fireEvent.change(textarea, { target: { value: "test" } });
+      });
+
+      const sendButton = screen.getByTitle("Send message");
+      await act(async () => {
+        fireEvent.click(sendButton);
+      });
+
+      await waitFor(() => {
+        expect(createSessionStreamMock).toHaveBeenCalled();
+      });
+
+      const callArgs = createSessionStreamMock.mock.calls[0][0];
+      expect(callArgs.sandboxEnabled).toBeUndefined();
+      expect(callArgs.sandboxSlug).toBeUndefined();
+    });
+
+    it("shows image status indicator when pulling", async () => {
+      // When sandbox is enabled and the image is pulling, a pulsing
+      // amber dot should be visible next to the Sandbox button.
+      mockApi.getImageStatus.mockResolvedValue({ status: "pulling", progress: "downloading..." });
+      localStorage.setItem("cc-sandbox-enabled", "true");
+      render(<HomePage />);
+      await screen.findByLabelText("Task description");
+
+      await waitFor(() => {
+        expect(screen.getByTitle("Pulling Docker image...")).toBeInTheDocument();
+      });
+    });
+
+    it("shows image error indicator", async () => {
+      // When sandbox is enabled but image pull failed, a red dot with
+      // error info should appear.
+      mockApi.getImageStatus.mockResolvedValue({ status: "error", error: "pull failed" });
+      localStorage.setItem("cc-sandbox-enabled", "true");
+      render(<HomePage />);
+      await screen.findByLabelText("Task description");
+
+      await waitFor(() => {
+        expect(screen.getByTitle("Image error: pull failed")).toBeInTheDocument();
+      });
+    });
+  });
+
+  // ─── Onboarding tip ──────────────────────────────────────────────────────────
+
+  describe("onboarding tip", () => {
+    it("renders the onboarding tip when cc-onboarding-dismissed is not set", async () => {
+      // First-time users should see the onboarding tip explaining
+      // the toolbar controls and Branch from session.
+      render(<HomePage />);
+      await screen.findByPlaceholderText("Fix a bug, build a feature, refactor code...");
+
+      expect(screen.getByText(/sets where your code lives/)).toBeInTheDocument();
+    });
+
+    it("does not render the tip when cc-onboarding-dismissed is already set", async () => {
+      // Returning users who have previously dismissed the tip should
+      // not see it again; the localStorage flag gates initial state.
+      localStorage.setItem("cc-onboarding-dismissed", "true");
+      render(<HomePage />);
+      await screen.findByPlaceholderText("Fix a bug, build a feature, refactor code...");
+
+      expect(screen.queryByText(/sets where your code lives/)).not.toBeInTheDocument();
+    });
+
+    it("dismisses the tip and persists to localStorage on click", async () => {
+      // Clicking the dismiss button should hide the tip and write
+      // the cc-onboarding-dismissed flag to localStorage so it stays
+      // hidden across sessions.
+      render(<HomePage />);
+      await screen.findByPlaceholderText("Fix a bug, build a feature, refactor code...");
+
+      expect(screen.getByText(/sets where your code lives/)).toBeInTheDocument();
+
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText("Dismiss onboarding tip"));
+      });
+
+      expect(screen.queryByText(/sets where your code lives/)).not.toBeInTheDocument();
+      expect(localStorage.getItem("cc-onboarding-dismissed")).toBe("true");
+    });
+
+    it("does not mention Branch from session when backend is codex", async () => {
+      // The onboarding tip conditionally shows the "Branch from session"
+      // sentence only for Claude backend. Codex users should not see it
+      // since the branching feature is Claude-only.
+      localStorage.setItem("cc-backend", "codex");
+      render(<HomePage />);
+      await screen.findByPlaceholderText("Fix a bug, build a feature, refactor code...");
+
+      // The tip itself should still render (toolbar explanation)
+      expect(screen.getByText(/sets where your code lives/)).toBeInTheDocument();
+      // But the Claude-only sentence should be absent
+      expect(screen.queryByText(/branch from session/i)).not.toBeInTheDocument();
     });
   });
 });

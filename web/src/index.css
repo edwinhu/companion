@@ -37,22 +37,66 @@
   --color-cc-warning: #b7791f;
   --color-cc-sidebar-footer: #edece5;
   --color-cc-separator: rgba(31,30,29,0.10);
+  --color-cc-info: #2b6cb0;
+  --color-cc-merged: #805ad5;
+  --color-cc-codex: #10a37f;
+  --color-cc-codex-hover: #0d8c6d;
+  /* Darker button-grade variants — meet WCAG AA (4.5:1) with white text */
+  --color-cc-primary-btn: #ad5535;
+  --color-cc-primary-btn-hover: #b85c3a;
+  --color-cc-codex-btn: #0a7d5f;
+  --color-cc-codex-btn-hover: #0b8362;
 }
 
 @keyframes fadeSlideIn {
-  from {
+  0% {
     opacity: 0;
-    transform: translateY(4px);
+    transform: translateY(6px) scale(0.98);
   }
-  to {
+  60% {
     opacity: 1;
-    transform: translateY(0);
+    transform: translateY(-1px) scale(1.002);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes userSlideIn {
+  0% {
+    opacity: 0;
+    transform: translateX(8px) scale(0.97);
+  }
+  60% {
+    opacity: 1;
+    transform: translateX(-1px) scale(1.002);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
   }
 }
 
 @keyframes pulse-dot {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.3; transform: scale(0.85); }
+}
+
+@keyframes typing-breathe {
+  0%, 100% { opacity: 0.4; transform: scale(0.92); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes gradient-shift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+@keyframes gentle-bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
 }
 
 @keyframes spin {
@@ -119,6 +163,28 @@
   100% { box-shadow: 0 0 0 0 transparent; }
 }
 
+/* Accordion reveal — CSS-only smooth expand/collapse using grid rows.
+   Apply .accordion-panel to the wrapper, toggle data-open="true" to expand.
+   The inner child (.accordion-inner) handles overflow clipping. */
+.accordion-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 200ms ease-out, opacity 150ms ease-out, visibility 0s 200ms;
+  opacity: 0;
+  visibility: hidden;
+}
+
+.accordion-panel[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  visibility: visible;
+  transition: grid-template-rows 200ms ease-out, opacity 150ms ease-out, visibility 0s;
+}
+
+.accordion-panel > .accordion-inner {
+  overflow: hidden;
+}
+
 /* Dark mode overrides */
 .dark {
   --color-cc-bg: #262624;
@@ -140,6 +206,14 @@
   --color-cc-warning: #f6e05e;
   --color-cc-sidebar-footer: #141413;
   --color-cc-separator: rgba(222,220,209,0.08);
+  --color-cc-info: #63b3ed;
+  --color-cc-merged: #b794f4;
+  --color-cc-codex: #34d399;
+  --color-cc-codex-hover: #2fc48d;
+  --color-cc-primary-btn: #ad5535;
+  --color-cc-primary-btn-hover: #b85c3a;
+  --color-cc-codex-btn: #0a7d5f;
+  --color-cc-codex-btn-hover: #0b8362;
 }
 
 /* Scrollbar styling — desktop only.
@@ -178,6 +252,94 @@
 
 .font-mono-code {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ─── Chat-specific refinements ──────────────────────────────────────────── */
+
+/* Subtle inner glow for the composer card on desktop */
+.composer-card {
+  box-shadow: 0 10px 30px rgba(0,0,0,0.10), inset 0 1px 0 rgba(255,255,255,0.06);
+  transition: box-shadow 200ms ease, border-color 200ms ease;
+}
+.composer-card:focus-within {
+  box-shadow: 0 12px 36px rgba(0,0,0,0.14), inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+/* Thinking block expand/collapse animation */
+.thinking-expand {
+  animation: thinkingReveal 250ms ease-out;
+}
+@keyframes thinkingReveal {
+  from { opacity: 0; max-height: 0; }
+  to { opacity: 1; max-height: 500px; }
+}
+
+/* Tool block hover lift */
+.tool-card {
+  transition: transform 150ms ease, box-shadow 150ms ease;
+}
+.tool-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+}
+
+/* Avatar gradient ring */
+.avatar-ring {
+  background: conic-gradient(from 180deg, var(--color-cc-primary), #e8a87c, var(--color-cc-primary));
+  padding: 1.5px;
+}
+.avatar-ring > .avatar-inner {
+  background: var(--color-cc-bg);
+}
+
+/* User bubble subtle gradient */
+.user-bubble-gradient {
+  background: linear-gradient(135deg, var(--color-cc-user-bubble), color-mix(in srgb, var(--color-cc-user-bubble) 85%, var(--color-cc-primary) 15%));
+}
+
+/* Generation stats pulsing bar */
+.stats-glow {
+  position: relative;
+}
+.stats-glow::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--color-cc-primary);
+  opacity: 0.4;
+  animation: typing-breathe 1.5s ease-in-out infinite;
+}
+
+/* ─── Onboarding provider cards ─────────────────────────────────────────── */
+.provider-card--claude:hover,
+.provider-card--claude:focus-visible {
+  border-color: var(--color-cc-primary);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--color-cc-primary) 12%, transparent);
+}
+.provider-card--codex:hover,
+.provider-card--codex:focus-visible {
+  border-color: var(--color-cc-codex);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--color-cc-codex) 12%, transparent);
+}
+
+/* WCAG AA button backgrounds — darker shades for white text contrast */
+.btn-primary-aa {
+  background-color: var(--color-cc-primary-btn);
+}
+.btn-primary-aa:hover {
+  background-color: var(--color-cc-primary-btn-hover);
+}
+.btn-codex-aa {
+  background-color: var(--color-cc-codex-btn);
+}
+.btn-codex-aa:hover {
+  background-color: var(--color-cc-codex-btn-hover);
 }
 
 /* Global focus-visible ring — ensures keyboard users always see focus.
@@ -258,8 +420,19 @@ select {
   color: var(--color-cc-code-fg);
 }
 .diff-compact {
-  max-height: 280px;
-  overflow-y: auto;
+  /* No scroll — parent handles truncation with "show more" */
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+.diff-compact .diff-file-header {
+  display: none;
+}
+.diff-compact .diff-hunk-header {
+  font-size: 10px;
+  opacity: 0.4;
+  padding: 1px 4px;
+  font-style: italic;
 }
 .diff-full {
   overflow-y: auto;

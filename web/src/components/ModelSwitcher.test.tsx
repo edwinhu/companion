@@ -57,13 +57,18 @@ describe("ModelSwitcher", () => {
     expect(screen.getByLabelText("Switch model")).toBeInTheDocument();
   });
 
-  it("opens dropdown on click and shows Claude model options including opus-latest", () => {
+  it("opens dropdown on click and shows all Claude model options including Opus 4.7", () => {
     render(<ModelSwitcher sessionId="s1" />);
     fireEvent.click(screen.getByLabelText("Switch model"));
 
-    // Fallback Claude model options should appear in the dropdown.
+    // All Claude model options should appear in the dropdown.
+    // Note: "Opus Latest" (claude-opus-latest) was removed because the Claude CLI
+    // rejects it — valid IDs are full version strings or short aliases like 'opus'.
+    // The "Opus (latest)" entry uses the valid CLI short alias 'opus' and floats
+    // to whatever the CLI currently considers latest Opus.
     expect(screen.getByRole("option", { name: /Opus 4.6/ })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: /Opus Latest/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Opus 4.7/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Opus \(latest\)/ })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /Sonnet/ })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /Haiku/ })).toBeInTheDocument();
   });

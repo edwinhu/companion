@@ -2,7 +2,7 @@
 // Each key is a namespaced event name; values are the payload passed to handlers.
 
 import type { BrowserIncomingMessage } from "./session-types.js";
-import type { CodexAdapter } from "./codex-adapter.js";
+import type { IBackendAdapter } from "./backend-adapter.js";
 import type { SessionPhase } from "./session-state-machine.js";
 
 export interface CompanionEventMap {
@@ -39,10 +39,10 @@ export interface CompanionEventMap {
 
   // ── Backend integration ────────────────────────────────────────────
 
-  /** Codex adapter created and ready to be attached to WsBridge. */
+  /** Backend adapter created and ready to be attached to WsBridge. */
   "backend:codex-adapter-created": {
     sessionId: string;
-    adapter: CodexAdapter;
+    adapter: IBackendAdapter;
   };
 
   // ── Per-session messages (high volume) ─────────────────────────────

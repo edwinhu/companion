@@ -13,6 +13,7 @@ import type { SessionStore } from "./session-store.js";
 import type { BackendType } from "./session-types.js";
 import type { RecorderManager } from "./recorder.js";
 import { CodexAdapter } from "./codex-adapter.js";
+import { OpencodeAdapter, waitForOpencodeReady, createOpencodeSession } from "./opencode-adapter.js";
 import { resolveBinary, getEnrichedPath } from "./path-resolver.js";
 import { containerManager } from "./container-manager.js";
 import { companionBus } from "./event-bus.js";
@@ -125,6 +126,10 @@ export interface SdkSessionInfo {
   codexWsPort?: number;
   /** Full WebSocket URL for the Codex app-server. */
   codexWsUrl?: string;
+  /** opencode (Gemini) internal session ID (ses_...) for resume support. */
+  opencodeSessionId?: string;
+  /** Port the opencode serve daemon is listening on. */
+  opencodePort?: number;
 
   // Container fields
   /** Docker container ID when session runs inside a container */
@@ -330,8 +335,10 @@ export class CliLauncher {
       this.sessionEnvs.set(sessionId, { ...options.env });
     }
 
-    if (backendType === "codex" || backendType === "gemini") {
+    if (backendType === "codex") {
       this.spawnCodex(sessionId, info, options);
+    } else if (backendType === "gemini") {
+      this.spawnOpencode(sessionId, info, options);
     } else {
       this.spawnCLI(sessionId, info, options);
     }
@@ -463,7 +470,157 @@ export class CliLauncher {
     return Array.from(this.sessions.values()).filter((s) => s.state === "starting");
   }
 
+  /**
+   * Spawn opencode (Gemini backend) as a headless HTTP server and wire up
+   * an OpencodeAdapter that translates REST+SSE events into BrowserIncomingMessages.
+   *
+   * Flow:
+   *   1. Find a free port and spawn: opencode serve --port <PORT>
+   *   2. Poll GET /session until the server is ready (up to 30s)
+   *   3. POST /session to create a session inside opencode
+   *   4. Instantiate OpencodeAdapter and attach it to the WsBridge
+   */
+  private async spawnOpencode(sessionId: string, info: SdkSessionInfo, options: LaunchOptions): Promise<void> {
+    const binary = options.geminiBinary || "opencode";
+    const resolvedBinary = resolveBinary(binary);
+    if (!resolvedBinary) {
+      console.error(`[cli-launcher] Binary "${binary}" not found in PATH`);
+      info.state = "exited";
+      info.exitCode = 127;
+      this.persistState();
+      return;
+    }
+
+    // Find a free port for the opencode HTTP server
+    let port: number;
+    try {
+      port = await findFreePort(4600, 4700, (p) => this.claimedCodexWsPorts.has(p));
+      this.claimedCodexWsPorts.add(port);
+      info.opencodePort = port;
+    } catch (err) {
+      console.error(`[cli-launcher] Failed to find free port for opencode: ${err}`);
+      info.state = "exited";
+      info.exitCode = 1;
+      this.persistState();
+      return;
+    }
+
+    const enrichedPath = getEnrichedPath();
+    const cwd = info.cwd || process.cwd();
+
+    const args = ["serve", "--port", String(port), "--hostname", "127.0.0.1"];
+
+    console.log(`[cli-launcher] Spawning opencode serve session ${sessionId} on port ${port}: ${resolvedBinary} ${args.join(" ")}`);
+
+    const proc = Bun.spawn([resolvedBinary, ...args], {
+      cwd,
+      env: {
+        ...process.env,
+        ...options.env,
+        PATH: enrichedPath,
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    info.pid = proc.pid;
+    this.processes.set(sessionId, proc);
+    this.pipeOutput(sessionId, proc);
+
+    // Wait for the opencode HTTP server to be ready
+    let baseUrl: string;
+    try {
+      baseUrl = await waitForOpencodeReady(port, 30_000);
+    } catch (err) {
+      console.error(`[cli-launcher] opencode serve did not start for session ${sessionId}: ${err}`);
+      try { proc.kill("SIGTERM"); } catch {}
+      info.state = "exited";
+      info.exitCode = 1;
+      this.claimedCodexWsPorts.delete(port);
+      info.opencodePort = undefined;
+      this.processes.delete(sessionId);
+      this.persistState();
+      this.initErrorCbForSession?.(sessionId, `opencode serve failed to start: ${err}`);
+      return;
+    }
+
+    // Create an opencode session
+    let opencodeSessionId: string;
+    try {
+      opencodeSessionId = await createOpencodeSession(baseUrl, {
+        modelID: this.mapModelToOpencode(options.model),
+        cwd,
+      });
+    } catch (err) {
+      console.error(`[cli-launcher] Failed to create opencode session for ${sessionId}: ${err}`);
+      try { proc.kill("SIGTERM"); } catch {}
+      info.state = "exited";
+      info.exitCode = 1;
+      this.claimedCodexWsPorts.delete(port);
+      info.opencodePort = undefined;
+      this.processes.delete(sessionId);
+      this.persistState();
+      return;
+    }
+
+    info.opencodeSessionId = opencodeSessionId;
+    info.cliSessionId = opencodeSessionId;
+
+    // Create adapter and wire it up
+    const adapter = new OpencodeAdapter(baseUrl, sessionId, opencodeSessionId);
+
+    // Notify WsBridge so it can attach this adapter (same bus event as Codex)
+    companionBus.emit("backend:codex-adapter-created", { sessionId, adapter });
+
+    info.state = "connected";
+    this.persistState();
+
+    // Start the SSE listener and emit session_init to the browser
+    await adapter.start({
+      model: options.model || "gemini",
+      cwd,
+      permissionMode: options.permissionMode,
+    });
+
+    // Monitor process exit
+    proc.exited.then((exitCode) => {
+      console.log(`[cli-launcher] opencode serve session ${sessionId} exited (code=${exitCode})`);
+      adapter.disconnect().catch(() => {});
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.state = "exited";
+        session.exitCode = exitCode;
+        this.claimedCodexWsPorts.delete(port);
+        session.opencodePort = undefined;
+      }
+      this.processes.delete(sessionId);
+      this.persistState();
+      companionBus.emit("session:exited", { sessionId, exitCode });
+    });
+  }
+
+  /** Map a Companion model name to an opencode modelID (provider/model format). */
+  private mapModelToOpencode(model?: string): string | undefined {
+    if (!model) return undefined;
+    // If already in provider/model format, return as-is
+    if (model.includes("/")) return model;
+    // Map known shorthand names
+    const mapping: Record<string, string> = {
+      "gemini-2.5-pro": "google/gemini-2.5-pro",
+      "gemini-2.5-flash": "google/gemini-2.5-flash",
+      "gemini-2.0-flash": "google/gemini-2.0-flash",
+      "gemini-1.5-pro": "google/gemini-1.5-pro",
+      "gemini-1.5-flash": "google/gemini-1.5-flash",
+    };
+    return mapping[model] ?? `google/${model}`;
+  }
+
+  /** Internal helper: fire init error callback for a session. */
+  private initErrorCbForSession?: (sessionId: string, error: string) => void;
+
   private spawnCLI(sessionId: string, info: SdkSessionInfo, options: LaunchOptions & { resumeSessionId?: string }): void {
+
     const isContainerized = !!options.containerId;
 
     // For containerized sessions, the CLI binary lives inside the container.

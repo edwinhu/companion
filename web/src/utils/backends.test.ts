@@ -147,6 +147,10 @@ describe("static model/mode lists", () => {
     }
   });
 
+  it("includes a floating opus-latest option for Claude", () => {
+    expect(CLAUDE_MODELS.some((m) => m.value === "claude-opus-latest")).toBe(true);
+  });
+
   it("has at least 2 modes for each backend", () => {
     expect(CLAUDE_MODES.length).toBeGreaterThanOrEqual(2);
     expect(CODEX_MODES.length).toBeGreaterThanOrEqual(2);

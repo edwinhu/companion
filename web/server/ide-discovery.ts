@@ -487,6 +487,14 @@ export function startIdeDiscovery(
   const ideDir = options.ideDir ?? join(homedir(), ".claude", "ide");
   currentIdeDir = ideDir;
   stopped = false;
+  // Cubic P2 (DISC-06d): defensive zeroing. `readdirFailureStreak` is
+  // module-level state; even though stopCurrent() already clears it, a
+  // caller might invoke startIdeDiscovery() without a matching prior
+  // stop() (first-ever start, or after an abnormal tear-down that
+  // bypassed stopCurrent). Reset here so the new session always starts
+  // with a clean streak and cannot inherit a carry-over that pushes it
+  // across the eviction threshold too early.
+  readdirFailureStreak = 0;
 
   // Initial scan — synchronous so listAvailableIdes() reflects pre-existing
   // lockfiles the moment startIdeDiscovery returns. See scanDirSync for the
@@ -556,6 +564,12 @@ function stopCurrent(): void {
   // entries from the previous dir forever.
   known.clear();
   transientCounts.clear();
+  // Cubic P2 (DISC-06d): readdir failure streak is module-level state
+  // that must not leak across stop/start cycles. If a session accumulated
+  // failures under the eviction threshold and is then stopped, the next
+  // startIdeDiscovery() would otherwise inherit the non-zero streak and
+  // evict IDEs too early on the first failure in the new session.
+  readdirFailureStreak = 0;
 }
 
 /** Snapshot of currently-known IDEs. */
@@ -587,6 +601,15 @@ export function _getSkippedCountForTests(): number {
  */
 export function _resetReaddirFailureStreakForTests(): void {
   readdirFailureStreak = 0;
+}
+
+/**
+ * Test-only: inspect the DISC-06 readdir failure streak counter. Used by
+ * DISC-06d to assert the streak is reset across stop/start cycles and does
+ * not leak stale failure history into a fresh session.
+ */
+export function _getReaddirFailureStreakForTests(): number {
+  return readdirFailureStreak;
 }
 
 /**

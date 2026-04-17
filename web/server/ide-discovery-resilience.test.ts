@@ -637,5 +637,99 @@ describe("ide-discovery resilience (DISC-05 / DISC-06)", () => {
     // whether the mid-success scan ran through pass-mode (which reads the
     // real lockfile). Either way, no removal event should have fired.
   });
+
+  // DISC-06d: Cubic P2 — `readdirFailureStreak` is module-level state. If
+  // `startIdeDiscovery()` is torn down while the streak is non-zero, a
+  // subsequent `startIdeDiscovery()` must start with a fresh streak of 0.
+  // Otherwise the new session inherits the old streak and can evict IDEs
+  // too early (e.g. a single readdir failure in the new session would push
+  // a carried-over streak of 2 to 3, crossing the threshold and triggering
+  // eviction prematurely).
+  //
+  // Scenario:
+  //   1. Stage 2 consecutive readdirSync failures (streak=2, below
+  //      threshold=3, no eviction).
+  //   2. Stop the current discovery session (the `stop` function returned
+  //      by `startIdeDiscovery`).
+  //   3. Start a fresh session.
+  //   4. Trigger 1 readdirSync failure.
+  //   5. Assert: streak in the new session is 1 (not 3) and no eviction
+  //      occurred.
+  it("DISC-06d: readdirFailureStreak resets across stop/start cycles", async () => {
+    const lockPath = join(tmpDir, "60014.lock");
+    writeFileSync(lockPath, lockfilePayload({ ideName: "Neovim" }));
+
+    // Start session #1 — entry is discovered cleanly.
+    stop = disco.startIdeDiscovery({ ideDir: tmpDir });
+    expect(disco.listAvailableIdes().some((i: { port: number }) => i.port === 60014)).toBe(true);
+
+    const removedSpy = vi.fn();
+    bus.on("ide:removed", removedSpy);
+
+    disco._resetReaddirFailureStreakForTests?.();
+
+    // Stage persistent readdirSync failures.
+    readdirSyncImpl.current = (p: string) => {
+      if (p === tmpDir) {
+        const err = new Error("EACCES: permission denied");
+        (err as NodeJS.ErrnoException).code = "EACCES";
+        throw err;
+      }
+      return readdirSyncImpl.real!(p);
+    };
+
+    // Two failing scans in session #1 — streak=2, still below threshold=3.
+    await disco._scanDirForTests(tmpDir);
+    await disco._scanDirForTests(tmpDir);
+    expect(
+      disco._getReaddirFailureStreakForTests?.(),
+      "DISC-06d precondition: streak must be 2 after two failures",
+    ).toBe(2);
+    // No eviction yet.
+    const removedBefore = removedSpy.mock.calls.map((c) => (c[0] as { port: number }).port);
+    expect(removedBefore).not.toContain(60014);
+
+    // Stop the session. The streak should be zeroed by stopCurrent().
+    stop?.();
+    stop = null;
+    expect(
+      disco._getReaddirFailureStreakForTests?.(),
+      "DISC-06d: streak must be reset to 0 on stop",
+    ).toBe(0);
+
+    // Start a fresh session — entry needs to be re-seeded. Restore
+    // readdirSync so the initial sync scan succeeds and re-adds the lockfile.
+    readdirSyncImpl.current = null;
+    stop = disco.startIdeDiscovery({ ideDir: tmpDir });
+    expect(
+      disco._getReaddirFailureStreakForTests?.(),
+      "DISC-06d: streak must be 0 at the start of a new session",
+    ).toBe(0);
+    expect(disco.listAvailableIdes().some((i: { port: number }) => i.port === 60014)).toBe(true);
+
+    // Re-install the failing readdirSync mock and trigger exactly ONE
+    // failing scan in session #2.
+    readdirSyncImpl.current = (p: string) => {
+      if (p === tmpDir) {
+        const err = new Error("EACCES: permission denied");
+        (err as NodeJS.ErrnoException).code = "EACCES";
+        throw err;
+      }
+      return readdirSyncImpl.real!(p);
+    };
+
+    await disco._scanDirForTests(tmpDir);
+
+    // Streak must be 1 (fresh session), NOT 3 (would-be carry-over: 2 + 1).
+    expect(
+      disco._getReaddirFailureStreakForTests?.(),
+      "DISC-06d: new session must see streak=1, not 3, after one failure",
+    ).toBe(1);
+    const removedAfter = removedSpy.mock.calls.map((c) => (c[0] as { port: number }).port);
+    expect(
+      removedAfter,
+      "DISC-06d: no eviction in new session (streak below threshold)",
+    ).not.toContain(60014);
+  });
 });
 

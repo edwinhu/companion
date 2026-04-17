@@ -572,9 +572,21 @@ function stopCurrent(): void {
   readdirFailureStreak = 0;
 }
 
-/** Snapshot of currently-known IDEs. */
+/**
+ * Snapshot of currently-known IDEs.
+ *
+ * Returns a fresh outer array AND fresh per-entry clones so that callers
+ * cannot mutate the module's internal `known` Map by writing through the
+ * returned records (cubic round-5 P2 FIX 2 / SNAPSHOT-01). `DiscoveredIde`
+ * is a flat record whose only nested mutable field is `workspaceFolders`
+ * (string[]); spreading the record and copying that array is sufficient —
+ * cheaper than `structuredClone` and covers every field.
+ */
 export function listAvailableIdes(): DiscoveredIde[] {
-  return Array.from(known.values());
+  return Array.from(known.values()).map((ide) => ({
+    ...ide,
+    workspaceFolders: [...ide.workspaceFolders],
+  }));
 }
 
 /** Test-only — wipe internal state between tests. */

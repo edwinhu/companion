@@ -1101,4 +1101,156 @@ describe("IDE integration (Task 11)", () => {
     expect(onOpenIdePicker).not.toHaveBeenCalled();
     expect(mockSendToSession).not.toHaveBeenCalled();
   });
+
+  // ─── /ide escape hatch (cubic round-5 P2 FIX 1) ────────────────────────────
+  //
+  // The literal `/ide` string is intercepted client-side to open the IdePicker
+  // (BIND-06). That intercept hijacks any real CLI slash command of the same
+  // name and gives users no way to send the literal text `/ide` to the
+  // backend. FIX 1: a leading backslash acts as an escape hatch. `\/ide`
+  // sends `/ide` as a user_message and does NOT open the picker. The
+  // intercept must still fire for the bare `/ide` (no backslash).
+
+  it("IDE-ESC-01: bare /ide + Enter still opens the picker (regression)", () => {
+    // Regression guard — the escape-hatch fix must not break the primary
+    // intercept path. Bare `/ide` remains client-side only.
+    setupMockStore({ session: { slash_commands: [], skills: [] } });
+    const onOpenIdePicker = vi.fn();
+    const { container } = render(
+      <Composer sessionId="s1" onOpenIdePicker={onOpenIdePicker} />,
+    );
+    const textarea = container.querySelector("textarea")! as HTMLTextAreaElement;
+
+    fireEvent.change(textarea, { target: { value: "/ide" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    expect(onOpenIdePicker).toHaveBeenCalledTimes(1);
+    expect(mockSendToSession).not.toHaveBeenCalled();
+  });
+
+  it("IDE-ESC-02: \\/ide + Enter sends literal /ide to backend, does NOT open picker", () => {
+    // Escape hatch: user prepends `\` to send the literal string `/ide` as
+    // a user_message. The backslash is stripped before send.
+    setupMockStore({ session: { slash_commands: [], skills: [] } });
+    const onOpenIdePicker = vi.fn();
+    const { container } = render(
+      <Composer sessionId="s1" onOpenIdePicker={onOpenIdePicker} />,
+    );
+    const textarea = container.querySelector("textarea")! as HTMLTextAreaElement;
+
+    fireEvent.change(textarea, { target: { value: "\\/ide" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    expect(onOpenIdePicker).not.toHaveBeenCalled();
+    expect(mockSendToSession).toHaveBeenCalledWith(
+      "s1",
+      expect.objectContaining({
+        type: "user_message",
+        content: "/ide",
+      }),
+    );
+  });
+
+  it("IDE-ESC-03: /ide with arguments passes through to backend (no intercept)", () => {
+    // Any arguments after `/ide` means the user is talking to the CLI, not
+    // the overlay. Pin current behavior — intercept only fires on the bare
+    // exact string.
+    setupMockStore({ session: { slash_commands: [], skills: [] } });
+    const onOpenIdePicker = vi.fn();
+    const { container } = render(
+      <Composer sessionId="s1" onOpenIdePicker={onOpenIdePicker} />,
+    );
+    const textarea = container.querySelector("textarea")! as HTMLTextAreaElement;
+
+    fireEvent.change(textarea, { target: { value: "/ide --help" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    expect(onOpenIdePicker).not.toHaveBeenCalled();
+    expect(mockSendToSession).toHaveBeenCalledWith(
+      "s1",
+      expect.objectContaining({
+        type: "user_message",
+        content: "/ide --help",
+      }),
+    );
+  });
+
+  it("IDE-ESC-04: Codex session + bare /ide does NOT open picker and does NOT send", () => {
+    // Pin current behavior: on Codex the overlay is disabled (UI-04). The
+    // secondary intercept swallows the message anyway so the CLI never
+    // observes /ide. Neither onOpenIdePicker nor sendToSession should fire.
+    setupMockStore({
+      session: {
+        backend_type: "codex",
+        slash_commands: [],
+        skills: [],
+      } as Partial<SessionState>,
+    });
+    const onOpenIdePicker = vi.fn();
+    const { container } = render(
+      <Composer sessionId="s1" onOpenIdePicker={onOpenIdePicker} />,
+    );
+    const textarea = container.querySelector("textarea")! as HTMLTextAreaElement;
+
+    fireEvent.change(textarea, { target: { value: "/ide" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    expect(onOpenIdePicker).not.toHaveBeenCalled();
+    expect(mockSendToSession).not.toHaveBeenCalled();
+  });
+
+  it("IDE-ESC-05: \\\\/ide (two backslashes + /ide) passes through verbatim", () => {
+    // Codex review concern: the original broad escape (`startsWith("\\/")`)
+    // stripped any leading backslash on a `\/`-prefixed message, which gave
+    // `\\/ide` undefined, untested semantics. The narrowed escape (exact
+    // match on `\/ide`) leaves `\\/ide` untouched so it arrives at the
+    // backend verbatim. This test pins that contract: user typed two
+    // backslashes, backend sees two backslashes. No partial stripping.
+    setupMockStore({ session: { slash_commands: [], skills: [] } });
+    const onOpenIdePicker = vi.fn();
+    const { container } = render(
+      <Composer sessionId="s1" onOpenIdePicker={onOpenIdePicker} />,
+    );
+    const textarea = container.querySelector("textarea")! as HTMLTextAreaElement;
+
+    fireEvent.change(textarea, { target: { value: "\\\\/ide" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    expect(onOpenIdePicker).not.toHaveBeenCalled();
+    expect(mockSendToSession).toHaveBeenCalledWith(
+      "s1",
+      expect.objectContaining({
+        type: "user_message",
+        content: "\\\\/ide",
+      }),
+    );
+  });
+
+  it("IDE-ESC-06: \\/clear (escape-looking but NOT /ide) sent verbatim, backslash preserved", () => {
+    // Codex review concern: a broad `startsWith("\\/")` escape would strip
+    // the backslash from ANY `\/`-prefixed input (e.g. `\/clear`, `\/help`),
+    // even though those strings are not intercepted by Companion and the
+    // user never opted into escape semantics for them. This test pins the
+    // narrow contract: only the exact string `\/ide` gets un-escaped. Every
+    // other `\/`-prefixed input is passed through unchanged so the backend
+    // sees exactly what the user typed.
+    setupMockStore({ session: { slash_commands: [], skills: [] } });
+    const onOpenIdePicker = vi.fn();
+    const { container } = render(
+      <Composer sessionId="s1" onOpenIdePicker={onOpenIdePicker} />,
+    );
+    const textarea = container.querySelector("textarea")! as HTMLTextAreaElement;
+
+    fireEvent.change(textarea, { target: { value: "\\/clear" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    expect(onOpenIdePicker).not.toHaveBeenCalled();
+    expect(mockSendToSession).toHaveBeenCalledWith(
+      "s1",
+      expect.objectContaining({
+        type: "user_message",
+        content: "\\/clear",
+      }),
+    );
+  });
 });

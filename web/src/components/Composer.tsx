@@ -195,11 +195,28 @@ export function Composer({ sessionId, onOpenIdePicker }: ComposerProps) {
       setSlashMenuOpen(false);
       return;
     }
+    // Escape hatch (cubic round-5 P2 FIX 1, narrowed in P2 FIX 1.1 per
+    // codex review): allow the user to send a literal `/ide` to the backend
+    // by prefixing with a backslash. `\/ide` → sends `/ide` as a user_message.
+    // The intercept above operates on the ORIGINAL `msg`, so prefixing with
+    // `\` bypasses it cleanly. Strip the backslash and continue down the
+    // normal send path with `outbound` in place of `msg`.
+    //
+    // NARROW BY DESIGN: this match is EXACT on the single string `\/ide`
+    // because `/ide` is the ONLY slash string Companion intercepts today.
+    // A broader rule (e.g. `msg.startsWith("\\/")`) would silently inherit
+    // escape semantics for any future intercepted string and would also
+    // strip backslashes from unrelated input like `\/clear`, which the user
+    // never opted into. If a new intercept is added (e.g. `/foo`), extend
+    // this explicitly — e.g. `new Set(["\\/ide", "\\/foo"]).has(msg)` —
+    // rather than loosening the prefix test. See codex review on PR for
+    // rationale.
+    const outbound = msg === "\\/ide" ? "/ide" : msg;
     const clientMsgId = createClientMessageId();
 
     sendToSession(sessionId, {
       type: "user_message",
-      content: msg,
+      content: outbound,
       session_id: sessionId,
       images: images.length > 0 ? images.map((img) => ({ media_type: img.mediaType, data: img.base64 })) : undefined,
       client_msg_id: clientMsgId,
@@ -208,7 +225,7 @@ export function Composer({ sessionId, onOpenIdePicker }: ComposerProps) {
     useStore.getState().appendMessage(sessionId, {
       id: clientMsgId,
       role: "user",
-      content: msg,
+      content: outbound,
       images: images.length > 0 ? images.map((img) => ({ media_type: img.mediaType, data: img.base64 })) : undefined,
       timestamp: Date.now(),
     });

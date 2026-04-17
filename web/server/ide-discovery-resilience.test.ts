@@ -731,5 +731,87 @@ describe("ide-discovery resilience (DISC-05 / DISC-06)", () => {
       "DISC-06d: no eviction in new session (streak below threshold)",
     ).not.toContain(60014);
   });
+
+  // ─── SNAPSHOT-01: listAvailableIdes must return a deep-cloned snapshot ─────
+  //
+  // Cubic round-5 P2 FIX 2. Previously, `listAvailableIdes()` returned a
+  // fresh outer array via `Array.from(known.values())` but the entries
+  // themselves were shared references into the internal `known` Map. A
+  // caller that mutated a returned `DiscoveredIde` (e.g.
+  // `result[0].port = 9999`) corrupted the module's internal state,
+  // poisoning the next reconcile diff (the prev entry would reflect the
+  // caller's mutation, producing false "changed" events or missing
+  // removals).
+  //
+  // The fix returns structurally cloned entries — spread each record and
+  // make a fresh copy of the only nested mutable field
+  // (`workspaceFolders: string[]`). Flat scalar fields (`port`, `ideName`,
+  // `transport`, …) are safe under spread alone.
+  //
+  // This test mutates every relevant field on the returned entry then
+  // calls `listAvailableIdes()` a second time and asserts the second
+  // snapshot matches the originally-observed shape.
+  it("SNAPSHOT-01: listAvailableIdes returns immutable snapshots (cubic round-5 P2 FIX 2)", async () => {
+    const lockPath = join(tmpDir, "60099.lock");
+    const originalWorkspace = ["/Users/test/project"];
+    writeFileSync(
+      lockPath,
+      lockfilePayload({
+        ideName: "Neovim",
+        workspaceFolders: originalWorkspace,
+      }),
+    );
+
+    // Seed `known` by driving a scan — after this `listAvailableIdes()`
+    // must contain one entry.
+    stop = disco.startIdeDiscovery({ ideDir: tmpDir });
+
+    const first = disco.listAvailableIdes() as Array<{
+      port: number;
+      ideName: string;
+      workspaceFolders: string[];
+    }>;
+    expect(first).toHaveLength(1);
+    const originalPort = first[0].port;
+    const originalIdeName = first[0].ideName;
+    const originalWsLen = first[0].workspaceFolders.length;
+
+    // Mutate the returned entry aggressively — top-level scalars AND the
+    // nested array (which is the only non-scalar mutable field on the
+    // record). If the implementation returns shared refs, these writes
+    // land inside the module's `known` Map and the next call will see
+    // them.
+    first[0].port = 9999;
+    first[0].ideName = "HIJACKED";
+    first[0].workspaceFolders.push("/poisoned/path");
+    first[0].workspaceFolders[0] = "/mutated";
+
+    const second = disco.listAvailableIdes() as Array<{
+      port: number;
+      ideName: string;
+      workspaceFolders: string[];
+    }>;
+
+    expect(second).toHaveLength(1);
+    expect(
+      second[0].port,
+      "SNAPSHOT-01: port must not reflect caller mutation",
+    ).toBe(originalPort);
+    expect(
+      second[0].ideName,
+      "SNAPSHOT-01: ideName must not reflect caller mutation",
+    ).toBe(originalIdeName);
+    expect(
+      second[0].workspaceFolders.length,
+      "SNAPSHOT-01: workspaceFolders length must not reflect caller push",
+    ).toBe(originalWsLen);
+    expect(
+      second[0].workspaceFolders[0],
+      "SNAPSHOT-01: workspaceFolders[0] must not reflect caller mutation",
+    ).toBe(originalWorkspace[0]);
+    // And a third call still returns a fresh, independent copy.
+    const third = disco.listAvailableIdes() as Array<{ workspaceFolders: string[] }>;
+    expect(third[0].workspaceFolders).not.toBe(second[0].workspaceFolders);
+  });
 });
 

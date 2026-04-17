@@ -1339,11 +1339,16 @@ export function connectSession(sessionId: string) {
     const lastSeq = getLastSeq(sessionId);
     ws.send(JSON.stringify({ type: "session_subscribe", last_seq: lastSeq }));
     flushQueuedOutgoing(sessionId, ws);
-    // cubic-ai review (PR #652, round 3, P2): reset the ide_list_changed
-    // generation dedupe whenever a WS opens so a server restart (which
-    // resets scanGeneration to 0/1 on the server) does not cause every
-    // new-lifetime event to be suppressed by a stale high-water mark.
-    resetIdeListChangedDedupe();
+    // Reset ide_list_changed generation dedupe only when this is the FIRST
+    // socket opening (no other sessions connected). A server restart drops
+    // all sockets, so the first reconnect is our tightest signal for "new
+    // server lifetime / generation counter reset". Resetting on every
+    // per-session reconnect while others are still connected would let
+    // duplicate dispatches through (Cubic round-9, P2).
+    const otherConnected = Array.from(sockets.entries()).some(
+      ([id, s]) => id !== sessionId && s.readyState === WebSocket.OPEN,
+    );
+    if (!otherConnected) resetIdeListChangedDedupe();
     // Clear any reconnect timer
     const timer = reconnectTimers.get(sessionId);
     if (timer) {

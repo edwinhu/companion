@@ -90,23 +90,63 @@ export function IdePicker({
   );
 
   // ── Fetch IDE list on mount ────────────────────────────────────────────
+  //
+  // cubic-ai review (PR #652): concurrent loadList calls can resolve out of
+  // order. When `companion:ide-list-changed` fires rapidly, two requests
+  // are in flight and a slow FIRST call can land AFTER a fast SECOND call,
+  // clobbering the newer state. An epoch counter drops stale responses:
+  // each call increments the ref and captures its token; the resolver
+  // only commits state when the token still matches the latest.
+  const loadEpochRef = useRef(0);
+  // Codex adversarial review (BRITTLE 1): the epoch ref prevents post-unmount
+  // setState, but the underlying HTTP request keeps running. An AbortController
+  // per call lets us (a) cancel superseded in-flight requests when a newer
+  // loadList() starts and (b) cancel the mount-time request on unmount. The
+  // epoch guard remains as a second layer for requests that resolve between
+  // `fetch()` returning and our `.catch(AbortError)` branch executing.
+  const loadControllerRef = useRef<AbortController | null>(null);
   const loadList = useCallback(async () => {
+    const token = ++loadEpochRef.current;
+    // Abort any prior in-flight request before issuing a new one.
+    loadControllerRef.current?.abort();
+    const controller = new AbortController();
+    loadControllerRef.current = controller;
     setLoading(true);
     setLoadError(null);
     try {
-      const list = await getAvailableIdes(cwd);
+      const list = await getAvailableIdes(cwd, controller.signal);
+      if (loadEpochRef.current !== token) return; // stale — newer load in flight or done
       setIdes(list);
       setSelectedIndex(list.length > 0 ? 0 : -1);
     } catch (e) {
+      if (loadEpochRef.current !== token) return;
+      // AbortError is expected (supersede or unmount) — never surface it.
+      const isAbort =
+        (e instanceof DOMException && e.name === "AbortError") ||
+        (e instanceof Error && e.name === "AbortError");
+      if (isAbort) return;
       setLoadError(e instanceof Error ? e.message : "Failed to load IDEs");
       setIdes([]);
     } finally {
-      setLoading(false);
+      if (loadEpochRef.current === token) setLoading(false);
     }
   }, [cwd]);
 
   useEffect(() => {
     loadList();
+    // Codex adversarial review (BRITTLE 2): bump the epoch on unmount so any
+    // in-flight `loadList` resolution that lands AFTER unmount sees a stale
+    // token and early-returns before calling setIdes / setLoading / setLoadError.
+    // Without this, React warns "setState on unmounted component" whenever the
+    // picker closes while a fetch is pending. The loadEpochRef comparison
+    // inside loadList already handles stale races — we just invalidate all
+    // tokens on teardown.
+    // BRITTLE 1: also abort the in-flight controller so the HTTP request
+    // itself is cancelled (not just its setState branch suppressed).
+    return () => {
+      loadEpochRef.current++;
+      loadControllerRef.current?.abort();
+    };
   }, [loadList]);
 
   // ── Live refresh on ide_list_changed (Task 12, DISC-03 UX side) ─────────

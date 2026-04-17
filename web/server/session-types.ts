@@ -386,7 +386,14 @@ export type BrowserIncomingMessageBase =
   | { type: "streamlined_tool_use_summary"; tool_summary: string }
   // Broadcast to all browsers when the available-IDE list changes (add/remove/update).
   // IdePicker instances refetch `GET /api/ide/available` on receipt.
-  | { type: "ide_list_changed" };
+  //
+  // `generation` is a monotonic counter sourced from ide-discovery's
+  // `scanGeneration`. The client uses it to deduplicate fan-out across
+  // multiple session sockets receiving the same server broadcast: the same
+  // generation means the same underlying discovery scan. A newer generation
+  // is always a fresh event — including legitimate fast add+remove cycles
+  // (e.g. IDE restart) that would be lost under a time-window dedupe.
+  | { type: "ide_list_changed"; generation?: number };
 
 export type BrowserIncomingMessage = BrowserIncomingMessageBase & { seq?: number };
 

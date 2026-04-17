@@ -82,12 +82,13 @@ async function post<T = unknown>(path: string, body?: object): Promise<T> {
   }
 }
 
-async function get<T = unknown>(path: string): Promise<T> {
+async function get<T = unknown>(path: string, signal?: AbortSignal): Promise<T> {
   const startedAt = nowMs();
   let failureTracked = false;
   try {
     const res = await fetch(`${BASE}${path}`, {
       headers: { ...getAuthHeaders() },
+      signal,
     });
     if (!res.ok) {
       handle401(res.status);
@@ -851,9 +852,12 @@ export interface AvailableIde {
  * Throws on non-2xx — the IdePicker treats that as "unable to load" and
  * renders a retry affordance.
  */
-export async function getAvailableIdes(cwd?: string): Promise<AvailableIde[]> {
+export async function getAvailableIdes(
+  cwd?: string,
+  signal?: AbortSignal,
+): Promise<AvailableIde[]> {
   const qs = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
-  return get<AvailableIde[]>(`/ide/available${qs}`);
+  return get<AvailableIde[]>(`/ide/available${qs}`, signal);
 }
 
 /**

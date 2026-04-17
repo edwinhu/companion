@@ -2143,6 +2143,21 @@ describe("getAvailableIdes (Task 9)", () => {
 
     await expect(getAvailableIdes()).rejects.toThrow("boom");
   });
+
+  // Codex adversarial review (BRITTLE 1): the picker uses an AbortController
+  // to cancel superseded / post-unmount requests. The api wrapper must thread
+  // the caller-supplied AbortSignal through to the underlying fetch() call so
+  // that aborting the controller actually cancels the HTTP request (not just
+  // suppresses the setState branch). This test pins that contract.
+  it("threads the caller-supplied AbortSignal through to fetch()", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse([]));
+    const controller = new AbortController();
+
+    await getAvailableIdes("/tmp/x", controller.signal);
+
+    const [, opts] = mockFetch.mock.calls[0];
+    expect(opts?.signal).toBe(controller.signal);
+  });
 });
 
 describe("bindIde (Task 9)", () => {

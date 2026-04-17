@@ -131,16 +131,19 @@ describe("CompanionEventMap IDE events (Task 1)", () => {
       ideName: "Neovim",
       workspaceFolders: ["/tmp"],
       lockfilePath: "/tmp/123.lock",
+      generation: 1,
     };
     const removed: CompanionEventMap["ide:removed"] = {
       port: 123,
       lockfilePath: "/tmp/123.lock",
+      generation: 2,
     };
     const changed: CompanionEventMap["ide:changed"] = {
       port: 123,
       ideName: "Neovim",
       workspaceFolders: ["/tmp"],
       lockfilePath: "/tmp/123.lock",
+      generation: 3,
     };
     const bindingChangedNull: CompanionEventMap["ide:binding-changed"] = {
       sessionId: "s1",

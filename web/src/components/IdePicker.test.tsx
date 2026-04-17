@@ -665,8 +665,103 @@ describe("IdePicker — live refresh (Task 12)", () => {
     await waitFor(() => {
       expect(mockGetAvailableIdes).toHaveBeenCalledTimes(2);
     });
-    // Same cwd is passed on refetch.
-    expect(mockGetAvailableIdes).toHaveBeenLastCalledWith("/Users/me/areas/secreg");
+    // Same cwd is passed on refetch. Second positional arg is the AbortSignal
+    // threaded through per BRITTLE 1 — asserted separately in the
+    // "aborts the prior in-flight request" test.
+    const lastCall = mockGetAvailableIdes.mock.calls.at(-1)!;
+    expect(lastCall[0]).toBe("/Users/me/areas/secreg");
+  });
+
+  // cubic-ai review (PR #652): concurrent loadList() calls can resolve out
+  // of order. When `companion:ide-list-changed` fires rapidly (e.g. a batch
+  // of fs.watch events), two fetches are in flight simultaneously. If the
+  // FIRST (older, stale) request resolves AFTER the SECOND (newer, fresh)
+  // request, the component state ends up displaying stale data.
+  //
+  // Fix: each loadList invocation captures an epoch token; a resolving
+  // response only commits to state if its token still matches the latest.
+  it("concurrent loadList: stale response is ignored when newer request has resolved", async () => {
+    // Build two deferred promises so we can control resolution order.
+    let resolveA!: (v: typeof idesMany) => void;
+    let resolveB!: (v: typeof idesMany) => void;
+    const promiseA = new Promise<typeof idesMany>((r) => {
+      resolveA = r;
+    });
+    const promiseB = new Promise<typeof idesMany>((r) => {
+      resolveB = r;
+    });
+
+    // Mount fires request A. Then fire the event to start request B.
+    mockGetAvailableIdes.mockReturnValueOnce(promiseA);
+    mockGetAvailableIdes.mockReturnValueOnce(promiseB);
+
+    setup();
+    await waitFor(() => {
+      expect(mockGetAvailableIdes).toHaveBeenCalledTimes(1);
+    });
+
+    window.dispatchEvent(new CustomEvent("companion:ide-list-changed"));
+    await waitFor(() => {
+      expect(mockGetAvailableIdes).toHaveBeenCalledTimes(2);
+    });
+
+    // Resolve B (newer) first — it has only the Neovim entry.
+    const bOnly = [idesMany[0]];
+    resolveB(bOnly);
+    await waitFor(() => {
+      expect(screen.getByText("Neovim")).toBeInTheDocument();
+    });
+    // Sanity: the other entries from the "many" fixture are not yet
+    // rendered — only B's single-item list is visible.
+    expect(screen.queryByText("Visual Studio Code")).not.toBeInTheDocument();
+
+    // Now resolve A (stale, older) with the larger list. Without the epoch
+    // guard, A's state.setIdes would clobber B's already-committed state.
+    resolveA(idesMany);
+
+    // Give React a tick to react. The component must still render only
+    // B's entry — A's response is dropped on the floor.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.getByText("Neovim")).toBeInTheDocument();
+    expect(screen.queryByText("Visual Studio Code")).not.toBeInTheDocument();
+    expect(screen.queryByText("Obsidian")).not.toBeInTheDocument();
+  });
+
+  it("stale response doesn't overwrite newer state (explicit list count check)", async () => {
+    // Inverse framing of the prior test: assert on list size rather than
+    // specific labels so a future label change doesn't silently pass.
+    let resolveA!: (v: typeof idesMany) => void;
+    let resolveB!: (v: typeof idesMany) => void;
+    const promiseA = new Promise<typeof idesMany>((r) => {
+      resolveA = r;
+    });
+    const promiseB = new Promise<typeof idesMany>((r) => {
+      resolveB = r;
+    });
+
+    mockGetAvailableIdes.mockReturnValueOnce(promiseA);
+    mockGetAvailableIdes.mockReturnValueOnce(promiseB);
+
+    setup();
+    await waitFor(() => {
+      expect(mockGetAvailableIdes).toHaveBeenCalledTimes(1);
+    });
+    window.dispatchEvent(new CustomEvent("companion:ide-list-changed"));
+    await waitFor(() => {
+      expect(mockGetAvailableIdes).toHaveBeenCalledTimes(2);
+    });
+
+    // B resolves with THREE entries (the full idesMany).
+    resolveB(idesMany);
+    await waitFor(() => {
+      expect(screen.getAllByRole("option")).toHaveLength(3);
+    });
+
+    // A resolves with ONE entry. If stale-response handling were broken,
+    // we'd see the listbox collapse to one option.
+    resolveA([idesMany[0]]);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.getAllByRole("option")).toHaveLength(3);
   });
 
   it("stops listening after unmount — no refetch post-close", async () => {
@@ -684,5 +779,143 @@ describe("IdePicker — live refresh (Task 12)", () => {
     // Give React a tick to do anything erroneous.
     await new Promise((r) => setTimeout(r, 20));
     expect(mockGetAvailableIdes).toHaveBeenCalledTimes(1);
+  });
+
+  // Codex adversarial review (BRITTLE 2): when the picker is closed while a
+  // loadList request is still in flight, the epoch ref must be bumped during
+  // cleanup so that the late-resolving response's token comparison fails and
+  // no setState runs on the unmounted component. Without the bump, React logs
+  // the "state update on unmounted component" warning and the rest of the
+  // suite becomes noisy (and in strict mode, fails).
+  //
+  // Assertion strategy: spy on `console.error` and assert it's NOT called
+  // with the React unmounted-setState warning after we resolve the pending
+  // request post-unmount. This mirrors React's own test-suite pattern and
+  // avoids fragile coupling to internal setState names.
+  it("in-flight loadList response does not call setState after unmount (combined guard: aborted signal + no React warning)", async () => {
+    // Build a deferred fetch so we can hold the mount-time request open,
+    // unmount the component, THEN resolve — the classic unmount race.
+    //
+    // Codex adversarial review (BRITTLE 1 + BRITTLE 2): this test now pins
+    // the invariant from TWO angles so it fails loudly if either layer
+    // regresses:
+    //   (a) The AbortController's signal passed to getAvailableIdes must be
+    //       aborted after unmount — a direct behavioral assertion that the
+    //       HTTP request is cancelled (BRITTLE 1). This assertion does NOT
+    //       depend on React's warning machinery.
+    //   (b) console.error must NOT be called with the React "setState on
+    //       unmounted component" warning (BRITTLE 2 epoch-guard). Defensive
+    //       second layer for responses that resolve between fetch() returning
+    //       and the AbortError catch running.
+    // Removing the `loadEpochRef.current++` cleanup OR the
+    // `loadControllerRef.current?.abort()` cleanup will fail at least one of
+    // these two assertions.
+    let resolveFetch!: (v: typeof idesMany) => void;
+    let capturedSignal: AbortSignal | undefined;
+    const pendingFetch = new Promise<typeof idesMany>((r) => {
+      resolveFetch = r;
+    });
+    mockGetAvailableIdes.mockImplementationOnce(
+      (_cwd?: string, signal?: AbortSignal) => {
+        capturedSignal = signal;
+        return pendingFetch;
+      },
+    );
+
+    // Spy BEFORE mount to capture any warnings the component emits.
+    // React 18+ emits warnings via console.error.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const { unmount } = setup();
+    // Wait one tick so the mount-effect's loadList() is actually in-flight.
+    await Promise.resolve();
+    expect(mockGetAvailableIdes).toHaveBeenCalledTimes(1);
+    // The api must receive a non-aborted AbortSignal pre-unmount.
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    // Unmount while the fetch is still pending. The cleanup MUST (a) abort
+    // the controller AND (b) bump the epoch so any late resolver short-circuits.
+    unmount();
+
+    // Direct behavioral assertion (BRITTLE 1): the signal passed to the
+    // api wrapper must now be aborted. This alone proves the HTTP request
+    // was cancelled on unmount — no reliance on React warning text.
+    expect(capturedSignal?.aborted).toBe(true);
+
+    // Now resolve the long-hanging mount-time fetch. If the epoch guard is
+    // missing, the resolver runs setIdes / setLoading on an unmounted
+    // component and React logs a warning via console.error.
+    resolveFetch(idesMany);
+    // Give React microtasks + a macrotask to flush any pending warnings.
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Collect any React "unmounted component" warnings — format varies
+    // slightly across versions, but all include the phrase "unmounted".
+    const unmountedWarnings = errorSpy.mock.calls.filter((call) => {
+      const msg = call.map((a) => String(a)).join(" ");
+      return (
+        msg.includes("unmounted component") ||
+        msg.includes("Can't perform a React state update on an unmounted")
+      );
+    });
+    try {
+      expect(unmountedWarnings).toHaveLength(0);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  // Codex adversarial review (BRITTLE 1): a second loadList() must abort the
+  // AbortController attached to the first. Without this, rapid
+  // `companion:ide-list-changed` bursts spawn N concurrent HTTP requests,
+  // only one of whose state updates is useful — the rest are dead weight on
+  // the server and the client.
+  it("concurrent loadList aborts the prior in-flight request's AbortSignal", async () => {
+    // First call: capture its signal and hang.
+    let firstSignal: AbortSignal | undefined;
+    let resolveFirst!: (v: typeof idesMany) => void;
+    const firstPending = new Promise<typeof idesMany>((r) => {
+      resolveFirst = r;
+    });
+    // Second call: capture its signal and resolve normally.
+    let secondSignal: AbortSignal | undefined;
+
+    mockGetAvailableIdes.mockImplementationOnce(
+      (_cwd?: string, signal?: AbortSignal) => {
+        firstSignal = signal;
+        return firstPending;
+      },
+    );
+    mockGetAvailableIdes.mockImplementationOnce(
+      (_cwd?: string, signal?: AbortSignal) => {
+        secondSignal = signal;
+        return Promise.resolve(idesMany);
+      },
+    );
+
+    setup();
+    await waitFor(() => {
+      expect(mockGetAvailableIdes).toHaveBeenCalledTimes(1);
+    });
+    expect(firstSignal?.aborted).toBe(false);
+
+    // Trigger a second loadList while the first is still pending.
+    window.dispatchEvent(new CustomEvent("companion:ide-list-changed"));
+    await waitFor(() => {
+      expect(mockGetAvailableIdes).toHaveBeenCalledTimes(2);
+    });
+
+    // The prior (stale) request's signal must now be aborted — a brand-new
+    // controller was created for the second call.
+    expect(firstSignal?.aborted).toBe(true);
+    // The second call's signal is fresh and still live.
+    expect(secondSignal).toBeInstanceOf(AbortSignal);
+    expect(secondSignal?.aborted).toBe(false);
+
+    // Clean up: resolve the first so it doesn't leak. Its resolution is
+    // harmless because the epoch guard + aborted signal both short-circuit.
+    resolveFirst(idesMany);
   });
 });

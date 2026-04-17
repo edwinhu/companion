@@ -151,7 +151,8 @@ export class WsBridge {
     // closed pickers ignore the ping. The broadcast is payload-free — clients
     // re-enter the same authenticated REST path discovery uses, so no
     // sensitive fields (authToken, lockfilePath) leak over the browser WS.
-    const onIdeListChanged = () => this.broadcastIdeListChanged();
+    const onIdeListChanged = (payload: { generation: number }) =>
+      this.broadcastIdeListChanged(payload.generation);
     this.ideListChangedUnsubscribes.push(
       companionBus.on("ide:added", onIdeListChanged),
       companionBus.on("ide:removed", onIdeListChanged),
@@ -160,13 +161,20 @@ export class WsBridge {
   }
 
   /**
-   * Fan `{type: "ide_list_changed"}` out to every browser socket across
-   * every live session. Uses sendToBrowser (no sequencing) because this is
-   * a transient refresh ping — clients that missed it while offline will
-   * refetch the list on reconnect anyway.
+   * Fan `{type: "ide_list_changed", generation}` out to every browser socket
+   * across every live session. Uses sendToBrowser (no sequencing) because
+   * this is a transient refresh ping — clients that missed it while offline
+   * will refetch the list on reconnect anyway.
+   *
+   * `generation` is a monotonic counter from ide-discovery's scan loop. The
+   * client uses it to dedupe fan-out across multiple sockets: same generation
+   * => same underlying discovery scan (skip); newer generation => fresh
+   * event (dispatch). This is stricter than a time-window dedupe because it
+   * preserves legitimate fast add+remove cycles (e.g. IDE restart) that
+   * would otherwise be lost.
    */
-  private broadcastIdeListChanged(): void {
-    const msg: BrowserIncomingMessage = { type: "ide_list_changed" };
+  private broadcastIdeListChanged(generation: number): void {
+    const msg: BrowserIncomingMessage = { type: "ide_list_changed", generation };
     for (const session of this.sessions.values()) {
       for (const ws of session.browserSockets) {
         this.sendToBrowser(ws, msg);
@@ -1543,7 +1551,41 @@ export class WsBridge {
     // to construct merge-safe payloads (Claude full-replace; Codex surgical).
     // Apply deleteKeys BEFORE upserts so a single message with both fields is
     // well-defined (matches codex-adapter's phase-1-delete / phase-2-upsert).
+    //
+    // cubic-ai review (PR #652, Issue 1): Claude's `mcp_set_servers` is a
+    // FULL REPLACE on the wire. When a browser sends `mcp_set_servers` while
+    // an IDE is bound, the user's payload has no reason to include the IDE
+    // entry — so Claude would drop it on the next CLI apply, producing a
+    // split-brain (UI shows bound; CLI lost the IDE MCP server). Inject the
+    // active IDE entry into the outbound payload BEFORE forwarding, unless
+    // the user explicitly deletes the IDE key via `deleteKeys`. Codex is
+    // per-key upsert (not full-replace), so no injection needed there.
     if (msg.type === "mcp_set_servers") {
+      if (session.backendType === "claude" && session.state.ideBinding) {
+        const ideKey = session.state.ideBinding.ideName
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, "");
+        const explicitlyDeleted = !!msg.deleteKeys?.includes(ideKey);
+        const alreadyPresent = Object.prototype.hasOwnProperty.call(
+          msg.servers,
+          ideKey,
+        );
+        const ideEntry = session.dynamicMcpServers[ideKey];
+        if (
+          ideKey.length > 0 &&
+          !explicitlyDeleted &&
+          !alreadyPresent &&
+          ideEntry !== undefined
+        ) {
+          // Non-mutating: rebuild msg with the IDE entry injected into
+          // servers. `msg` is reassigned so the downstream adapter.send()
+          // picks up the merged payload.
+          msg = {
+            ...msg,
+            servers: { ...msg.servers, [ideKey]: ideEntry },
+          };
+        }
+      }
       this.updateDynamicMcpServers(session, msg.servers, msg.deleteKeys);
     }
 

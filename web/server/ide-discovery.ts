@@ -219,15 +219,23 @@ async function scanDir(dir: string): Promise<void> {
 
   // Final generation / stopped guard before touching shared state.
   if (stopped || gen !== scanGeneration) return;
-  reconcileKnown(nextKnown);
+  reconcileKnown(nextKnown, gen);
 }
 
 /**
  * Reconcile the shared `known` map with a scan's local snapshot. Emits
  * ide:added / ide:changed / ide:removed as deltas. Runs synchronously —
  * the caller is responsible for the generation/stopped guards.
+ *
+ * `gen` is the scan generation that produced `nextKnown`. It is forwarded
+ * into each emitted bus event so downstream consumers (ws-bridge fan-out)
+ * can stamp their browser-facing broadcasts with a monotonic counter,
+ * allowing the client to deduplicate by generation instead of time.
  */
-function reconcileKnown(nextKnown: Map<string, DiscoveredIde>): void {
+function reconcileKnown(
+  nextKnown: Map<string, DiscoveredIde>,
+  gen: number,
+): void {
   for (const [path, next] of nextKnown) {
     const prev = known.get(path);
     if (!prev) {
@@ -237,6 +245,7 @@ function reconcileKnown(nextKnown: Map<string, DiscoveredIde>): void {
         ideName: next.ideName,
         workspaceFolders: next.workspaceFolders,
         lockfilePath: next.lockfilePath,
+        generation: gen,
       });
     } else {
       const changed =
@@ -250,6 +259,7 @@ function reconcileKnown(nextKnown: Map<string, DiscoveredIde>): void {
           ideName: next.ideName,
           workspaceFolders: next.workspaceFolders,
           lockfilePath: next.lockfilePath,
+          generation: gen,
         });
       }
     }
@@ -261,6 +271,7 @@ function reconcileKnown(nextKnown: Map<string, DiscoveredIde>): void {
       companionBus.emit("ide:removed", {
         port: entry.port,
         lockfilePath: entry.lockfilePath,
+        generation: gen,
       });
     }
   }
@@ -319,7 +330,7 @@ function scanDirSync(dir: string): void {
     nextKnown.set(path, next);
   }
   if (stopped || gen !== scanGeneration) return;
-  reconcileKnown(nextKnown);
+  reconcileKnown(nextKnown, gen);
 }
 
 /**

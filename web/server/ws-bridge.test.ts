@@ -5125,6 +5125,7 @@ describe("IDE binding (bindIde / unbindIde)", () => {
     companionBus.emit("ide:removed", {
       port: 44444,
       lockfilePath: join(ideTmpDir, "44444.lock"),
+      generation: 1,
     });
 
     // Auto-unbind may be async (unbindIde is async); give microtasks a tick.
@@ -6053,6 +6054,148 @@ describe("IDE binding (bindIde / unbindIde)", () => {
     const session = bridge.getSession("s1")!;
     expect(session.state.ideBinding).toBeFalsy();
   });
+
+  // ─── cubic-ai review (PR #652, Issue 1): browser mcp_set_servers after IDE bind ─
+  //
+  // Context: Claude's `mcp_set_servers` is FULL REPLACE on the wire. After
+  // `bindIde` merges the IDE entry into session.dynamicMcpServers and sends
+  // a merged `{...others, [ideKey]: entry}` payload, the user can later edit
+  // MCP servers via McpPanel — that sends a NEW `mcp_set_servers` from the
+  // browser. Before this fix, that browser-originated payload was forwarded
+  // verbatim to Claude, DROPPING the IDE entry (because the browser had no
+  // reason to include it). Result: split-brain — UI says bound, Claude lost
+  // the IDE MCP server, tools disappear.
+  //
+  // Fix: for Claude ONLY, in `routeBrowserMessage`'s `mcp_set_servers` branch,
+  // inject the active IDE entry (from `session.dynamicMcpServers[ideKey]`)
+  // into `msg.servers` BEFORE mirror update + adapter.send, unless the user
+  // explicitly opts in to delete the IDE key via `deleteKeys`. Codex path is
+  // per-key upsert (not full-replace), so no injection needed.
+  it("Claude: browser mcp_set_servers preserves active IDE entry on full-replace", async () => {
+    await seedIde({ port: 90001, ideName: "Neovim", authToken: "tok-preserve" });
+
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+
+    // Bind the IDE first — this populates dynamicMcpServers.neovim.
+    const bindResult = await bridge.bindIde("s1", 90001);
+    expect(bindResult).toEqual({ ok: true });
+    sendCalls.length = 0;
+
+    // User edits MCP via McpPanel — browser sends a full-replace with ONLY
+    // the new server. Pre-fix: this payload was forwarded verbatim, dropping
+    // the IDE entry.
+    const fooConfig = { type: "stdio" as const, command: "/usr/bin/foo" };
+    bridge.handleBrowserMessage(
+      browser,
+      JSON.stringify({ type: "mcp_set_servers", servers: { foo: fooConfig } }),
+    );
+
+    // Adapter must have seen ONE mcp_set_servers — with BOTH the user's new
+    // `foo` AND the merged-in `neovim` (IDE) entry.
+    const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
+    expect(mcpCalls).toHaveLength(1);
+    expect(mcpCalls[0].servers.foo).toMatchObject(fooConfig);
+    expect(mcpCalls[0].servers.neovim).toBeDefined();
+    expect(mcpCalls[0].servers.neovim).toMatchObject({
+      type: "ws-ide",
+      ideName: "Neovim",
+    });
+  });
+
+  it("Claude: browser mcp_set_servers with deleteKeys:[ideKey] does drop the IDE", async () => {
+    // Explicit delete: the user asked to remove the IDE key. The merge
+    // injection must respect that — don't re-add it. Cleaning up the
+    // binding state is NOT this path's job (that's bindIde/unbindIde);
+    // this test only pins the wire contract.
+    await seedIde({ port: 90002, ideName: "Neovim", authToken: "tok-delete" });
+
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+
+    await bridge.bindIde("s1", 90002);
+    sendCalls.length = 0;
+
+    // User explicitly deletes `neovim` via deleteKeys.
+    bridge.handleBrowserMessage(
+      browser,
+      JSON.stringify({
+        type: "mcp_set_servers",
+        servers: {},
+        deleteKeys: ["neovim"],
+      }),
+    );
+
+    const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
+    expect(mcpCalls).toHaveLength(1);
+    // The payload must NOT re-inject neovim — user asked to delete it.
+    expect(mcpCalls[0].servers.neovim).toBeUndefined();
+    // deleteKeys passed through unchanged.
+    expect(mcpCalls[0].deleteKeys).toEqual(["neovim"]);
+
+    // Binding state is still populated (cleaning it up is bindIde/unbindIde's
+    // job, not routeBrowserMessage's). This documents the contract boundary.
+    const session = bridge.getSession("s1")!;
+    expect(session.state.ideBinding).not.toBeNull();
+  });
+
+  it("Codex: browser mcp_set_servers is unchanged (per-key upsert — no merge injected)", async () => {
+    // Codex's `config/batchWrite` is per-key upsert, not full-replace, so
+    // omitting the IDE key does NOT drop it. Injecting the IDE entry here
+    // would spuriously re-upsert it on every user edit. Contract: Codex
+    // path forwards the browser payload byte-for-byte (minus bridge-level
+    // bookkeeping).
+    await seedIde({ port: 90003, ideName: "Neovim", authToken: "tok-codex" });
+
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.attachBackendAdapter("s1", adapter, "codex");
+
+    await bridge.bindIde("s1", 90003);
+    sendCalls.length = 0;
+
+    const fooConfig = { type: "stdio" as const, command: "/usr/bin/foo" };
+    bridge.handleBrowserMessage(
+      browser,
+      JSON.stringify({ type: "mcp_set_servers", servers: { foo: fooConfig } }),
+    );
+
+    const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
+    expect(mcpCalls).toHaveLength(1);
+    // Codex: payload is forwarded as-is. `foo` is present; `neovim` is NOT
+    // (because Codex didn't need it to be — upserts are independent).
+    expect(mcpCalls[0].servers.foo).toMatchObject(fooConfig);
+    expect(mcpCalls[0].servers.neovim).toBeUndefined();
+  });
+
+  it("Claude: browser mcp_set_servers when no IDE is bound is forwarded unchanged", async () => {
+    // Baseline: merge injection only kicks in when an IDE is actively bound.
+    // Without a binding, there is nothing to preserve — forward verbatim.
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+    sendCalls.length = 0;
+
+    const fooConfig = { type: "stdio" as const, command: "/usr/bin/foo" };
+    bridge.handleBrowserMessage(
+      browser,
+      JSON.stringify({ type: "mcp_set_servers", servers: { foo: fooConfig } }),
+    );
+
+    const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
+    expect(mcpCalls).toHaveLength(1);
+    expect(mcpCalls[0].servers).toEqual({ foo: fooConfig });
+  });
 });
 
 // ─── IDE list change broadcast (Task 12, DISC-03 UX side) ─────────────────────
@@ -6088,6 +6231,7 @@ describe("IDE list change broadcast (Task 12)", () => {
       ideName: "Neovim",
       workspaceFolders: ["/tmp/proj"],
       lockfilePath: "/tmp/.claude/ide/40001.lock",
+      generation: 1,
     });
 
     for (const browser of [b1a, b1b, b2]) {
@@ -6106,6 +6250,7 @@ describe("IDE list change broadcast (Task 12)", () => {
     companionBus.emit("ide:removed", {
       port: 40002,
       lockfilePath: "/tmp/.claude/ide/40002.lock",
+      generation: 2,
     });
 
     const listChanges = browser.send.mock.calls
@@ -6124,6 +6269,7 @@ describe("IDE list change broadcast (Task 12)", () => {
       ideName: "VS Code",
       workspaceFolders: ["/tmp/proj-new"],
       lockfilePath: "/tmp/.claude/ide/40003.lock",
+      generation: 3,
     });
 
     const listChanges = browser.send.mock.calls
@@ -6146,6 +6292,7 @@ describe("IDE list change broadcast (Task 12)", () => {
       ideName: "Neovim",
       workspaceFolders: ["/secret/path"],
       lockfilePath: "/secret/path/.claude/ide/40004.lock",
+      generation: 4,
     });
 
     const listChanges = browser.send.mock.calls
@@ -6154,6 +6301,8 @@ describe("IDE list change broadcast (Task 12)", () => {
     expect(listChanges).toHaveLength(1);
     // Exact-equality assertion is the strongest form — any additional key
     // (e.g. a payload that copies the event verbatim) fails this test.
-    expect(listChanges[0]).toEqual({ type: "ide_list_changed" });
+    // `generation` is the ONLY additional field clients use for dedupe —
+    // still no authToken / lockfilePath / workspaceFolders leak.
+    expect(listChanges[0]).toEqual({ type: "ide_list_changed", generation: 4 });
   });
 });

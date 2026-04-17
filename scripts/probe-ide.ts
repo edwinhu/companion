@@ -144,6 +144,19 @@ export function deriveBindShape(
 }
 
 /**
+ * cubic-ai review (PR #652): validate a port derived from a lockfile
+ * filename stem. `Number(stem)` returns NaN for non-numeric stems (e.g.
+ * `foo.lock`) and out-of-range values for weird stems. `probe()` skips
+ * entries whose shape fails this check; tests cover each failure mode.
+ */
+export function isValidBindShape(
+  shape: ReturnType<typeof deriveBindShape>,
+): boolean {
+  const p = shape.port;
+  return Number.isInteger(p) && p > 0 && p < 65536;
+}
+
+/**
  * Build the exact `mcp_set_servers` payload Companion would emit to bind
  * this IDE. This matches `claude-adapter.ts :: handleOutgoingMcpSetServers`
  * — same path used by the CLI's internal `/ide` command.
@@ -224,7 +237,12 @@ export function probe(dir: string = IDE_DIR): ProbeResult {
       skipped.push({ path, reason: `pid ${parsed.pid} not alive` });
       continue;
     }
-    const { port, transport } = deriveBindShape(path, parsed);
+    const shape = deriveBindShape(path, parsed);
+    if (!isValidBindShape(shape)) {
+      skipped.push({ path, reason: "invalid port in lockfile name" });
+      continue;
+    }
+    const { port, transport } = shape;
     rows.push({
       path,
       ideName: parsed.ideName,

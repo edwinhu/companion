@@ -2038,16 +2038,109 @@ describe("handleMessage: ide_list_changed dispatches companion:ide-list-changed 
     // Multiple dispatches independently notify — important so that arbitrary
     // add/remove/change events observed while the picker is closed don't
     // queue up work that IdePicker has to deduplicate.
+    //
+    // NOTE: "not cumulative" means subsequent events still fire, but after
+    // the dedup fix they only fire ONCE per logical event — even if multiple
+    // sockets receive the same broadcast. Because we only have ONE session
+    // socket in this test, each fireMessage is a distinct logical event
+    // carrying a distinct `generation` value.
     wsModule.connectSession("s1");
     fireMessage({ type: "session_init", session: makeSession("s1") });
 
     const listener = vi.fn();
     window.addEventListener("companion:ide-list-changed", listener);
     try {
+      // Messages with NO generation field fall through to legacy path and
+      // always fire — three distinct pings, three CustomEvents.
       fireMessage({ type: "ide_list_changed" });
       fireMessage({ type: "ide_list_changed" });
       fireMessage({ type: "ide_list_changed" });
       expect(listener).toHaveBeenCalledTimes(3);
+    } finally {
+      window.removeEventListener("companion:ide-list-changed", listener);
+    }
+  });
+
+  // cubic-ai review (PR #652): the server broadcasts `ide_list_changed` to
+  // EVERY connected browser socket across EVERY live session. With N session
+  // sockets connected in the same browser, IdePicker would refetch N times
+  // per single discovery event — wasted network + potential spurious state
+  // churn.
+  //
+  // Codex adversarial review (BRITTLE 1): dedupe by the server-stamped
+  // `generation` counter (monotonic, sourced from ide-discovery's scanGeneration).
+  // Same generation = same logical discovery scan (skip). Newer generation =
+  // fresh event (always dispatch) — including legitimate fast add+remove
+  // cycles (IDE restart) that a time-window dedupe would wrongly drop.
+  it("ide_list_changed: same generation is deduplicated across two session sockets", () => {
+    // Connect two sessions; each spawns its own MockWebSocket instance.
+    // `lastWs` always points to the most recently constructed one, so we
+    // capture `ws1` explicitly before the second connectSession overwrites it.
+    wsModule.connectSession("s1");
+    const ws1 = lastWs;
+    fireMessage({ type: "session_init", session: makeSession("s1") });
+
+    wsModule.connectSession("s2");
+    const ws2 = lastWs;
+    ws2.onmessage!({
+      data: JSON.stringify({ type: "session_init", session: makeSession("s2") }),
+    });
+
+    const listener = vi.fn();
+    window.addEventListener("companion:ide-list-changed", listener);
+    try {
+      // Simulate the server broadcast hitting BOTH sockets near-simultaneously
+      // with the SAME generation. In a real browser this is one logical
+      // discovery scan fanned out to two sockets.
+      ws1.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 42 }) });
+      ws2.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 42 }) });
+
+      // Without dedup, the listener would fire 2x — one per session socket.
+      // With generation-based dedup, the second ping (same generation) is
+      // recognized as the same logical event and dropped.
+      expect(listener).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener("companion:ide-list-changed", listener);
+    }
+  });
+
+  it("ide_list_changed: newer generation fires a fresh event", () => {
+    // Regression: the dedupe must not be so aggressive that legitimate
+    // fast discovery events (e.g. an IDE add+remove within a few ms during
+    // restart) get swallowed. The server stamps each scan's broadcast with
+    // a new generation, so any generation strictly greater than the last
+    // observed one MUST dispatch — even if it arrives microseconds after
+    // the previous one. This replaces the old time-window check which
+    // would incorrectly drop the second event inside a ~100ms window.
+    wsModule.connectSession("s1");
+    const ws1 = lastWs;
+    fireMessage({ type: "session_init", session: makeSession("s1") });
+
+    wsModule.connectSession("s2");
+    const ws2 = lastWs;
+    ws2.onmessage!({
+      data: JSON.stringify({ type: "session_init", session: makeSession("s2") }),
+    });
+
+    const listener = vi.fn();
+    window.addEventListener("companion:ide-list-changed", listener);
+    try {
+      // First event — gen=1. Both sockets receive the broadcast, one dispatch.
+      ws1.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 1 }) });
+      ws2.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 1 }) });
+      expect(listener).toHaveBeenCalledTimes(1);
+
+      // Second event — gen=2 — arriving on the SAME synchronous tick as the
+      // first (no time advance). Under the old time-window dedupe this would
+      // be dropped; under generation dedupe it fires because gen 2 > 1.
+      ws1.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 2 }) });
+      ws2.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 2 }) });
+      expect(listener).toHaveBeenCalledTimes(2);
+
+      // An out-of-order older generation (e.g. a delayed retransmit) must NOT
+      // fire — generations are monotonic and we already observed gen=2.
+      ws1.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 1 }) });
+      expect(listener).toHaveBeenCalledTimes(2);
     } finally {
       window.removeEventListener("companion:ide-list-changed", listener);
     }

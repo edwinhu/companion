@@ -70,10 +70,16 @@ export interface CompanionEventMap {
     ideName: string;
     workspaceFolders: string[];
     lockfilePath: string;
+    /**
+     * Monotonic scan generation from ide-discovery. Used by ws-bridge to
+     * stamp the browser-facing `ide_list_changed` broadcast so clients can
+     * deduplicate fan-out by generation instead of a brittle time window.
+     */
+    generation: number;
   };
 
   /** An IDE lockfile was removed or its PID is no longer alive. */
-  "ide:removed": { port: number; lockfilePath: string };
+  "ide:removed": { port: number; lockfilePath: string; generation: number };
 
   /** An IDE lockfile was modified (e.g. workspaceFolders changed). */
   "ide:changed": {
@@ -81,6 +87,7 @@ export interface CompanionEventMap {
     ideName: string;
     workspaceFolders: string[];
     lockfilePath: string;
+    generation: number;
   };
 
   /** A session's IDE binding changed (bind, unbind, or auto-unbind). */

@@ -1518,6 +1518,7 @@ export class CodexAdapter implements IBackendAdapter {
       // combined message is well-defined: remove, then add.
       if (deleteKeys && deleteKeys.length > 0) {
         for (const name of deleteKeys) {
+          if (typeof name !== "string" || name.length === 0) continue;
           if (name.includes(".")) {
             throw new Error(`Server names containing '.' are not supported: ${name}`);
           }

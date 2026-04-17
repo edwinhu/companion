@@ -216,22 +216,33 @@ export class WsBridge {
     // call it. Matches the pattern used by other long-lived bus listeners
     // in this file (e.g. ideListChangedUnsubscribes handles are stored but
     // never invoked either).
-    companionBus.on("ide:removed", ({ port }) => {
+    companionBus.on("ide:removed", ({ port, lockfilePath }) => {
       for (const [sessionId, session] of this.sessions) {
-        if (session.state.ideBinding?.port === port) {
-          // Fire-and-forget: unbindIde is idempotent and never throws.
-          // Round-4 robustness (BIND-10): if the wire send fails because
-          // the backend adapter is disconnected, the IDE is STILL gone
-          // (discovery removed the lockfile). Force-clear local state so
-          // the UI reflects reality and the BIND-05 disconnect banner
-          // fires — otherwise the session stays stuck "bound" to a dead
-          // IDE with a stale MCP mirror entry forever.
-          void this.unbindIde(sessionId).then((result) => {
-            if (!result.ok) {
-              this.forceClearDeadIdeBinding(sessionId);
-            }
-          });
-        }
+        const binding = session.state.ideBinding;
+        if (!binding) continue;
+        // Codex round-7 P2: match by `lockfilePath` (one-to-one with the
+        // dead IDE process), not by `port`. Matching on port alone has a
+        // race when an IDE dies and another IDE rebinds the same port
+        // before the removal event is processed — the bridge would tear
+        // down a valid current binding for the new IDE. lockfilePath is
+        // unique per IDE process and never reused. Fall back to port for
+        // legacy bindings that predate `lockfilePath` storage.
+        const matches = binding.lockfilePath
+          ? binding.lockfilePath === lockfilePath
+          : binding.port === port;
+        if (!matches) continue;
+        // Fire-and-forget: unbindIde is idempotent and never throws.
+        // Round-4 robustness (BIND-10): if the wire send fails because
+        // the backend adapter is disconnected, the IDE is STILL gone
+        // (discovery removed the lockfile). Force-clear local state so
+        // the UI reflects reality and the BIND-05 disconnect banner
+        // fires — otherwise the session stays stuck "bound" to a dead
+        // IDE with a stale MCP mirror entry forever.
+        void this.unbindIde(sessionId).then((result) => {
+          if (!result.ok) {
+            this.forceClearDeadIdeBinding(sessionId);
+          }
+        });
       }
     });
 
@@ -1323,29 +1334,54 @@ export class WsBridge {
       }
     }
 
+    // Codex round-7 P1: when re-binding to a DIFFERENT IDE (e.g. switching
+    // from Neovim to VS Code), the prior IDE's `companion-ide-<old>` entry
+    // must be evicted from BOTH the outbound payload and the local mirror.
+    // bindIde only ever upserts the *new* serverKey; without this eviction,
+    // the prior entry stays live in `session.dynamicMcpServers` indefinitely
+    // (carrying a stale `authToken`) and on Claude's full-replace wire shape
+    // both old and new IDE servers would be sent at once. unbindIde later
+    // only deletes the *current* serverKey, so the orphan entry would leak
+    // forever.
+    const priorIdeKeys = Object.keys(session.dynamicMcpServers).filter(
+      (k) => k.startsWith(IDE_SERVER_KEY_PREFIX) && k !== serverKey,
+    );
+
     // Build the outbound `servers` payload — backend-specific shape.
     //
     // Claude (full-replace): we MUST include every dynamic server the user
     //   has previously configured or it will be dropped. We merge on top of
     //   the bridge's in-memory mirror (session.dynamicMcpServers). The IDE
     //   entry overrides any prior entry at the same key (same-ideName rebind).
+    //   Prior `companion-ide-*` keys (other IDE) are omitted via the filter
+    //   above so the wire payload reflects "exactly one IDE bound".
     //
     // Codex (per-key upsert): `config/batchWrite` processes each key
     //   independently. Sending the full mirror here would spuriously re-upsert
-    //   every other server on every bind. Send only the IDE entry.
+    //   every other server on every bind. Send only the IDE entry, plus a
+    //   deleteKeys list to evict any prior IDE entry on the wire.
     //
     // `servers` is typed as Record<string, McpServerConfig> in session-types,
     // but the real wire shape for ws-ide/sse-ide carries extra fields
     // (ideName, authToken, ideRunningInWindows, scope). Cast through unknown
     // to bypass the narrow type — the adapter's handleOutgoingMcpSetServers
     // accepts Record<string, unknown>.
-    const outboundServers: Record<string, unknown> =
-      session.backendType === "claude"
-        ? { ...session.dynamicMcpServers, [serverKey]: ideServerEntry }
-        : { [serverKey]: ideServerEntry };
+    let outboundServers: Record<string, unknown>;
+    let outboundDeleteKeys: string[];
+    if (session.backendType === "claude") {
+      const merged: Record<string, unknown> = { ...session.dynamicMcpServers };
+      for (const k of priorIdeKeys) delete merged[k];
+      merged[serverKey] = ideServerEntry;
+      outboundServers = merged;
+      outboundDeleteKeys = [];
+    } else {
+      outboundServers = { [serverKey]: ideServerEntry };
+      outboundDeleteKeys = priorIdeKeys;
+    }
     const accepted = adapter.send({
       type: "mcp_set_servers",
       servers: outboundServers as Record<string, import("./session-types.js").McpServerConfig>,
+      deleteKeys: outboundDeleteKeys,
     });
     if (!accepted) {
       return { ok: false, error: "backend not connected" };
@@ -1353,7 +1389,8 @@ export class WsBridge {
 
     // Mirror the mutation we just sent to the backend so subsequent
     // bind/unbind cycles (and any later user mcp_set_servers) see a
-    // consistent view.
+    // consistent view. Drop prior IDE entries first, then upsert the new one.
+    for (const k of priorIdeKeys) delete session.dynamicMcpServers[k];
     session.dynamicMcpServers[serverKey] = ideServerEntry as unknown as McpServerConfig;
 
     const binding: IdeBinding = {

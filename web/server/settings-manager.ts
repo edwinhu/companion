@@ -17,7 +17,10 @@ export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6";
 export function supportsSamplingParams(model: string): boolean {
   const m = model.trim().toLowerCase();
   if (m === "opus") return false;
-  return !m.startsWith("claude-opus-4-7");
+  // Match both hyphenated (`claude-opus-4-7`) and dotted (`claude-opus-4.7`)
+  // model IDs — Anthropic uses both forms (Cubic round-8 P2).
+  if (m.startsWith("claude-opus-4-7") || m.startsWith("claude-opus-4.7")) return false;
+  return true;
 }
 
 export type UpdateChannel = "stable" | "prerelease";

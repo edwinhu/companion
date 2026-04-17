@@ -126,12 +126,28 @@ function derivePortAndTransport(
   lockfilePath: string,
   parsed: NonNullable<ReturnType<typeof parseLockfile>>,
 ): { port: number; transport: "ws-ide" | "sse-ide" } {
+  // Codex round-7 P2: prefer the JSON-embedded `port` over the filename stem
+  // (matches scripts/probe-ide.ts deriveBindShape). Neovim's claudecode.nvim
+  // names lockfiles by PID (`<pid>.lock`), so the stem is the PID — not the
+  // port. Without this preference, discovery surfaced PIDs as bind ports and
+  // any subsequent bind produced an unreachable URL. JSON-port wins when
+  // present and in valid TCP range; otherwise fall back to the stem (which
+  // is correct for VS Code-style `<port>.lock` lockfiles).
   const stem = basename(lockfilePath).replace(/\.lock$/, "");
-  let port = Number(stem);
-  if (!Number.isFinite(port)) {
-    // Fall back to a `port` field embedded in the JSON if present.
-    const embedded = (parsed.raw as Record<string, unknown>).port;
-    port = typeof embedded === "number" ? embedded : NaN;
+  const stemPort = Number(stem);
+  const jsonPortRaw = (parsed.raw as Record<string, unknown>).port;
+  const jsonPort = typeof jsonPortRaw === "number" ? jsonPortRaw : NaN;
+
+  let port: number;
+  if (Number.isInteger(jsonPort) && jsonPort > 0 && jsonPort < 65536) {
+    port = jsonPort;
+  } else if (Number.isFinite(jsonPort)) {
+    // JSON had an explicit `port` but it is invalid (0, negative, > 65535).
+    // Surface the invalid value so toDiscovered's range gate rejects it
+    // rather than masking with a possibly-bogus stem fallback.
+    port = jsonPort;
+  } else {
+    port = stemPort;
   }
 
   let transport: "ws-ide" | "sse-ide";
@@ -207,7 +223,11 @@ function toDiscovered(
   mtime: number,
 ): DiscoveredIde | null {
   const { port, transport } = derivePortAndTransport(lockfilePath, parsed);
-  if (!Number.isFinite(port)) return null;
+  // Codex round-7 P2: range-validate the final port (matches probe-ide.ts
+  // isValidBindShape). Previously any finite number passed — out-of-range
+  // ports (PID-shaped stems > 65535, JSON port 0, negatives) would reach
+  // bindIde and produce invalid `ws://127.0.0.1:<bogus>` URLs.
+  if (!Number.isInteger(port) || port <= 0 || port >= 65536) return null;
   return {
     port,
     ideName: parsed.ideName,

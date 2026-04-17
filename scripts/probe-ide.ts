@@ -296,8 +296,11 @@ async function main(): Promise<void> {
 
   // eslint-disable-next-line no-console
   console.log("## Live IDE lockfiles:");
+  // Redact authToken — this is a credential that must not appear in
+  // plaintext diagnostic output (Cubic round-8, P2).
+  const redactedRows = result.rows.map(({ authToken: _, ...rest }) => rest);
   // eslint-disable-next-line no-console
-  console.log(JSON.stringify(result.rows, null, 2));
+  console.log(JSON.stringify(redactedRows, null, 2));
 
   if (result.skipped.length > 0) {
     // eslint-disable-next-line no-console

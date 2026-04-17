@@ -269,9 +269,17 @@ export function Composer({ sessionId, onOpenIdePicker }: ComposerProps) {
         return;
       }
       if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        selectCommand(filteredCommands[slashMenuIndex]);
-        return;
+        const cmd = filteredCommands[slashMenuIndex];
+        if (cmd?.disabled) {
+          // Cubic round-8 P2: close the menu but let Enter fall through to
+          // handleSend so manually-typed text (e.g. "/ide" on Codex) still
+          // reaches the send intercept path instead of being swallowed.
+          setSlashMenuOpen(false);
+        } else {
+          e.preventDefault();
+          selectCommand(cmd);
+          return;
+        }
       }
       if (e.key === "Escape") {
         e.preventDefault();

@@ -1521,11 +1521,17 @@ export class CodexAdapter implements IBackendAdapter {
           if (name.includes(".")) {
             throw new Error(`Server names containing '.' are not supported: ${name}`);
           }
-          await this.transport.call("config/value/write", {
-            keyPath: `mcp_servers.${name}`,
-            value: null,
-            mergeStrategy: "replace",
-          });
+          try {
+            await this.transport.call("config/value/write", {
+              keyPath: `mcp_servers.${name}`,
+              value: null,
+              mergeStrategy: "replace",
+            });
+          } catch (delErr) {
+            // Cubic round-8 P2: per-key catch so a single delete failure
+            // does not abort remaining deletes + upserts + status reconciliation.
+            this.emit({ type: "error", message: `Failed to delete MCP server '${name}': ${delErr}` });
+          }
         }
       }
 

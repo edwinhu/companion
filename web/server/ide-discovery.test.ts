@@ -410,8 +410,8 @@ describe("ide-discovery", () => {
   // fs.watch / setInterval rescans.
   it("initial snapshot is synchronous — listAvailableIdes() reflects pre-existing lockfiles immediately on return", () => {
     // Two valid lockfiles present BEFORE startIdeDiscovery is called.
-    writeFileSync(join(tmpDir, "77001.lock"), lockfilePayload({ ideName: "Neovim" }));
-    writeFileSync(join(tmpDir, "77002.lock"), lockfilePayload({ ideName: "VS Code" }));
+    writeFileSync(join(tmpDir, "47001.lock"), lockfilePayload({ ideName: "Neovim" }));
+    writeFileSync(join(tmpDir, "47002.lock"), lockfilePayload({ ideName: "VS Code" }));
 
     // startIdeDiscovery is synchronous — simulate a browser hitting
     // /api/ide/available the instant after the server finishes startup.
@@ -422,6 +422,6 @@ describe("ide-discovery", () => {
     // both entries right now.
     const snap = listAvailableIdes();
     const ports = snap.map((i) => i.port).sort();
-    expect(ports).toEqual([77001, 77002]);
+    expect(ports).toEqual([47001, 47002]);
   });
 });

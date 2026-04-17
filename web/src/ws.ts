@@ -1242,6 +1242,19 @@ function handleParsedMessage(
       break;
     }
 
+    case "ide_list_changed": {
+      // Task 12 (DISC-03 UX side): the server broadcasts this payload-free
+      // ping whenever `companionBus` fires ide:added / ide:removed /
+      // ide:changed. Fan it out to any open IdePicker via a DOM CustomEvent
+      // so the component can refetch the authoritative list via REST.
+      // We DO NOT refetch centrally here — only mounted pickers need the
+      // list, and they already own the fetch via `api.getAvailableIdes`.
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("companion:ide-list-changed"));
+      }
+      break;
+    }
+
     default: {
       console.debug("[ws] Unhandled message type:", (data as { type: string }).type);
       break;

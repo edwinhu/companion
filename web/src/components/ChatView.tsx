@@ -7,6 +7,18 @@ import { Composer } from "./Composer.js";
 import { PermissionBanner } from "./PermissionBanner.js";
 import { AiValidationBadge } from "./AiValidationBadge.js";
 import { ActivityTray } from "./ActivityTray.js";
+import { IdePicker } from "./IdePicker.js";
+import { IdeDisconnectBanner } from "./IdeDisconnectBanner.js";
+import type { IdeBinding } from "../types.js";
+
+/**
+ * Stable identifier for an IDE binding — used to keep the BIND-05 banner
+ * dismissal state keyed to this specific disconnect. A new bind+disconnect
+ * cycle produces a different id, so the banner re-shows.
+ */
+function bindingId(b: IdeBinding): string {
+  return `${b.lockfilePath}|${b.port}|${b.boundAt}`;
+}
 
 export function ChatView({ sessionId }: { sessionId: string }) {
   const sessionPerms = useStore((s) => s.pendingPermissions.get(sessionId));
@@ -20,9 +32,69 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     (s) => s.cliReconnecting.get(sessionId) ?? false
   );
   const setCliReconnecting = useStore((s) => s.setCliReconnecting);
+  // Session record — needed for current `cwd` (passed to IdePicker for
+  // best-match ranking) and the live `ideBinding`.
+  const sessionRecord = useStore((s) => s.sessions.get(sessionId));
+  const ideBinding = sessionRecord?.ideBinding ?? null;
+  const sessionCwd = sessionRecord?.cwd;
 
   const [reconnectError, setReconnectError] = useState<string | null>(null);
   const errorTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  // ── UI-03: IdePicker open/close state (parent owns modal visibility) ──
+  const [idePickerOpen, setIdePickerOpen] = useState(false);
+  const openIdePicker = useCallback(() => setIdePickerOpen(true), []);
+  const closeIdePicker = useCallback(() => setIdePickerOpen(false), []);
+
+  // ── BIND-05: disconnect banner plumbing ──────────────────────────────
+  // Track the most recent non-null binding we saw for this session so we
+  // can detect a non-null → null transition and surface the banner.
+  // Per-session/per-binding dismissal: we record the `bindingId` that was
+  // dismissed. A new disconnect yields a different id and re-shows the banner.
+  const previousIdeBindingRef = useRef<IdeBinding | null>(null);
+  const [disconnectedBindingId, setDisconnectedBindingId] = useState<
+    string | null
+  >(null);
+  const [dismissedForBinding, setDismissedForBinding] = useState<string | null>(
+    null
+  );
+
+  // Detect transitions. Non-null → null surfaces the banner (unless the user
+  // has already dismissed *this exact* disconnect); a new non-null updates
+  // the ref so the next disconnect can be detected.
+  useEffect(() => {
+    const prev = previousIdeBindingRef.current;
+    if (ideBinding) {
+      previousIdeBindingRef.current = ideBinding;
+    } else if (prev) {
+      const id = bindingId(prev);
+      setDisconnectedBindingId(id);
+      // Clear any prior dismissal so BIND-05's re-show semantics hold.
+      setDismissedForBinding(null);
+      previousIdeBindingRef.current = null;
+    }
+  }, [ideBinding]);
+
+  // Switching sessions must reset the banner state — the ref belongs to
+  // *this* session only, and we don't want stale banners leaking across tabs.
+  useEffect(() => {
+    previousIdeBindingRef.current = null;
+    setDisconnectedBindingId(null);
+    setDismissedForBinding(null);
+    // Seed the ref with the current binding (if any) so a later disconnect
+    // within this session still triggers the banner.
+    if (ideBinding) previousIdeBindingRef.current = ideBinding;
+    // We deliberately do NOT include ideBinding in the dep list: it's handled
+    // by the transition effect above. sessionId is the only driver here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
+  const showIdeDisconnectBanner =
+    disconnectedBindingId !== null &&
+    disconnectedBindingId !== dismissedForBinding;
+  const dismissIdeDisconnectBanner = useCallback(() => {
+    setDismissedForBinding(disconnectedBindingId);
+  }, [disconnectedBindingId]);
 
   // Clear stale error when switching sessions or when CLI reconnects
   useEffect(() => {
@@ -133,8 +205,23 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         </div>
       )}
 
+      {/* BIND-05: IDE disconnected banner (non-null → null transition) */}
+      {showIdeDisconnectBanner && (
+        <IdeDisconnectBanner onDismiss={dismissIdeDisconnectBanner} />
+      )}
+
       {/* Composer */}
-      <Composer sessionId={sessionId} />
+      <Composer sessionId={sessionId} onOpenIdePicker={openIdePicker} />
+
+      {/* UI-03: IdePicker modal — parent-owned visibility */}
+      {idePickerOpen && (
+        <IdePicker
+          sessionId={sessionId}
+          cwd={sessionCwd}
+          currentBinding={ideBinding}
+          onClose={closeIdePicker}
+        />
+      )}
     </div>
   );
 }

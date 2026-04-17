@@ -2089,3 +2089,149 @@ describe("listExecutions", () => {
     expect(url).toBe("/api/executions?status=running");
   });
 });
+
+// ===========================================================================
+// IDE integration (Task 9 — STATE-02)
+//
+// Three REST wrappers that back the `/ide` composer flow:
+//   - getAvailableIdes(cwd?)      → GET  /api/ide/available
+//   - bindIde(sessionId, port)    → POST /api/sessions/:id/ide
+//   - unbindIde(sessionId)        → DELETE /api/sessions/:id/ide
+//
+// Contract details covered here:
+//   - getAvailableIdes throws on non-200 (caller decides how to surface).
+//   - bindIde returns a discriminated union {ok:true, binding} | {ok:false, error};
+//     it must NOT throw for 400/404 — those are normal "bind failed" UX paths.
+//   - unbindIde returns {ok:true} on 200 and THROWS on 404 (session truly gone).
+// ===========================================================================
+import { getAvailableIdes, bindIde, unbindIde } from "./api.js";
+
+describe("getAvailableIdes (Task 9)", () => {
+  it("sends GET /api/ide/available with no query string when cwd is omitted", async () => {
+    const payload = [
+      {
+        port: 50001,
+        ideName: "Neovim",
+        workspaceFolders: ["/Users/x/repo"],
+        transport: "ws-ide" as const,
+        lockfilePath: "/Users/x/.claude/ide/50001.lock",
+        lockfileMtime: 1_700_000_000_000,
+      },
+    ];
+    mockFetch.mockResolvedValueOnce(mockResponse(payload));
+
+    const result = await getAvailableIdes();
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/ide/available");
+    expect(result).toEqual(payload);
+  });
+
+  it("URL-encodes cwd into the query string when provided", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse([]));
+
+    await getAvailableIdes("/Users/me/my project");
+
+    const [url] = mockFetch.mock.calls[0];
+    // encodeURIComponent turns spaces into %20 and '/' into %2F
+    expect(url).toBe("/api/ide/available?cwd=%2FUsers%2Fme%2Fmy%20project");
+  });
+
+  it("throws an Error when the server responds non-2xx (caller handles)", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ error: "boom" }, 500));
+
+    await expect(getAvailableIdes()).rejects.toThrow("boom");
+  });
+});
+
+describe("bindIde (Task 9)", () => {
+  it("POSTs JSON { port } to /api/sessions/:id/ide and returns {ok:true, binding} on 200", async () => {
+    const binding = {
+      port: 50001,
+      ideName: "Neovim",
+      workspaceFolders: ["/Users/x/repo"],
+      transport: "ws-ide" as const,
+      boundAt: 1_700_000_000_000,
+      lockfilePath: "/Users/x/.claude/ide/50001.lock",
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse({ ok: true, binding }));
+
+    const result = await bindIde("sess-A", 50001);
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sessions/sess-A/ide");
+    expect(opts.method).toBe("POST");
+    expect(opts.headers["Content-Type"]).toBe("application/json");
+    expect(JSON.parse(opts.body)).toEqual({ port: 50001 });
+    // Narrow to success branch and verify binding flows through unchanged.
+    if (!result.ok) throw new Error("expected ok:true");
+    expect(result.binding).toEqual(binding);
+  });
+
+  it("URL-encodes the sessionId so slashes / spaces in ids cannot break the path", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ ok: true, binding: null }));
+
+    await bindIde("weird/id with space", 123);
+
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sessions/weird%2Fid%20with%20space/ide");
+  });
+
+  it("returns {ok:false, error} (no throw) on 400 — unknown port is a normal UX path", async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockResponse({ error: "unknown port" }, 400),
+    );
+
+    const result = await bindIde("sess-A", 99999);
+    expect(result).toEqual({ ok: false, error: "unknown port" });
+  });
+
+  it("returns {ok:false, error} (no throw) on 404 — missing session surfaces as a failure, not an exception", async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockResponse({ error: "session not found" }, 404),
+    );
+
+    const result = await bindIde("sess-gone", 50001);
+    expect(result).toEqual({ ok: false, error: "session not found" });
+  });
+
+  it("falls back to statusText when the error body has no { error } field", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: "Bad Request",
+      json: () => Promise.reject(new Error("no body")),
+    });
+
+    const result = await bindIde("sess-A", 1);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected ok:false");
+    expect(result.error).toBe("Bad Request");
+  });
+});
+
+describe("unbindIde (Task 9)", () => {
+  it("DELETEs /api/sessions/:id/ide and returns {ok:true} on 200", async () => {
+    mockFetch.mockResolvedValueOnce(mockResponse({ ok: true }));
+
+    const result = await unbindIde("sess-A");
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe("/api/sessions/sess-A/ide");
+    expect(opts.method).toBe("DELETE");
+    expect(result).toEqual({ ok: true });
+  });
+
+  // Session genuinely gone is an exceptional condition — throw so callers
+  // cannot accidentally treat it as a successful clear.
+  it("throws on 404 — the session no longer exists", async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockResponse({ error: "session not found" }, 404),
+    );
+
+    await expect(unbindIde("sess-gone")).rejects.toThrow("session not found");
+  });
+});

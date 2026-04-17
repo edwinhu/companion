@@ -36,9 +36,54 @@ vi.mock("./MessageFeed.js", () => ({
   ),
 }));
 
+// Composer stub exposes the `onOpenIdePicker` prop via a button so we can
+// assert that ChatView wires open/close state through to Composer (UI-03).
 vi.mock("./Composer.js", () => ({
-  Composer: ({ sessionId }: { sessionId: string }) => (
-    <div data-testid="composer">{sessionId}</div>
+  Composer: ({
+    sessionId,
+    onOpenIdePicker,
+  }: {
+    sessionId: string;
+    onOpenIdePicker?: () => void;
+  }) => (
+    <div data-testid="composer">
+      {sessionId}
+      <button
+        type="button"
+        data-testid="composer-open-ide"
+        onClick={() => onOpenIdePicker?.()}
+      >
+        open-ide
+      </button>
+    </div>
+  ),
+}));
+
+// IdePicker stub — ChatView mounts it when idePickerOpen=true. We render a
+// visible element with role="dialog" to assert the mount, and surface the
+// props so tests can verify currentBinding / cwd wiring.
+vi.mock("./IdePicker.js", () => ({
+  IdePicker: ({
+    sessionId,
+    cwd,
+    currentBinding,
+    onClose,
+  }: {
+    sessionId: string;
+    cwd?: string;
+    currentBinding?: unknown;
+    onClose: () => void;
+  }) => (
+    <div role="dialog" aria-label="ide-picker-stub" data-testid="ide-picker">
+      <span data-testid="ide-picker-session">{sessionId}</span>
+      <span data-testid="ide-picker-cwd">{cwd ?? ""}</span>
+      <span data-testid="ide-picker-binding">
+        {currentBinding ? "bound" : "unbound"}
+      </span>
+      <button type="button" onClick={onClose}>
+        close-picker
+      </button>
+    </div>
   ),
 }));
 
@@ -58,12 +103,20 @@ vi.mock("./ActivityTray.js", () => ({
 
 import { ChatView } from "./ChatView.js";
 
+// Minimal shape for a stored session — only the fields ChatView reads.
+type SessionStub = {
+  session_id: string;
+  cwd?: string;
+  ideBinding?: unknown;
+};
+
 function setupStore(overrides: {
   connectionStatus?: "connecting" | "connected" | "disconnected";
   cliConnected?: boolean;
   cliReconnecting?: boolean;
   hasPendingPerms?: boolean;
   hasAiResolved?: boolean;
+  session?: SessionStub | null;
 } = {}) {
   const {
     connectionStatus = "connected",
@@ -71,6 +124,7 @@ function setupStore(overrides: {
     cliReconnecting = false,
     hasPendingPerms = false,
     hasAiResolved = false,
+    session = { session_id: "s1", cwd: "/Users/me/proj", ideBinding: null },
   } = overrides;
 
   const connMap = new Map<string, string>();
@@ -94,16 +148,54 @@ function setupStore(overrides: {
     aiResolved.set("s1", [{ tool: "Read", decision: "approved" }]);
   }
 
+  const sessions = new Map<string, SessionStub>();
+  if (session) sessions.set(session.session_id, session);
+
   mockStoreState = {
     connectionStatus: connMap,
     cliConnected: cliMap,
     cliReconnecting: reconnMap,
     pendingPermissions: pendingPerms,
     aiResolvedPermissions: aiResolved,
+    sessions,
     clearAiResolvedPermissions: vi.fn(),
     setCliReconnecting: mockSetCliReconnecting,
   };
 }
+
+/**
+ * Mutate just the session record + bump the selector cache — simulates the
+ * server broadcasting a `session_update` that flips `ideBinding` without
+ * tearing down the ChatView.
+ */
+function updateSessionInStore(next: SessionStub) {
+  const sessions = mockStoreState.sessions as Map<string, SessionStub>;
+  // Clone map so React's identity check (if any) triggers — not strictly
+  // required with the mocked selector, but matches the real store semantics.
+  const nextMap = new Map(sessions);
+  nextMap.set(next.session_id, next);
+  mockStoreState = { ...mockStoreState, sessions: nextMap };
+}
+
+// Representative binding used by BIND-05 transition tests.
+const NVIM_BINDING = {
+  port: 38630,
+  ideName: "Neovim",
+  workspaceFolders: ["/Users/me/proj"],
+  transport: "ws-ide" as const,
+  boundAt: 1700000000000,
+  lockfilePath: "/Users/me/.claude/ide/38630.lock",
+};
+
+const NVIM_BINDING_2 = {
+  port: 42424,
+  ideName: "Neovim",
+  workspaceFolders: ["/Users/me/proj"],
+  transport: "ws-ide" as const,
+  // Different boundAt + lockfilePath → different bindingId → banner re-shows.
+  boundAt: 1700000999999,
+  lockfilePath: "/Users/me/.claude/ide/42424.lock",
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -236,5 +328,195 @@ describe("ChatView", () => {
     setupStore({ hasAiResolved: true });
     render(<ChatView sessionId="s1" />);
     expect(screen.getByTestId("ai-validation-badge")).toBeTruthy();
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // UI-03 + BIND-05 — IdePicker integration + disconnect banner
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // UI-03: Composer's onOpenIdePicker prop mounts IdePicker (role="dialog").
+  // This is the production path when a user types /ide in the composer.
+  it("UI-03: onOpenIdePicker mounts IdePicker with role=dialog", () => {
+    setupStore();
+    render(<ChatView sessionId="s1" />);
+    // Initially closed.
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByTestId("composer-open-ide"));
+    // Dialog mounts — our stub asserts the picker rendered.
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByTestId("ide-picker-session").textContent).toBe("s1");
+    expect(screen.getByTestId("ide-picker-cwd").textContent).toBe(
+      "/Users/me/proj"
+    );
+    // No binding on this session → stub reports "unbound".
+    expect(screen.getByTestId("ide-picker-binding").textContent).toBe("unbound");
+  });
+
+  // UI-03: close callback unmounts the picker (dialog gone).
+  it("UI-03: picker closes when onClose fires", () => {
+    setupStore();
+    render(<ChatView sessionId="s1" />);
+    fireEvent.click(screen.getByTestId("composer-open-ide"));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    fireEvent.click(screen.getByText("close-picker"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  // UI-03: currentBinding is forwarded to IdePicker so the picker can render
+  // the "currently bound" affordance (Disconnect button, highlight, etc.).
+  it("UI-03: forwards currentBinding to IdePicker when session has one", () => {
+    setupStore({
+      session: {
+        session_id: "s1",
+        cwd: "/Users/me/proj",
+        ideBinding: NVIM_BINDING,
+      },
+    });
+    render(<ChatView sessionId="s1" />);
+    fireEvent.click(screen.getByTestId("composer-open-ide"));
+    expect(screen.getByTestId("ide-picker-binding").textContent).toBe("bound");
+  });
+
+  // BIND-05: transition non-null → null renders banner with exact spec copy.
+  // The copy is pinned by SPEC — test asserts the literal string including
+  // the em-dash (\u2014). A future drift (hyphen, minus, typo) fails here.
+  it("BIND-05: non-null → null transition shows banner with exact copy", () => {
+    setupStore({
+      session: {
+        session_id: "s1",
+        cwd: "/Users/me/proj",
+        ideBinding: NVIM_BINDING,
+      },
+    });
+    const { rerender } = render(<ChatView sessionId="s1" />);
+    // Before disconnect: no banner.
+    expect(
+      screen.queryByText("IDE disconnected \u2014 rebind via /ide")
+    ).toBeNull();
+
+    // Simulate server session_update setting ideBinding: null.
+    updateSessionInStore({
+      session_id: "s1",
+      cwd: "/Users/me/proj",
+      ideBinding: null,
+    });
+    rerender(<ChatView sessionId="s1" />);
+
+    // Banner appears with the EXACT literal copy.
+    expect(
+      screen.getByText("IDE disconnected \u2014 rebind via /ide")
+    ).toBeTruthy();
+    expect(screen.getByRole("status")).toBeTruthy();
+  });
+
+  // BIND-05: dismiss button removes the banner for this disconnect only.
+  it("BIND-05: dismiss button removes the banner", () => {
+    setupStore({
+      session: {
+        session_id: "s1",
+        cwd: "/Users/me/proj",
+        ideBinding: NVIM_BINDING,
+      },
+    });
+    const { rerender } = render(<ChatView sessionId="s1" />);
+    updateSessionInStore({
+      session_id: "s1",
+      cwd: "/Users/me/proj",
+      ideBinding: null,
+    });
+    rerender(<ChatView sessionId="s1" />);
+    expect(screen.getByTestId("ide-disconnect-banner")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /dismiss/i }));
+    expect(screen.queryByTestId("ide-disconnect-banner")).toBeNull();
+  });
+
+  // BIND-05: a SECOND disconnect (new bindingId) must re-show the banner
+  // even if the prior disconnect was dismissed. Dismissal is per-binding.
+  it("BIND-05: a second disconnect re-shows the banner after prior dismissal", () => {
+    setupStore({
+      session: {
+        session_id: "s1",
+        cwd: "/Users/me/proj",
+        ideBinding: NVIM_BINDING,
+      },
+    });
+    const { rerender } = render(<ChatView sessionId="s1" />);
+
+    // First disconnect → banner → dismiss.
+    updateSessionInStore({
+      session_id: "s1",
+      cwd: "/Users/me/proj",
+      ideBinding: null,
+    });
+    rerender(<ChatView sessionId="s1" />);
+    fireEvent.click(screen.getByRole("button", { name: /dismiss/i }));
+    expect(screen.queryByTestId("ide-disconnect-banner")).toBeNull();
+
+    // Rebind to a DIFFERENT binding (new bindingId).
+    updateSessionInStore({
+      session_id: "s1",
+      cwd: "/Users/me/proj",
+      ideBinding: NVIM_BINDING_2,
+    });
+    rerender(<ChatView sessionId="s1" />);
+    // No banner while bound.
+    expect(screen.queryByTestId("ide-disconnect-banner")).toBeNull();
+
+    // Second disconnect — banner reappears because dismissal was scoped to
+    // the prior bindingId, not "any disconnect on this session".
+    updateSessionInStore({
+      session_id: "s1",
+      cwd: "/Users/me/proj",
+      ideBinding: null,
+    });
+    rerender(<ChatView sessionId="s1" />);
+    expect(screen.getByTestId("ide-disconnect-banner")).toBeTruthy();
+  });
+
+  // BIND-05: no toast / modal API involvement. We spy on the module-level
+  // `api` object to confirm ChatView does NOT call anything that looks like
+  // a toast or modal on the disconnect transition. (The mocked api only
+  // exposes relaunchSession; assertion is on call count across the full
+  // interaction.)
+  it("BIND-05: no toast/modal API is invoked during the transition", () => {
+    mockRelaunchSession.mockClear();
+    setupStore({
+      session: {
+        session_id: "s1",
+        cwd: "/Users/me/proj",
+        ideBinding: NVIM_BINDING,
+      },
+    });
+    const { rerender } = render(<ChatView sessionId="s1" />);
+    updateSessionInStore({
+      session_id: "s1",
+      cwd: "/Users/me/proj",
+      ideBinding: null,
+    });
+    rerender(<ChatView sessionId="s1" />);
+
+    // Banner is an in-chat role=status element — not a dialog, not a toast.
+    expect(screen.getByRole("status")).toBeTruthy();
+    // No dialog (modal) appears as a result of the transition. Only the
+    // explicit UI-03 openIdePicker path mounts a dialog.
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // No API calls happened (we only mock relaunchSession, and the
+    // transition must not trigger anything network-y).
+    expect(mockRelaunchSession).not.toHaveBeenCalled();
+  });
+
+  // Defensive: a session that was NEVER bound must not render the banner
+  // on an undefined/null ideBinding — banners only fire on a transition.
+  it("BIND-05: never-bound sessions do not show the banner", () => {
+    setupStore({
+      session: {
+        session_id: "s1",
+        cwd: "/Users/me/proj",
+        ideBinding: null,
+      },
+    });
+    render(<ChatView sessionId="s1" />);
+    expect(screen.queryByTestId("ide-disconnect-banner")).toBeNull();
   });
 });

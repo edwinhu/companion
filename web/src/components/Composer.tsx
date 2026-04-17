@@ -15,10 +15,25 @@ const emptyStringArray: string[] = [];
 
 interface CommandItem {
   name: string;
-  type: "command" | "skill";
+  type: "command" | "skill" | "ide";
+  /** When true, render as disabled (aria-disabled, muted styling, non-interactive). */
+  disabled?: boolean;
+  /** Tooltip (title attribute) shown on hover — used for disabled reasons. */
+  tooltip?: string;
 }
 
-export function Composer({ sessionId }: { sessionId: string }) {
+interface ComposerProps {
+  sessionId: string;
+  /**
+   * Called when the user selects `/ide` (either from the autocomplete menu or
+   * by typing `/ide` and pressing Enter). Parent owns the IdePicker modal's
+   * open/close state. The Composer never sends `/ide` as a user_message —
+   * the slash command is intercepted client-side.
+   */
+  onOpenIdePicker?: () => void;
+}
+
+export function Composer({ sessionId, onOpenIdePicker }: ComposerProps) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<ImageAttachment[]>([]);
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
@@ -50,7 +65,11 @@ export function Composer({ sessionId }: { sessionId: string }) {
     enabled: !slashMenuOpen,
   });
 
-  // Build command list from session data
+  // Build command list from session data.
+  // NOTE: We inject `/ide` as a synthetic client-side overlay. We do NOT mutate
+  // `session.slash_commands` — the server has no knowledge of this command
+  // because /ide is handled entirely in the browser (BIND-06). On Codex
+  // sessions the entry is rendered disabled with a tooltip (UI-04).
   const allCommands = useMemo<CommandItem[]>(() => {
     const cmds: CommandItem[] = [];
     if (sessionData?.slash_commands) {
@@ -58,13 +77,23 @@ export function Composer({ sessionId }: { sessionId: string }) {
         cmds.push({ name: cmd, type: "command" });
       }
     }
+    // Synthetic /ide overlay. Append after user slash commands so typing
+    // `/cl` prefers real commands when both match.
+    cmds.push({
+      name: "ide",
+      type: "ide",
+      disabled: isCodex,
+      tooltip: isCodex
+        ? "IDE integration requires Claude Code"
+        : "Bind an IDE for context/diff/selection",
+    });
     if (sessionData?.skills) {
       for (const skill of sessionData.skills) {
         cmds.push({ name: skill, type: "skill" });
       }
     }
     return cmds;
-  }, [sessionData?.slash_commands, sessionData?.skills]);
+  }, [sessionData?.slash_commands, sessionData?.skills, isCodex]);
 
   // Filter commands based on what the user typed after /
   const filteredCommands = useMemo(() => {
@@ -88,12 +117,19 @@ export function Composer({ sessionId }: { sessionId: string }) {
     }
   }, [text, allCommands.length, slashMenuOpen]);
 
-  // Keep slash menu selected index in bounds
+  // Keep slash menu selected index in bounds AND off any disabled row
+  // (e.g. `/ide` on Codex sessions). UI-04.
   useEffect(() => {
-    if (slashMenuIndex >= filteredCommands.length) {
-      setSlashMenuIndex(Math.max(0, filteredCommands.length - 1));
+    if (filteredCommands.length === 0) return;
+    const current = filteredCommands[slashMenuIndex];
+    const currentOutOfBounds = slashMenuIndex >= filteredCommands.length;
+    const currentDisabled = current?.disabled === true;
+    if (currentOutOfBounds || currentDisabled) {
+      // Find the first enabled index; fall back to 0 if all are disabled.
+      const firstEnabled = filteredCommands.findIndex((c) => !c.disabled);
+      setSlashMenuIndex(firstEnabled === -1 ? 0 : firstEnabled);
     }
-  }, [filteredCommands.length, slashMenuIndex]);
+  }, [filteredCommands, slashMenuIndex]);
 
   // Scroll slash menu selected item into view
   useEffect(() => {
@@ -113,10 +149,24 @@ export function Composer({ sessionId }: { sessionId: string }) {
   }, [text]);
 
   const selectCommand = useCallback((cmd: CommandItem) => {
+    // Disabled rows (e.g. /ide on Codex) are a hard no-op: do not insert
+    // text, do not close the menu, do not call the callback. (UI-04)
+    if (cmd.disabled) return;
+    // PRIMARY /ide intercept (UI-01, BIND-06). The /ide command is handled
+    // entirely client-side: skip setText, skip sendToSession, just open the
+    // IdePicker via the parent-supplied callback. Clear any pending text
+    // (including a manually-typed `/ide`) so Enter doesn't leave stray
+    // characters in the composer.
+    if (cmd.type === "ide") {
+      onOpenIdePicker?.();
+      setText("");
+      setSlashMenuOpen(false);
+      return;
+    }
     setText(`/${cmd.name} `);
     setSlashMenuOpen(false);
     textareaRef.current?.focus();
-  }, []);
+  }, [onOpenIdePicker]);
 
   const selectPrompt = useCallback((prompt: SavedPrompt) => {
     const result = mention.selectPrompt(prompt);
@@ -135,6 +185,16 @@ export function Composer({ sessionId }: { sessionId: string }) {
   function handleSend() {
     const msg = text.trim();
     if (!msg || !isConnected) return;
+    // SECONDARY /ide intercept (UI-01, BIND-06). Handles the case where the
+    // user typed `/ide` manually (bypassing the autocomplete menu) and hit
+    // Enter. On Codex the synthetic overlay is disabled, but we still
+    // intercept here so the CLI never observes `/ide` as a user_message.
+    if (msg === "/ide") {
+      if (!isCodex) onOpenIdePicker?.();
+      setText("");
+      setSlashMenuOpen(false);
+      return;
+    }
     const clientMsgId = createClientMessageId();
 
     sendToSession(sessionId, {
@@ -167,14 +227,23 @@ export function Composer({ sessionId }: { sessionId: string }) {
   function handleKeyDown(e: React.KeyboardEvent) {
     // Slash menu navigation
     if (slashMenuOpen && filteredCommands.length > 0) {
+      // Arrow nav skips disabled rows (e.g. /ide on Codex). UI-04.
+      const nextEnabledIndex = (start: number, dir: 1 | -1): number => {
+        const n = filteredCommands.length;
+        for (let step = 1; step <= n; step++) {
+          const candidate = (start + dir * step + n * n) % n;
+          if (!filteredCommands[candidate].disabled) return candidate;
+        }
+        return start;
+      };
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        setSlashMenuIndex((i) => (i + 1) % filteredCommands.length);
+        setSlashMenuIndex((i) => nextEnabledIndex(i, 1));
         return;
       }
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        setSlashMenuIndex((i) => (i - 1 + filteredCommands.length) % filteredCommands.length);
+        setSlashMenuIndex((i) => nextEnabledIndex(i, -1));
         return;
       }
       if (e.key === "Tab" && !e.shiftKey) {
@@ -425,34 +494,52 @@ export function Composer({ sessionId }: { sessionId: string }) {
               ref={menuRef}
               className="absolute left-2 right-2 bottom-full mb-1 max-h-[240px] overflow-y-auto bg-cc-card border border-cc-border rounded-[10px] shadow-lg z-20 py-1"
             >
-              {filteredCommands.map((cmd, i) => (
-                <button
-                  key={`${cmd.type}-${cmd.name}`}
-                  data-cmd-index={i}
-                  onClick={() => selectCommand(cmd)}
-                  className={`w-full px-3 py-2 text-left flex items-center gap-2.5 transition-colors cursor-pointer ${
-                    i === slashMenuIndex
-                      ? "bg-cc-hover"
-                      : "hover:bg-cc-hover/50"
-                  }`}
-                >
-                  <span className="flex items-center justify-center w-6 h-6 rounded-md bg-cc-hover text-cc-muted shrink-0">
-                    {cmd.type === "skill" ? (
-                      <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
-                        <path d="M8 1l1.796 3.64L14 5.255l-3 2.924.708 4.126L8 10.5l-3.708 1.805L5 8.18 2 5.255l4.204-.615L8 1z" />
-                      </svg>
-                    ) : (
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5">
-                        <path d="M5 12L10 4" strokeLinecap="round" />
-                      </svg>
-                    )}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <span className="text-[13px] font-medium text-cc-fg">/{cmd.name}</span>
-                    <span className="ml-2 text-[11px] text-cc-muted">{cmd.type}</span>
-                  </div>
-                </button>
-              ))}
+              {filteredCommands.map((cmd, i) => {
+                const isSelected = i === slashMenuIndex;
+                const isDisabled = cmd.disabled === true;
+                return (
+                  <button
+                    key={`${cmd.type}-${cmd.name}`}
+                    data-cmd-index={i}
+                    onClick={() => selectCommand(cmd)}
+                    aria-disabled={isDisabled ? "true" : undefined}
+                    aria-selected={isSelected && !isDisabled ? "true" : "false"}
+                    title={cmd.tooltip}
+                    className={`w-full px-3 py-2 text-left flex items-center gap-2.5 transition-colors ${
+                      isDisabled
+                        ? "opacity-40 cursor-not-allowed"
+                        : "cursor-pointer"
+                    } ${
+                      isSelected && !isDisabled
+                        ? "bg-cc-hover"
+                        : isDisabled
+                          ? ""
+                          : "hover:bg-cc-hover/50"
+                    }`}
+                  >
+                    <span className="flex items-center justify-center w-6 h-6 rounded-md bg-cc-hover text-cc-muted shrink-0">
+                      {cmd.type === "skill" ? (
+                        <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                          <path d="M8 1l1.796 3.64L14 5.255l-3 2.924.708 4.126L8 10.5l-3.708 1.805L5 8.18 2 5.255l4.204-.615L8 1z" />
+                        </svg>
+                      ) : cmd.type === "ide" ? (
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5">
+                          <rect x="2" y="3" width="12" height="9" rx="1.5" />
+                          <path d="M2 6h12" strokeLinecap="round" />
+                        </svg>
+                      ) : (
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5">
+                          <path d="M5 12L10 4" strokeLinecap="round" />
+                        </svg>
+                      )}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <span className="text-[13px] font-medium text-cc-fg">/{cmd.name}</span>
+                      <span className="ml-2 text-[11px] text-cc-muted">{cmd.type}</span>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           )}
 

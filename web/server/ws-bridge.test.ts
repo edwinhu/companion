@@ -4775,3 +4775,424 @@ describe("User message during initializing phase", () => {
     expect(session.stateMachine.phase).toBe("streaming");
   });
 });
+
+// ─── IDE binding (Task 6: BIND-01, BIND-02, BIND-04, BIND-06, STATE-01) ──────
+//
+// These tests pin the bindIde/unbindIde contract on WsBridge.
+//
+// Test seam: we seed `listAvailableIdes()` by running `startIdeDiscovery` on a
+// fresh temp directory and writing real lockfile JSON with our own pid (so
+// isPidAlive returns true). That exercises the production discovery path —
+// no internal mock — matching how routes/ide-routes.test.ts seeds fixtures.
+//
+// Adapter seam: we attach a fake IBackendAdapter via attachBackendAdapter and
+// capture every .send() call. bindIde must route through session.backendAdapter.send
+// with a single {type:"mcp_set_servers", servers:{ide:{...}}} message — never a
+// {type:"user_message"} carrying "/ide" (that would leak the slash command into
+// the CLI and duplicate the intercept, violating BIND-06).
+
+import {
+  startIdeDiscovery as startIdeDiscoveryForBind,
+  resetIdeDiscoveryForTests as resetIdeDiscoveryForBind,
+  listAvailableIdes as listAvailableIdesForBind,
+} from "./ide-discovery.js";
+import { writeFileSync as writeFileSyncForBind } from "node:fs";
+
+describe("IDE binding (bindIde / unbindIde)", () => {
+  let ideTmpDir: string;
+  let stopDiscovery: (() => void) | null = null;
+
+  /** Write a healthy lockfile to the ide dir and wait for discovery to see it. */
+  async function seedIde(opts: {
+    port: number;
+    ideName?: string;
+    workspaceFolders?: string[];
+    authToken?: string;
+    transport?: "ws" | "sse";
+  }): Promise<void> {
+    const path = join(ideTmpDir, `${opts.port}.lock`);
+    writeFileSyncForBind(
+      path,
+      JSON.stringify({
+        pid: process.pid, // our own pid — guaranteed alive
+        ideName: opts.ideName ?? "Neovim",
+        workspaceFolders: opts.workspaceFolders ?? ["/Users/test/proj"],
+        authToken: opts.authToken ?? "tok-xyz",
+        transport: opts.transport ?? "ws",
+      }),
+    );
+    // Wait until discovery reflects the new IDE. fs.watch on macOS can lag
+    // up to several hundred ms; we poll for up to 4s and fall back to
+    // manually restarting discovery (which does a synchronous scan) if the
+    // watcher event never fires.
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      if (listAvailableIdesForBind().some((i) => i.port === opts.port)) return;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    // Watcher event never fired — force a synchronous rescan via restart.
+    if (stopDiscovery) {
+      try { stopDiscovery(); } catch { /* ignore */ }
+    }
+    stopDiscovery = startIdeDiscoveryForBind({ ideDir: ideTmpDir });
+    if (listAvailableIdesForBind().some((i) => i.port === opts.port)) return;
+    throw new Error(`seedIde: discovery did not pick up port ${opts.port}`);
+  }
+
+  /** Build a fake backend adapter that records every outgoing message. */
+  function makeFakeAdapter(): { adapter: any; sendCalls: any[] } {
+    const sendCalls: any[] = [];
+    const adapter = {
+      isConnected: () => true,
+      send: (msg: any) => {
+        sendCalls.push(msg);
+        return true;
+      },
+      disconnect: async () => {},
+      onBrowserMessage: () => {},
+      onSessionMeta: () => {},
+      onDisconnect: () => {},
+      onInitError: () => {},
+    };
+    return { adapter, sendCalls };
+  }
+
+  beforeEach(() => {
+    ideTmpDir = mkdtempSync(join(tmpdir(), "ide-bind-"));
+    resetIdeDiscoveryForBind();
+    // NOTE: the top-level beforeEach (above, outside any describe) creates
+    // `bridge = new WsBridge()` and THEN calls companionBus.clear(). The
+    // clear() wipes out the constructor's "ide:removed" subscription (the
+    // BIND-04 auto-unbind wiring). Re-create the bridge here, AFTER clear,
+    // so the subscription is alive for these tests. This is specific to the
+    // ordering chosen by the outer setup and does not affect other describes.
+    bridge = new WsBridge();
+    bridge.setStore(store);
+    // startIdeDiscovery populates the internal known-map by scanning ideTmpDir.
+    stopDiscovery = startIdeDiscoveryForBind({ ideDir: ideTmpDir });
+  });
+
+  afterEach(() => {
+    if (stopDiscovery) {
+      try { stopDiscovery(); } catch { /* ignore */ }
+      stopDiscovery = null;
+    }
+    resetIdeDiscoveryForBind();
+    try { rmSync(ideTmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  // BIND-01 core contract: bindIde must translate into exactly one
+  // mcp_set_servers carrying the `ide` entry with the expected shape.
+  // We assert on the PROTOCOL payload, not on a derivative — per the plan,
+  // this pins "CLI sees mcp_set_servers, never /ide text".
+  it("bindIde sends mcp_set_servers with an `ide` entry containing transport/url/ideName/authToken/scope", async () => {
+    await seedIde({ port: 42424, ideName: "Neovim", authToken: "secret-t" });
+
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+    sendCalls.length = 0; // ignore any send that happened during attach
+
+    const result = await bridge.bindIde("s1", 42424);
+    expect(result).toEqual({ ok: true });
+
+    // Find the mcp_set_servers call — there should be exactly one.
+    const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
+    expect(mcpCalls).toHaveLength(1);
+    const payload = mcpCalls[0];
+    expect(payload.servers.ide).toBeDefined();
+    expect(payload.servers.ide).toMatchObject({
+      type: "ws-ide",
+      url: "ws://127.0.0.1:42424",
+      ideName: "Neovim",
+      authToken: "secret-t",
+      ideRunningInWindows: false,
+      scope: "dynamic",
+    });
+  });
+
+  // STATE-01 + session_update broadcast contract.
+  // ideBinding must land on session.state AND be visible to browsers via the
+  // existing session_update channel (never a new variant — plan forbids it).
+  it("bindIde sets session.state.ideBinding and broadcasts session_update with the binding", async () => {
+    await seedIde({ port: 50001, ideName: "VSCode", workspaceFolders: ["/w/a", "/w/b"] });
+
+    bridge.getOrCreateSession("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    const { adapter } = makeFakeAdapter();
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+    browser.send.mockClear();
+
+    const result = await bridge.bindIde("s1", 50001);
+    expect(result).toEqual({ ok: true });
+
+    const session = bridge.getSession("s1")!;
+    expect(session.state.ideBinding).toMatchObject({
+      port: 50001,
+      ideName: "VSCode",
+      workspaceFolders: ["/w/a", "/w/b"],
+      transport: "ws-ide",
+      authToken: "tok-xyz",
+    });
+    expect(typeof session.state.ideBinding?.boundAt).toBe("number");
+    expect(session.state.ideBinding?.lockfilePath.endsWith("50001.lock")).toBe(true);
+
+    // At least one session_update broadcast contained ideBinding.
+    const broadcasts = browser.send.mock.calls
+      .map(([arg]: [string]) => JSON.parse(arg))
+      .filter((m: any) => m.type === "session_update");
+    const hasBinding = broadcasts.some(
+      (m: any) => m.session && m.session.ideBinding && m.session.ideBinding.port === 50001,
+    );
+    expect(hasBinding).toBe(true);
+  });
+
+  // Negative safety: unknown port must NOT issue any backend send. A failed
+  // match leaking mcp_set_servers with an empty `ide` would destabilize the
+  // live MCP config for the session — never acceptable.
+  it("bindIde with an unknown port returns error and does NOT call adapter.send", async () => {
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+    sendCalls.length = 0;
+
+    const result = await bridge.bindIde("s1", 9999);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/unknown port/i);
+
+    // Critical: no MCP traffic on the failure path.
+    expect(sendCalls.filter((m) => m.type === "mcp_set_servers")).toHaveLength(0);
+  });
+
+  // Unbind contract — pins the BIND-04 transition payload the FE relies on:
+  // ideBinding must be EXPLICITLY null (not undefined) so ChatView can detect
+  // the bound → unbound transition and render the disconnect banner.
+  it("unbindIde clears binding, sends mcp_set_servers (ide removed), and broadcasts session_update with ideBinding:null", async () => {
+    await seedIde({ port: 33333, ideName: "Neovim" });
+
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+
+    await bridge.bindIde("s1", 33333);
+    sendCalls.length = 0;
+    browser.send.mockClear();
+
+    const result = await bridge.unbindIde("s1");
+    expect(result).toEqual({ ok: true });
+
+    const session = bridge.getSession("s1")!;
+    // Use Object.is to prove it's LITERAL null, not undefined.
+    expect(session.state.ideBinding).toBeNull();
+
+    // mcp_set_servers was sent with `ide` key removed.
+    const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
+    expect(mcpCalls).toHaveLength(1);
+    expect(mcpCalls[0].servers.ide).toBeUndefined();
+
+    // session_update carries the explicit null.
+    const broadcasts = browser.send.mock.calls
+      .map(([arg]: [string]) => JSON.parse(arg))
+      .filter((m: any) => m.type === "session_update");
+    const hasNullBinding = broadcasts.some(
+      (m: any) => m.session && Object.prototype.hasOwnProperty.call(m.session, "ideBinding") && m.session.ideBinding === null,
+    );
+    expect(hasNullBinding).toBe(true);
+  });
+
+  // BIND-04 auto-unbind wiring: when the lockfile goes away mid-session,
+  // discovery emits ide:removed. ws-bridge must react by unbinding every
+  // session whose binding matches that port — no user action required.
+  it("BIND-04: companionBus.emit ide:removed for a bound port auto-unbinds matching sessions", async () => {
+    await seedIde({ port: 44444, ideName: "Neovim" });
+
+    const { adapter } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+
+    await bridge.bindIde("s1", 44444);
+    expect(bridge.getSession("s1")!.state.ideBinding?.port).toBe(44444);
+    browser.send.mockClear();
+
+    // Emit the event as if the lockfile had disappeared. We emit directly
+    // on companionBus rather than rely on fs.watch timing — the bridge's
+    // wiring is what we're pinning here, not discovery's eviction loop.
+    companionBus.emit("ide:removed", {
+      port: 44444,
+      lockfilePath: join(ideTmpDir, "44444.lock"),
+    });
+
+    // Auto-unbind may be async (unbindIde is async); give microtasks a tick.
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(bridge.getSession("s1")!.state.ideBinding).toBeNull();
+    const broadcasts = browser.send.mock.calls
+      .map(([arg]: [string]) => JSON.parse(arg))
+      .filter((m: any) => m.type === "session_update");
+    expect(
+      broadcasts.some(
+        (m: any) =>
+          m.session &&
+          Object.prototype.hasOwnProperty.call(m.session, "ideBinding") &&
+          m.session.ideBinding === null,
+      ),
+    ).toBe(true);
+  });
+
+  // BIND-06 safety (positive form): prePopulateCommands must never be invoked
+  // with "ide" or "/ide" during binding. The /ide slash is a CLIENT-ONLY
+  // affordance — the CLI never sees it.
+  it("BIND-06: prePopulateCommands is never called with `ide` or `/ide` during bindIde", async () => {
+    await seedIde({ port: 55555, ideName: "Neovim" });
+
+    const { adapter } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+
+    const preSpy = vi.spyOn(bridge, "prePopulateCommands");
+
+    await bridge.bindIde("s1", 55555);
+
+    for (const call of preSpy.mock.calls) {
+      const slash = call[1] as string[];
+      const skills = call[2] as string[];
+      expect(slash).not.toContain("ide");
+      expect(slash).not.toContain("/ide");
+      expect(skills).not.toContain("ide");
+      expect(skills).not.toContain("/ide");
+    }
+
+    preSpy.mockRestore();
+  });
+
+  // BIND-06 safety (negative form): adapter.send must NEVER receive a
+  // user_message containing "/ide" during bind. If this ever starts firing,
+  // the CLI would interpret it as a slash command and recursively bind —
+  // exactly the bug the client-side intercept was designed to prevent.
+  it("BIND-06: adapter.send is never called with {type:'user_message'} carrying `/ide` text during bind", async () => {
+    await seedIde({ port: 55556, ideName: "Neovim" });
+
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+    sendCalls.length = 0;
+
+    await bridge.bindIde("s1", 55556);
+
+    const leaked = sendCalls.filter(
+      (m) =>
+        m.type === "user_message" &&
+        typeof m.content === "string" &&
+        m.content.includes("/ide"),
+    );
+    expect(leaked).toEqual([]);
+  });
+});
+
+// ─── IDE list change broadcast (Task 12, DISC-03 UX side) ─────────────────────
+//
+// Pins the contract: when `companionBus` fires `ide:added`, `ide:removed`, or
+// `ide:changed`, ws-bridge broadcasts `{type: "ide_list_changed"}` to EVERY
+// connected browser socket across ALL sessions. The broadcast is payload-free
+// (no sensitive fields leak) — IdePicker instances refetch via REST on receipt.
+describe("IDE list change broadcast (Task 12)", () => {
+  beforeEach(() => {
+    // The outer beforeEach creates a fresh bridge but then calls
+    // companionBus.clear() which wipes out the constructor subscriptions.
+    // Recreate the bridge AFTER clear so the Task 12 subscriptions are live.
+    bridge = new WsBridge();
+    bridge.setStore(store);
+  });
+
+  it("ide:added → every connected browser socket receives one {type: ide_list_changed}", () => {
+    // Two sessions, multiple browsers each — the broadcast must fan out
+    // across sessions, not only to the session the event relates to.
+    const b1a = makeBrowserSocket("s1");
+    const b1b = makeBrowserSocket("s1");
+    const b2 = makeBrowserSocket("s2");
+    bridge.handleBrowserOpen(b1a, "s1");
+    bridge.handleBrowserOpen(b1b, "s1");
+    bridge.handleBrowserOpen(b2, "s2");
+    b1a.send.mockClear();
+    b1b.send.mockClear();
+    b2.send.mockClear();
+
+    companionBus.emit("ide:added", {
+      port: 40001,
+      ideName: "Neovim",
+      workspaceFolders: ["/tmp/proj"],
+      lockfilePath: "/tmp/.claude/ide/40001.lock",
+    });
+
+    for (const browser of [b1a, b1b, b2]) {
+      const listChanges = browser.send.mock.calls
+        .map(([raw]: [string]) => JSON.parse(raw))
+        .filter((m: any) => m.type === "ide_list_changed");
+      expect(listChanges).toHaveLength(1);
+    }
+  });
+
+  it("ide:removed → every browser receives {type: ide_list_changed}", () => {
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    companionBus.emit("ide:removed", {
+      port: 40002,
+      lockfilePath: "/tmp/.claude/ide/40002.lock",
+    });
+
+    const listChanges = browser.send.mock.calls
+      .map(([raw]: [string]) => JSON.parse(raw))
+      .filter((m: any) => m.type === "ide_list_changed");
+    expect(listChanges).toHaveLength(1);
+  });
+
+  it("ide:changed → every browser receives {type: ide_list_changed}", () => {
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    companionBus.emit("ide:changed", {
+      port: 40003,
+      ideName: "VS Code",
+      workspaceFolders: ["/tmp/proj-new"],
+      lockfilePath: "/tmp/.claude/ide/40003.lock",
+    });
+
+    const listChanges = browser.send.mock.calls
+      .map(([raw]: [string]) => JSON.parse(raw))
+      .filter((m: any) => m.type === "ide_list_changed");
+    expect(listChanges).toHaveLength(1);
+  });
+
+  it("broadcast payload is exactly {type: ide_list_changed} — no sensitive fields leak", () => {
+    // The ide:added event carries authToken-adjacent fields (lockfilePath,
+    // port, workspaceFolders, ideName). The browser broadcast must NOT
+    // include any of those — clients refetch through the authenticated
+    // REST endpoint which applies the same trust boundary as discovery.
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    browser.send.mockClear();
+
+    companionBus.emit("ide:added", {
+      port: 40004,
+      ideName: "Neovim",
+      workspaceFolders: ["/secret/path"],
+      lockfilePath: "/secret/path/.claude/ide/40004.lock",
+    });
+
+    const listChanges = browser.send.mock.calls
+      .map(([raw]: [string]) => JSON.parse(raw))
+      .filter((m: any) => m.type === "ide_list_changed");
+    expect(listChanges).toHaveLength(1);
+    // Exact-equality assertion is the strongest form — any additional key
+    // (e.g. a payload that copies the event verbatim) fails this test.
+    expect(listChanges[0]).toEqual({ type: "ide_list_changed" });
+  });
+});

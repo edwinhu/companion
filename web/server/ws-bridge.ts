@@ -51,6 +51,8 @@ import { companionBus } from "./event-bus.js";
 import { SessionStateMachine } from "./session-state-machine.js";
 import { metricsCollector } from "./metrics-collector.js";
 import { log } from "./logger.js";
+import { listAvailableIdes } from "./ide-discovery.js";
+import type { IdeBinding } from "./session-types.js";
 
 // ─── Bridge ───────────────────────────────────────────────────────────────────
 
@@ -88,6 +90,60 @@ export class WsBridge {
     "git_ahead",
     "git_behind",
   ];
+
+  /** Unsubscribe handle for the companionBus "ide:removed" listener (BIND-04). */
+  private ideRemovedUnsubscribe: (() => void) | null = null;
+
+  /**
+   * Unsubscribe handles for the Task 12 companionBus listeners that
+   * fan out `{type: "ide_list_changed"}` to every connected browser socket
+   * whenever the underlying IDE list mutates (added/removed/changed).
+   */
+  private ideListChangedUnsubscribes: Array<() => void> = [];
+
+  constructor() {
+    // BIND-04: when the IDE discovery layer detects that a lockfile has
+    // disappeared (process died, lockfile deleted, etc.), auto-unbind any
+    // session currently bound to that port. The frontend detects the
+    // bound→null transition via the existing session_update channel and
+    // renders the "IDE disconnected — rebind via /ide" banner (BIND-05).
+    this.ideRemovedUnsubscribe = companionBus.on("ide:removed", ({ port }) => {
+      for (const [sessionId, session] of this.sessions) {
+        if (session.state.ideBinding?.port === port) {
+          // Fire-and-forget: unbindIde is idempotent and never throws.
+          void this.unbindIde(sessionId);
+        }
+      }
+    });
+
+    // Task 12 (DISC-03 UX side): broadcast an IDE-list-changed ping to every
+    // connected browser whenever the discovery layer adds/removes/changes an
+    // IDE. Open IdePicker instances refetch GET /api/ide/available on receipt;
+    // closed pickers ignore the ping. The broadcast is payload-free — clients
+    // re-enter the same authenticated REST path discovery uses, so no
+    // sensitive fields (authToken, lockfilePath) leak over the browser WS.
+    const onIdeListChanged = () => this.broadcastIdeListChanged();
+    this.ideListChangedUnsubscribes.push(
+      companionBus.on("ide:added", onIdeListChanged),
+      companionBus.on("ide:removed", onIdeListChanged),
+      companionBus.on("ide:changed", onIdeListChanged),
+    );
+  }
+
+  /**
+   * Fan `{type: "ide_list_changed"}` out to every browser socket across
+   * every live session. Uses sendToBrowser (no sequencing) because this is
+   * a transient refresh ping — clients that missed it while offline will
+   * refetch the list on reconnect anyway.
+   */
+  private broadcastIdeListChanged(): void {
+    const msg: BrowserIncomingMessage = { type: "ide_list_changed" };
+    for (const session of this.sessions.values()) {
+      for (const ws of session.browserSockets) {
+        this.sendToBrowser(ws, msg);
+      }
+    }
+  }
 
   /** Set the Linear agent session ID on a Companion session and persist it. */
   setLinearSessionId(sessionId: string, linearSessionId: string): void {
@@ -959,6 +1015,126 @@ export class WsBridge {
       return;
     }
     this.routeBrowserMessage(session, { type: "mcp_set_servers", servers });
+  }
+
+  // ── IDE binding (Task 6: BIND-01/02/04/06, STATE-01) ─────────────────────
+  //
+  // MCP-merge decision: ws-bridge does NOT currently track the session's
+  // full MCP servers map (grep for `session.servers` / `dynamicMcpConfig`
+  // returns nothing in ws-bridge.ts — Session in ws-bridge-types.ts has no
+  // such field). The probe (scripts/probe-ide.ts, .planning/PLAN.md line 10)
+  // confirmed the CLI merges dynamic entries sent via mcp_set_servers with
+  // the user's existing MCP config rather than replacing them wholesale.
+  // Therefore we send only `{ ide: entry }` as the `servers` payload and
+  // rely on the CLI-side merge. If Companion ever starts tracking the full
+  // map (e.g. for an MCP manager UI), this code must be updated to merge
+  // server-side instead of relying on the CLI.
+
+  /**
+   * Bind a Companion session to a running IDE discovered via ~/.claude/ide/.
+   *
+   * Sends a single {type: "mcp_set_servers", servers: {ide: {...}}} through
+   * the existing backend adapter pipeline — NEVER a user_message containing
+   * "/ide" text (BIND-06). The /ide slash command stays client-side.
+   */
+  async bindIde(
+    sessionId: string,
+    port: number,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return { ok: false, error: "session not found" };
+
+    const ide = listAvailableIdes().find((i) => i.port === port);
+    if (!ide) return { ok: false, error: "unknown port" };
+
+    // Shape matches the CLI's internal /ide command (PROBE-02, see
+    // WEBSOCKET_PROTOCOL_REVERSED.md IDE appendix). The `type` field
+    // carries the transport flavor (ws-ide vs sse-ide); scope:"dynamic"
+    // tells the CLI this entry is ephemeral, not persisted to ~/.claude.json.
+    const ideServerEntry = {
+      type: ide.transport, // "ws-ide" or "sse-ide"
+      url: `${ide.transport === "ws-ide" ? "ws" : "http"}://127.0.0.1:${ide.port}`,
+      ideName: ide.ideName,
+      authToken: ide.authToken,
+      ideRunningInWindows: false,
+      scope: "dynamic",
+    };
+
+    // Send ONLY the ide entry — CLI merges with user's persistent MCP config.
+    // `servers` is typed as Record<string, McpServerConfig> in session-types,
+    // but the real wire shape for ws-ide/sse-ide carries extra fields
+    // (ideName, authToken, ideRunningInWindows, scope). Cast through unknown
+    // to bypass the narrow type — the adapter's handleOutgoingMcpSetServers
+    // accepts Record<string, unknown>.
+    if (session.backendAdapter) {
+      session.backendAdapter.send({
+        type: "mcp_set_servers",
+        servers: { ide: ideServerEntry } as unknown as Record<string, import("./session-types.js").McpServerConfig>,
+      });
+    }
+
+    const binding: IdeBinding = {
+      port: ide.port,
+      ideName: ide.ideName,
+      workspaceFolders: ide.workspaceFolders,
+      transport: ide.transport,
+      authToken: ide.authToken,
+      boundAt: Date.now(),
+      lockfilePath: ide.lockfilePath,
+    };
+
+    // Mutate session.state directly — same pattern used by setLinearSessionId
+    // (ws-bridge.ts line ~97) and the session_update handler (~line 447).
+    session.state.ideBinding = binding;
+    this.persistSession(session);
+    companionBus.emit("ide:binding-changed", { sessionId, binding });
+
+    // Browser sync via the existing session_update message (not a new
+    // variant — the plan explicitly forbids inventing one).
+    this.broadcastToBrowsers(session, {
+      type: "session_update",
+      session: { ideBinding: binding },
+    });
+
+    return { ok: true };
+  }
+
+  /**
+   * Unbind a session's IDE. Idempotent: missing session or already-null
+   * binding both return {ok: true}. Always sets `ideBinding` to an
+   * explicit `null` (not undefined) so the FE can distinguish
+   * "never bound" from "was bound, now disconnected" (BIND-04 / BIND-05).
+   */
+  async unbindIde(sessionId: string): Promise<{ ok: true }> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return { ok: true };
+
+    // If already null/undefined, no-op. Treat both as "nothing to do" —
+    // but do NOT short-circuit if the existing value is a real binding,
+    // so we always dispatch the mcp_set_servers tear-down.
+    const hadBinding = session.state.ideBinding != null;
+
+    if (hadBinding && session.backendAdapter) {
+      // Send empty `servers` map — ide-merge decision above: the CLI
+      // treats a missing `ide` key as unbind; we don't track the user's
+      // other MCP servers so we can't include them here. Documented above.
+      session.backendAdapter.send({
+        type: "mcp_set_servers",
+        servers: {} as Record<string, import("./session-types.js").McpServerConfig>,
+      });
+    }
+
+    // Explicit null (not undefined) — FE key to detect the transition.
+    session.state.ideBinding = null;
+    this.persistSession(session);
+    companionBus.emit("ide:binding-changed", { sessionId, binding: null });
+
+    this.broadcastToBrowsers(session, {
+      type: "session_update",
+      session: { ideBinding: null },
+    });
+
+    return { ok: true };
   }
 
   /** Send an initialize control request with context appended to the system prompt.

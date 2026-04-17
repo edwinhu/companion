@@ -1,0 +1,456 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import {
+  getAvailableIdes,
+  bindIde,
+  unbindIde,
+  api,
+  type AvailableIde,
+} from "../api.js";
+import type { IdeBinding } from "../types.js";
+
+/**
+ * IdePicker — modal list picker for Claude Code IDE integration (Task 10, UI-02/UI-03).
+ *
+ * Contract:
+ *   - Fetches `GET /api/ide/available?cwd=...` on open; the server returns
+ *     candidates ordered best-match first for the supplied cwd.
+ *   - Pressing Enter (or clicking an option) POSTs `/api/sessions/:id/ide`
+ *     via `bindIde`. On success → `onClose()`. On {ok:false} → inline error
+ *     + Retry (no close, no toast).
+ *   - `D` disconnects when `currentBinding` is non-null via `unbindIde`.
+ *   - Escape and the × close button are pure dismissals — they never touch
+ *     the API.
+ *
+ * State discipline:
+ *   - IdePicker DOES NOT mutate the Zustand store. `session_update`
+ *     broadcasts from the server are the single source of truth for
+ *     `ideBinding`. Keeping the picker store-free avoids split-brain
+ *     when concurrent binds race.
+ *
+ * Accessibility:
+ *   - role="dialog" + aria-modal="true" + aria-labelledby → title.
+ *   - List uses role="listbox"; items role="option" with aria-selected.
+ *   - Focus is trapped inside the panel on open; the panel receives
+ *     autofocus so keyboard shortcuts are immediately active.
+ */
+
+interface IdePickerProps {
+  sessionId: string;
+  /** Optional — used to rank the list (server-side longest-prefix match). */
+  cwd?: string;
+  /** If non-null, the picker renders the "currently bound" banner + Disconnect. */
+  currentBinding?: IdeBinding | null;
+  onClose: () => void;
+}
+
+/** Abbreviate an absolute path to `~/…` when it lives under `home`. */
+function shortenPath(abs: string, home: string | null): string {
+  if (!abs) return "";
+  if (home && (abs === home || abs.startsWith(home + "/"))) {
+    return "~" + abs.slice(home.length);
+  }
+  return abs;
+}
+
+function firstWorkspace(ide: { workspaceFolders: string[] }): string {
+  return ide.workspaceFolders[0] ?? "";
+}
+
+export function IdePicker({
+  sessionId,
+  cwd,
+  currentBinding = null,
+  onClose,
+}: IdePickerProps) {
+  const [ides, setIdes] = useState<AvailableIde[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [home, setHome] = useState<string | null>(null);
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [bindError, setBindError] = useState<string | null>(null);
+  const [lastPickedPort, setLastPickedPort] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const panelRef = useRef<HTMLDivElement>(null);
+  const titleId = useRef(
+    `ide-picker-title-${Math.random().toString(36).slice(2, 9)}`,
+  );
+
+  // ── Fetch IDE list on mount ────────────────────────────────────────────
+  const loadList = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const list = await getAvailableIdes(cwd);
+      setIdes(list);
+      setSelectedIndex(list.length > 0 ? 0 : -1);
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : "Failed to load IDEs");
+      setIdes([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [cwd]);
+
+  useEffect(() => {
+    loadList();
+  }, [loadList]);
+
+  // ── Live refresh on ide_list_changed (Task 12, DISC-03 UX side) ─────────
+  //
+  // ws.ts dispatches a window-level CustomEvent("companion:ide-list-changed")
+  // whenever the server broadcasts `{type: "ide_list_changed"}` — which fires
+  // on ide:added / ide:removed / ide:changed. Refetching through the same
+  // `loadList` the mount effect uses keeps server ordering intact and avoids
+  // introducing a second code path. No debouncing: discovery is already
+  // rate-limited by fs.watch, and the authenticated REST endpoint is cheap.
+  useEffect(() => {
+    const handler = () => {
+      void loadList();
+    };
+    window.addEventListener("companion:ide-list-changed", handler);
+    return () => {
+      window.removeEventListener("companion:ide-list-changed", handler);
+    };
+  }, [loadList]);
+
+  // Fetch home once — best-effort; used only for display formatting.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getHome()
+      .then((res) => {
+        if (!cancelled) setHome(res.home);
+      })
+      .catch(() => {
+        /* fall back to absolute paths */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // ── Focus trap on open ─────────────────────────────────────────────────
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    // Autofocus the panel so keyboard shortcuts register.
+    const timer = setTimeout(() => {
+      panel.focus();
+    }, 0);
+
+    function handleTab(e: KeyboardEvent) {
+      if (e.key !== "Tab") return;
+      const focusable = panel!.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener("keydown", handleTab);
+    return () => {
+      document.removeEventListener("keydown", handleTab);
+      clearTimeout(timer);
+      // Return focus to the opener on close.
+      previouslyFocused?.focus?.();
+    };
+  }, []);
+
+  // ── Pick handler (shared between Enter and click) ──────────────────────
+  const pick = useCallback(
+    async (port: number) => {
+      setBusy(true);
+      setBindError(null);
+      setLastPickedPort(port);
+      try {
+        const res = await bindIde(sessionId, port);
+        if (res.ok) {
+          onClose();
+        } else {
+          setBindError(res.error || "Bind failed");
+        }
+      } catch (e) {
+        setBindError(e instanceof Error ? e.message : "Bind failed");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [sessionId, onClose],
+  );
+
+  const disconnect = useCallback(async () => {
+    if (!currentBinding) return;
+    setBusy(true);
+    try {
+      await unbindIde(sessionId);
+      onClose();
+    } catch {
+      // Surface as a bind-style error; disconnect failures are rare.
+      setBindError("Disconnect failed");
+    } finally {
+      setBusy(false);
+    }
+  }, [currentBinding, sessionId, onClose]);
+
+  // ── Global keyboard: arrows / enter / escape / D ───────────────────────
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      // Allow typing in any text input inside the dialog to keep normal
+      // keystroke behavior (none today, but defensive).
+      const target = e.target as HTMLElement | null;
+      const isTextInput =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          (target as HTMLElement).isContentEditable);
+
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+
+      if (isTextInput) return;
+
+      if (e.key === "ArrowDown") {
+        if (ides.length === 0) return;
+        e.preventDefault();
+        setSelectedIndex((i) => (i + 1) % ides.length);
+      } else if (e.key === "ArrowUp") {
+        if (ides.length === 0) return;
+        e.preventDefault();
+        setSelectedIndex((i) => (i <= 0 ? ides.length - 1 : i - 1));
+      } else if (e.key === "Enter") {
+        if (ides.length === 0 || selectedIndex < 0) return;
+        e.preventDefault();
+        const entry = ides[selectedIndex];
+        if (entry) void pick(entry.port);
+      } else if (e.key === "d" || e.key === "D") {
+        if (!currentBinding) return;
+        e.preventDefault();
+        void disconnect();
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [ides, selectedIndex, currentBinding, pick, disconnect, onClose]);
+
+  // ── Retry the last failed pick ─────────────────────────────────────────
+  const retry = useCallback(() => {
+    if (lastPickedPort == null) return;
+    void pick(lastPickedPort);
+  }, [lastPickedPort, pick]);
+
+  const items = useMemo(
+    () =>
+      ides.map((ide) => ({
+        ide,
+        shortPath: shortenPath(firstWorkspace(ide), home),
+      })),
+    [ides, home],
+  );
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center"
+      style={{ backgroundColor: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)" }}
+      onClick={onClose}
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId.current}
+        tabIndex={-1}
+        className="w-full max-w-lg h-[min(520px,90dvh)] mx-0 sm:mx-4 flex flex-col bg-cc-bg border border-cc-border rounded-t-[14px] sm:rounded-[14px] shadow-2xl overflow-hidden focus:outline-none"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* ─── Header ───────────────────────────────────────────────── */}
+        <div className="flex items-center justify-between px-4 sm:px-5 py-3 sm:py-4 border-b border-cc-border shrink-0">
+          <h2
+            id={titleId.current}
+            className="text-sm font-semibold text-cc-fg font-sans-ui"
+          >
+            Select IDE
+          </h2>
+          <button
+            type="button"
+            aria-label="Close"
+            onClick={onClose}
+            className="w-6 h-6 flex items-center justify-center rounded-md text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer"
+          >
+            <svg
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              className="w-3.5 h-3.5"
+              aria-hidden="true"
+            >
+              <path d="M4 4l8 8M12 4l-8 8" strokeLinecap="round" />
+            </svg>
+          </button>
+        </div>
+
+        {/* ─── Currently-bound banner ───────────────────────────────── */}
+        {currentBinding && (
+          <div
+            className="px-4 py-2 border-b border-cc-border shrink-0 flex items-center gap-2 bg-cc-hover/40"
+            role="group"
+            aria-label="Current IDE binding"
+          >
+            <span className="text-xs text-cc-fg font-medium">
+              {currentBinding.ideName}
+            </span>
+            <span className="text-[11px] text-cc-muted font-mono-code truncate">
+              {shortenPath(firstWorkspace(currentBinding), home)}
+            </span>
+            <button
+              type="button"
+              onClick={disconnect}
+              disabled={busy}
+              aria-label={`Disconnect ${currentBinding.ideName}`}
+              className="ml-auto shrink-0 px-2 py-1 text-[11px] rounded-md text-cc-muted hover:text-cc-fg hover:bg-cc-hover transition-colors cursor-pointer disabled:opacity-50"
+            >
+              Disconnect
+            </button>
+          </div>
+        )}
+
+        {/* ─── Inline bind error ────────────────────────────────────── */}
+        {bindError && (
+          <div
+            className="px-4 py-2 border-b border-cc-border shrink-0 flex items-center gap-2 bg-cc-error/10"
+            role="alert"
+          >
+            <span className="text-xs text-cc-error flex-1">{bindError}</span>
+            <button
+              type="button"
+              onClick={retry}
+              disabled={busy}
+              className="shrink-0 px-2 py-1 text-[11px] font-medium rounded-md bg-cc-primary text-white hover:bg-cc-primary-hover transition-colors cursor-pointer disabled:opacity-50"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {/* ─── List ─────────────────────────────────────────────────── */}
+        <div className="flex-1 min-h-0 overflow-y-auto">
+          {loading ? (
+            <div
+              className="px-4 py-8 text-center text-xs text-cc-muted"
+              aria-busy="true"
+              aria-label="Loading IDEs"
+            >
+              Loading…
+            </div>
+          ) : loadError ? (
+            <div className="px-4 py-8 flex flex-col items-center gap-2 text-center">
+              <p className="text-xs text-cc-muted">{loadError}</p>
+              <button
+                type="button"
+                onClick={loadList}
+                className="mt-1 text-xs text-cc-primary hover:text-cc-primary-hover transition-colors cursor-pointer font-medium"
+              >
+                Retry
+              </button>
+            </div>
+          ) : items.length === 0 ? (
+            <div className="px-4 py-8 text-center">
+              <p className="text-xs text-cc-muted">
+                No IDE detected. Start one and try again.
+              </p>
+              <a
+                href="#"
+                className="mt-2 inline-block text-[11px] text-cc-primary hover:text-cc-primary-hover font-medium"
+                onClick={(e) => e.preventDefault()}
+              >
+                How to connect an IDE
+              </a>
+            </div>
+          ) : (
+            <ul role="listbox" aria-label="Available IDEs" className="list-none m-0 p-0">
+              {items.map(({ ide, shortPath }, i) => {
+                const selected = i === selectedIndex;
+                const isBestMatch = i === 0 && !!cwd;
+                return (
+                  <li
+                    key={`${ide.port}-${ide.lockfilePath}`}
+                    role="option"
+                    aria-selected={selected}
+                    onClick={() => {
+                      setSelectedIndex(i);
+                      void pick(ide.port);
+                    }}
+                    className={`flex items-center gap-2 px-4 py-2 cursor-pointer transition-colors ${
+                      selected ? "bg-cc-hover" : "hover:bg-cc-hover/60"
+                    }`}
+                  >
+                    <span className="text-xs font-medium text-cc-fg truncate">
+                      {ide.ideName}
+                    </span>
+                    <span
+                      className="text-[11px] text-cc-muted font-mono-code truncate"
+                      aria-hidden="true"
+                    >
+                      · {shortPath}
+                    </span>
+                    {isBestMatch && (
+                      <span className="ml-auto shrink-0 text-[10px] text-cc-primary font-medium uppercase tracking-wider">
+                        matches cwd
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+
+        {/* ─── Keyboard hint bar ────────────────────────────────────── */}
+        <div className="px-4 py-1.5 border-t border-cc-border shrink-0 flex items-center gap-3 text-[10px] text-cc-muted select-none">
+          <span>
+            <kbd className="px-1 py-0.5 rounded bg-cc-hover text-cc-muted font-mono-code text-[9px]">
+              &uarr;&darr;
+            </kbd>{" "}
+            navigate
+          </span>
+          <span>
+            <kbd className="px-1 py-0.5 rounded bg-cc-hover text-cc-muted font-mono-code text-[9px]">
+              &crarr;
+            </kbd>{" "}
+            select
+          </span>
+          {currentBinding && (
+            <span>
+              <kbd className="px-1 py-0.5 rounded bg-cc-hover text-cc-muted font-mono-code text-[9px]">
+                D
+              </kbd>{" "}
+              disconnect
+            </span>
+          )}
+          <span className="ml-auto">
+            <kbd className="px-1 py-0.5 rounded bg-cc-hover text-cc-muted font-mono-code text-[9px]">
+              esc
+            </kbd>{" "}
+            close
+          </span>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}

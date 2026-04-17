@@ -825,6 +825,95 @@ export async function autoAuth(): Promise<string | null> {
   }
 }
 
+// ─── IDE integration (Task 9 — STATE-02) ─────────────────────────────────────
+//
+// `AvailableIde` mirrors the server wire shape for `GET /api/ide/available`
+// (see `web/server/routes/system-routes.ts`). `authToken` is deliberately
+// stripped server-side (BIND-03) and therefore NOT on this client type.
+// It is defined inline here (not in types.ts) because it's strictly a REST
+// wire shape, matching the existing convention for response DTOs like
+// `ClaudeDiscoveredSession`, `LinearIssue`, etc. `IdeBinding` — which IS
+// persisted as part of `SessionState` — continues to live in types.ts.
+export interface AvailableIde {
+  port: number;
+  ideName: string;
+  workspaceFolders: string[];
+  transport: "ws-ide" | "sse-ide";
+  lockfilePath: string;
+  lockfileMtime: number;
+}
+
+/**
+ * List all currently-discovered IDEs. When `cwd` is passed, the server
+ * ranks candidates by longest-prefix workspace match (see MATCH-01/02);
+ * otherwise results are ordered by lockfile mtime desc.
+ *
+ * Throws on non-2xx — the IdePicker treats that as "unable to load" and
+ * renders a retry affordance.
+ */
+export async function getAvailableIdes(cwd?: string): Promise<AvailableIde[]> {
+  const qs = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
+  return get<AvailableIde[]>(`/ide/available${qs}`);
+}
+
+/**
+ * Bind the given session to an IDE discovered on `port`.
+ *
+ * Uses a raw fetch (not the shared `post` helper) because 400 / 404
+ * responses here are EXPECTED UX states — "port no longer available",
+ * "session vanished between discovery and pick" — and must NOT throw.
+ * Any other transport error still throws.
+ */
+export async function bindIde(
+  sessionId: string,
+  port: number,
+): Promise<
+  | { ok: true; binding: import("./types.js").IdeBinding }
+  | { ok: false; error: string }
+> {
+  const path = `/sessions/${encodeURIComponent(sessionId)}/ide`;
+  const startedAt = nowMs();
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+      body: JSON.stringify({ port }),
+    });
+    if (res.ok) {
+      trackApiSuccess("POST", path, nowMs() - startedAt, res.status);
+      const body = (await res.json()) as {
+        ok: true;
+        binding: import("./types.js").IdeBinding;
+      };
+      return body;
+    }
+    // 401 still triggers global auth reset before we return a soft failure.
+    handle401(res.status);
+    const err = await res
+      .json()
+      .catch(() => ({ error: res.statusText } as { error?: string }));
+    const message = err.error || res.statusText;
+    // Report the failure to analytics as a soft failure (we don't throw).
+    trackApiFailure("POST", path, nowMs() - startedAt, new Error(message), res.status);
+    return { ok: false, error: message };
+  } catch (error) {
+    // Transport-level failure (network, JSON parse on success path, etc.).
+    trackApiFailure("POST", path, nowMs() - startedAt, error);
+    throw error;
+  }
+}
+
+/**
+ * Clear any IDE binding on a session. Idempotent at the server, but 404
+ * (session truly gone) DOES throw — callers should distinguish "already
+ * cleared" (200) from "no such session".
+ */
+export async function unbindIde(
+  sessionId: string,
+): Promise<{ ok: true }> {
+  return del<{ ok: true }>(`/sessions/${encodeURIComponent(sessionId)}/ide`);
+}
+
 export async function verifyAuthToken(token: string): Promise<boolean> {
   try {
     const res = await fetch(`${BASE}/auth/verify`, {

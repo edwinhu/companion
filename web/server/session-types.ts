@@ -360,7 +360,10 @@ export type BrowserIncomingMessageBase =
   | { type: "session_phase"; phase: SessionPhase; previousPhase: SessionPhase }
   | { type: "prompt_suggestion"; suggestions: string[] }
   | { type: "streamlined_text"; text: string }
-  | { type: "streamlined_tool_use_summary"; tool_summary: string };
+  | { type: "streamlined_tool_use_summary"; tool_summary: string }
+  // Broadcast to all browsers when the available-IDE list changes (add/remove/update).
+  // IdePicker instances refetch `GET /api/ide/available` on receipt.
+  | { type: "ide_list_changed" };
 
 export type BrowserIncomingMessage = BrowserIncomingMessageBase & { seq?: number };
 
@@ -374,6 +377,34 @@ export interface BufferedBrowserEvent {
 // ─── Session State ────────────────────────────────────────────────────────────
 
 export type BackendType = "claude" | "codex";
+
+/**
+ * Binding between a Companion session and a running IDE (via ~/.claude/ide/ lockfile).
+ *
+ * Tri-state semantics on `SessionState.ideBinding`:
+ *   - `undefined` — never set (e.g. Codex session or freshly created Claude session)
+ *   - `null`      — explicitly unbound (BIND-04: lockfile disappeared, FE detects transition)
+ *   - `IdeBinding` — active binding
+ *
+ * `authToken` is present at runtime but NEVER persisted to disk (see Task 8 /
+ * session-store.ts). It is re-read from the lockfile on next bind operation.
+ */
+export interface IdeBinding {
+  /** TCP port from lockfile filename or inside JSON. */
+  port: number;
+  /** Human-readable IDE name, e.g. "Neovim", "Visual Studio Code". */
+  ideName: string;
+  /** Absolute workspace roots reported by the IDE. */
+  workspaceFolders: string[];
+  /** Transport advertised in the lockfile. */
+  transport: "ws-ide" | "sse-ide";
+  /** Auth token from lockfile — runtime only, never persisted. */
+  authToken?: string;
+  /** Epoch milliseconds when the binding was established. */
+  boundAt: number;
+  /** Absolute path to the source `.lock` file. */
+  lockfilePath: string;
+}
 
 export interface SessionState {
   session_id: string;
@@ -428,6 +459,11 @@ export interface SessionState {
   aiValidationAutoDeny?: boolean | null;
   /** If this session is linked to a Linear agent session */
   linearSessionId?: string;
+  /**
+   * Active IDE binding, or explicit-unbind state. See `IdeBinding` docstring
+   * for the tri-state semantics (undefined vs null vs object).
+   */
+  ideBinding?: IdeBinding | null;
 }
 
 // ─── MCP Types ───────────────────────────────────────────────────────────────

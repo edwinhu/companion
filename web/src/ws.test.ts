@@ -2006,3 +2006,50 @@ describe("handleMessage: assistant clears only completed tool progress", () => {
     expect(progress?.get("tu-b")).toEqual({ toolName: "Glob", elapsedSeconds: 2 });
   });
 });
+
+// ===========================================================================
+// Task 12 (DISC-03 UX side): ide_list_changed → window CustomEvent
+// ===========================================================================
+//
+// Contract: when the server broadcasts `{type: "ide_list_changed"}` over the
+// browser WebSocket, ws.ts dispatches a DOM CustomEvent named
+// "companion:ide-list-changed" on window. IdePicker instances subscribe to
+// that event on mount to refetch `GET /api/ide/available`. Using the browser
+// event bus (vs a module emitter) piggybacks on an already-present pattern
+// for cross-component notifications and costs zero dependencies.
+describe("handleMessage: ide_list_changed dispatches companion:ide-list-changed CustomEvent", () => {
+  it("fires the event exactly once per incoming ide_list_changed message", () => {
+    wsModule.connectSession("s1");
+    fireMessage({ type: "session_init", session: makeSession("s1") });
+
+    const listener = vi.fn();
+    window.addEventListener("companion:ide-list-changed", listener);
+    try {
+      fireMessage({ type: "ide_list_changed" });
+      expect(listener).toHaveBeenCalledTimes(1);
+      const evt = listener.mock.calls[0][0] as Event;
+      expect(evt.type).toBe("companion:ide-list-changed");
+    } finally {
+      window.removeEventListener("companion:ide-list-changed", listener);
+    }
+  });
+
+  it("fires once per subsequent ide_list_changed (not cumulative)", () => {
+    // Multiple dispatches independently notify — important so that arbitrary
+    // add/remove/change events observed while the picker is closed don't
+    // queue up work that IdePicker has to deduplicate.
+    wsModule.connectSession("s1");
+    fireMessage({ type: "session_init", session: makeSession("s1") });
+
+    const listener = vi.fn();
+    window.addEventListener("companion:ide-list-changed", listener);
+    try {
+      fireMessage({ type: "ide_list_changed" });
+      fireMessage({ type: "ide_list_changed" });
+      fireMessage({ type: "ide_list_changed" });
+      expect(listener).toHaveBeenCalledTimes(3);
+    } finally {
+      window.removeEventListener("companion:ide-list-changed", listener);
+    }
+  });
+});

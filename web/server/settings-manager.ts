@@ -9,6 +9,17 @@ import { COMPANION_HOME } from "./paths.js";
 
 export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6";
 
+// Claude Opus 4.7 removed `temperature`/`top_p`/`top_k` — sending any of them
+// returns 400. Callers that hit the Anthropic API directly (auto-namer,
+// ai-validator) must omit sampling params when the configured model is 4.7.
+// The `opus` short alias floats to whatever the CLI considers the latest Opus
+// (currently 4.7), so treat it the same.
+export function supportsSamplingParams(model: string): boolean {
+  const m = model.trim().toLowerCase();
+  if (m === "opus") return false;
+  return !m.startsWith("claude-opus-4-7");
+}
+
 export type UpdateChannel = "stable" | "prerelease";
 
 export interface CompanionSettings {

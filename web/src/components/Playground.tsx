@@ -718,7 +718,7 @@ export function Playground() {
     const session: SessionState = {
       session_id: sessionId,
       backend_type: "claude",
-      model: "claude-sonnet-4-5",
+      model: "claude-sonnet-4-6",
       cwd: "/Users/stan/Dev/project",
       tools: ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebSearch"],
       permissionMode: "default",

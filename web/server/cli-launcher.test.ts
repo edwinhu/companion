@@ -208,12 +208,12 @@ describe("launch", () => {
   });
 
   it("passes --model when provided", () => {
-    launcher.launch({ model: "claude-opus-4-20250514", cwd: "/tmp" });
+    launcher.launch({ model: "claude-opus-4-7", cwd: "/tmp" });
 
     const [cmdAndArgs] = mockSpawn.mock.calls[0];
     const modelIdx = cmdAndArgs.indexOf("--model");
     expect(modelIdx).toBeGreaterThan(-1);
-    expect(cmdAndArgs[modelIdx + 1]).toBe("claude-opus-4-20250514");
+    expect(cmdAndArgs[modelIdx + 1]).toBe("claude-opus-4-7");
   });
 
   it("passes --permission-mode when provided", () => {

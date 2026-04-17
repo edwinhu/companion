@@ -68,7 +68,7 @@ afterEach(() => {
 function makeSession(id: string): SessionState {
   return {
     session_id: id,
-    model: "claude-opus-4-20250514",
+    model: "claude-opus-4-7",
     cwd: "/home/user",
     tools: ["Bash", "Read"],
     permissionMode: "default",
@@ -361,7 +361,7 @@ describe("handleMessage: session_init", () => {
 
     const state = useStore.getState();
     expect(state.sessions.has("s1")).toBe(true);
-    expect(state.sessions.get("s1")!.model).toBe("claude-opus-4-20250514");
+    expect(state.sessions.get("s1")!.model).toBe("claude-opus-4-7");
     expect(state.cliConnected.get("s1")).toBe(true);
     expect(state.sessionStatus.get("s1")).toBe("idle");
     expect(state.sessionNames.get("s1")).toBe("Test Session");
@@ -469,7 +469,7 @@ describe("handleMessage: assistant", () => {
         id: "msg-1",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [{ type: "text", text: "Hello world" }],
         stop_reason: "end_turn",
         usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -509,7 +509,7 @@ describe("handleMessage: assistant", () => {
         id: "msg-final-1",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [{ type: "text", text: "Final answer" }],
         stop_reason: "end_turn",
         usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -534,7 +534,7 @@ describe("handleMessage: assistant", () => {
         id: "msg-shared-1",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [{ type: "thinking", thinking: "Thinking step" }],
         stop_reason: null,
         usage: { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -548,7 +548,7 @@ describe("handleMessage: assistant", () => {
         id: "msg-shared-1",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [{ type: "text", text: "Final answer text" }],
         stop_reason: "end_turn",
         usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -573,7 +573,7 @@ describe("handleMessage: assistant", () => {
         id: "msg-tool-1",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [
           {
             type: "tool_use",
@@ -601,7 +601,7 @@ describe("handleMessage: assistant", () => {
         id: "msg-tool-2",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [
           {
             type: "tool_use",
@@ -629,7 +629,7 @@ describe("handleMessage: assistant", () => {
         id: "msg-tool-3",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [
           {
             type: "tool_use",
@@ -657,7 +657,7 @@ describe("handleMessage: assistant", () => {
         id: "msg-tool-dedupe",
         type: "message" as const,
         role: "assistant" as const,
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [
           {
             type: "tool_use" as const,
@@ -1190,7 +1190,7 @@ describe("handleMessage: message_history", () => {
             id: "msg-hist-1",
             type: "message",
             role: "assistant",
-            model: "claude-opus-4-20250514",
+            model: "claude-opus-4-7",
             content: [{ type: "text", text: "4" }],
             stop_reason: "end_turn",
             usage: { input_tokens: 5, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -1304,7 +1304,7 @@ describe("handleMessage: message_history", () => {
             id: "msg-1",
             type: "message",
             role: "assistant",
-            model: "claude-opus-4-20250514",
+            model: "claude-opus-4-7",
             content: [{ type: "text", text: "hi" }],
             stop_reason: "end_turn",
             usage: { input_tokens: 5, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -1337,7 +1337,7 @@ describe("handleMessage: message_history", () => {
             id: "msg-shared-history-1",
             type: "message",
             role: "assistant",
-            model: "claude-opus-4-20250514",
+            model: "claude-opus-4-7",
             content: [{ type: "thinking", thinking: "Planning..." }],
             stop_reason: null,
             usage: { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -1351,7 +1351,7 @@ describe("handleMessage: message_history", () => {
             id: "msg-shared-history-1",
             type: "message",
             role: "assistant",
-            model: "claude-opus-4-20250514",
+            model: "claude-opus-4-7",
             content: [{ type: "text", text: "Final from history" }],
             stop_reason: "end_turn",
             usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -1383,7 +1383,7 @@ describe("handleMessage: message_history", () => {
             id: "msg-1",
             type: "message",
             role: "assistant",
-            model: "claude-opus-4-20250514",
+            model: "claude-opus-4-7",
             content: [{ type: "text", text: "hi" }],
             stop_reason: "end_turn",
             usage: { input_tokens: 5, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
@@ -1421,7 +1421,7 @@ describe("handleMessage: message_history", () => {
             id: "msg-tool-history-1",
             type: "message",
             role: "assistant",
-            model: "claude-opus-4-20250514",
+            model: "claude-opus-4-7",
             content: [
               { type: "tool_use", id: "tool-hist-1", name: "Bash", input: { command: "bun test" } },
             ],
@@ -1437,7 +1437,7 @@ describe("handleMessage: message_history", () => {
             id: "msg-tool-history-2",
             type: "message",
             role: "assistant",
-            model: "claude-opus-4-20250514",
+            model: "claude-opus-4-7",
             content: [
               { type: "tool_result", tool_use_id: "tool-hist-1", content: "done" },
             ],
@@ -1557,7 +1557,7 @@ describe("task extraction: TodoWrite", () => {
         id: "msg-tasks-1",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [
           {
             type: "tool_use",
@@ -1601,7 +1601,7 @@ describe("task extraction: TaskCreate", () => {
         id: "msg-tc-1",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [
           {
             type: "tool_use",
@@ -1639,7 +1639,7 @@ describe("task extraction: TaskUpdate", () => {
         id: "msg-tc-2",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [
           {
             type: "tool_use",
@@ -1664,7 +1664,7 @@ describe("task extraction: TaskUpdate", () => {
         id: "msg-tu-1",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [
           {
             type: "tool_use",
@@ -1989,7 +1989,7 @@ describe("handleMessage: assistant clears only completed tool progress", () => {
         id: "msg-1",
         type: "message",
         role: "assistant",
-        model: "claude-opus-4-20250514",
+        model: "claude-opus-4-7",
         content: [
           { type: "tool_result", tool_use_id: "tu-a", content: "3 matches" },
         ] as ContentBlock[],

@@ -1051,14 +1051,30 @@ export class WsBridge {
     // WEBSOCKET_PROTOCOL_REVERSED.md IDE appendix). The `type` field
     // carries the transport flavor (ws-ide vs sse-ide); scope:"dynamic"
     // tells the CLI this entry is ephemeral, not persisted to ~/.claude.json.
+    const host = session.state.is_containerized ? "host.docker.internal" : "127.0.0.1";
     const ideServerEntry = {
       type: ide.transport, // "ws-ide" or "sse-ide"
-      url: `${ide.transport === "ws-ide" ? "ws" : "http"}://127.0.0.1:${ide.port}`,
+      url: `${ide.transport === "ws-ide" ? "ws" : "http"}://${host}:${ide.port}`,
       ideName: ide.ideName,
       authToken: ide.authToken,
       ideRunningInWindows: false,
       scope: "dynamic",
     };
+
+    // Use the sanitized ideName (lowercase, alphanumeric only) as the MCP server
+    // key instead of the literal "ide". This is critical for tool exposure:
+    //
+    // The Claude Code CLI binary contains a hardcoded filter (`_35`) that blocks
+    // all MCP tools prefixed `mcp__ide__*` EXCEPT `getDiagnostics` and
+    // `executeCode`. When the server is named "ide", the CLI prefixes every tool
+    // as `mcp__ide__<name>` — the filter then silently drops 8 of 10 tools.
+    //
+    // Using a name like "neovim" causes the CLI to prefix tools as
+    // `mcp__neovim__*` — no match against the filter, all 10 tools pass through.
+    //
+    // Reference: HYPOTHESES.md H4 (confirmed) + Option 3 (confirmed fix).
+    // Regression test: BIND-07 in ws-bridge.test.ts.
+    const serverKey = ide.ideName.toLowerCase().replace(/[^a-z0-9]/g, "");
 
     // Send ONLY the ide entry — CLI merges with user's persistent MCP config.
     // `servers` is typed as Record<string, McpServerConfig> in session-types,
@@ -1069,7 +1085,7 @@ export class WsBridge {
     if (session.backendAdapter) {
       session.backendAdapter.send({
         type: "mcp_set_servers",
-        servers: { ide: ideServerEntry } as unknown as Record<string, import("./session-types.js").McpServerConfig>,
+        servers: { [serverKey]: ideServerEntry } as unknown as Record<string, import("./session-types.js").McpServerConfig>,
       });
     }
 

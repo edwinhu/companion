@@ -4882,10 +4882,15 @@ describe("IDE binding (bindIde / unbindIde)", () => {
   });
 
   // BIND-01 core contract: bindIde must translate into exactly one
-  // mcp_set_servers carrying the `ide` entry with the expected shape.
+  // mcp_set_servers with the IDE server entry keyed by the sanitized ideName.
   // We assert on the PROTOCOL payload, not on a derivative — per the plan,
   // this pins "CLI sees mcp_set_servers, never /ide text".
-  it("bindIde sends mcp_set_servers with an `ide` entry containing transport/url/ideName/authToken/scope", async () => {
+  //
+  // NOTE: The key must NOT be the literal "ide" — see BIND-07 for why.
+  // The CLI's _35 filter blocks all mcp__ide__* tools except getDiagnostics
+  // and executeCode. Using the sanitized ideName (e.g. "neovim") causes the
+  // CLI to prefix tools as mcp__neovim__* which bypasses the filter entirely.
+  it("bindIde sends mcp_set_servers with a sanitized-ideName entry containing transport/url/ideName/authToken/scope", async () => {
     await seedIde({ port: 42424, ideName: "Neovim", authToken: "secret-t" });
 
     const { adapter, sendCalls } = makeFakeAdapter();
@@ -4900,8 +4905,10 @@ describe("IDE binding (bindIde / unbindIde)", () => {
     const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
     expect(mcpCalls).toHaveLength(1);
     const payload = mcpCalls[0];
-    expect(payload.servers.ide).toBeDefined();
-    expect(payload.servers.ide).toMatchObject({
+    // The server must be keyed by the sanitized ideName, not the literal "ide".
+    const serverEntry = payload.servers["neovim"];
+    expect(serverEntry).toBeDefined();
+    expect(serverEntry).toMatchObject({
       type: "ws-ide",
       url: "ws://127.0.0.1:42424",
       ideName: "Neovim",
@@ -5091,6 +5098,73 @@ describe("IDE binding (bindIde / unbindIde)", () => {
         m.content.includes("/ide"),
     );
     expect(leaked).toEqual([]);
+  });
+
+  // BIND-07 regression: the CLI binary contains a hardcoded filter (`_35`) that
+  // blocks all MCP tools prefixed `mcp__ide__*` except `getDiagnostics` and
+  // `executeCode`. When we name the MCP server `"ide"`, the CLI prefixes ALL
+  // tools as `mcp__ide__<name>` and the filter strips 8 of 10.
+  //
+  // Fix: use the sanitized ideName (lowercase, alphanumeric only) as the server
+  // key instead of the literal string `"ide"`. Tools then get the prefix
+  // `mcp__<idename>__<tool>` which does NOT match `mcp__ide__*`, so all tools
+  // pass the filter.
+  //
+  // This test asserts:
+  //   (a) The `servers` object does NOT have a key literally named `"ide"`.
+  //   (b) The `servers` object HAS a key equal to the sanitized ideName.
+  //   (c) Different ideName values produce the correct sanitized key (e.g.
+  //       "VS Code" → "vscode", "Zed" → "zed").
+  //
+  // Why (a) matters: if "ide" is ever re-introduced as the key, the CLI filter
+  // silently drops 8 tools with no error — this test is the only guard.
+  it("BIND-07: bindIde uses sanitized ideName (not 'ide') as mcp_set_servers key to bypass CLI tool filter", async () => {
+    // Test with "Neovim" → expected key "neovim"
+    await seedIde({ port: 56001, ideName: "Neovim", authToken: "tok-bind07" });
+
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+    sendCalls.length = 0;
+
+    await bridge.bindIde("s1", 56001);
+
+    const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
+    expect(mcpCalls).toHaveLength(1);
+    const servers = mcpCalls[0].servers as Record<string, unknown>;
+
+    // (a) Must NOT use the literal "ide" key — that triggers the CLI's _35 filter
+    // which allows only getDiagnostics and executeCode from mcp__ide__* tools.
+    expect(servers.ide).toBeUndefined();
+
+    // (b) Must use the sanitized ideName as key — "Neovim" → "neovim"
+    const expectedKey = "neovim";
+    expect(servers[expectedKey]).toBeDefined();
+    expect(servers[expectedKey]).toMatchObject({
+      type: "ws-ide",
+      ideName: "Neovim",
+      authToken: "tok-bind07",
+    });
+  });
+
+  it("BIND-07b: sanitized server key handles multi-word and mixed-case ideName", async () => {
+    // "VS Code" → "vscode" (spaces stripped, lowercased)
+    await seedIde({ port: 56002, ideName: "VS Code", authToken: "tok-bind07b" });
+
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s2");
+    bridge.attachBackendAdapter("s2", adapter, "claude");
+    sendCalls.length = 0;
+
+    await bridge.bindIde("s2", 56002);
+
+    const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
+    expect(mcpCalls).toHaveLength(1);
+    const servers = mcpCalls[0].servers as Record<string, unknown>;
+
+    expect(servers.ide).toBeUndefined();
+    expect(servers["vscode"]).toBeDefined();
+    expect(servers["vscode"]).toMatchObject({ ideName: "VS Code" });
   });
 });
 

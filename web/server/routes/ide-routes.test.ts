@@ -450,10 +450,14 @@ describe("POST /api/sessions/:id/ide", () => {
     });
     expect(res.status).toBe(200);
 
-    // Exactly one mcp_set_servers call; it carries the `ide` entry.
+    // Exactly one mcp_set_servers call; it carries the sanitized ideName as key
+    // (not the literal "ide"). BIND-07: using "ide" triggers the CLI's _35 filter
+    // that silently drops 8 of 10 tools. The fix uses ideName.toLowerCase()
+    // stripped to alphanumeric — "Neovim" → "neovim" — so tools are prefixed
+    // mcp__neovim__* and bypass the filter entirely.
     const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
     expect(mcpCalls).toHaveLength(1);
-    expect(mcpCalls[0].servers).toHaveProperty("ide");
+    expect(mcpCalls[0].servers).toHaveProperty("neovim"); // "Neovim" → sanitized key
 
     // Zero user_message calls containing "/ide" text. We check permissively
     // because user_message payloads vary in shape across Claude vs. Codex.

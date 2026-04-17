@@ -78,6 +78,51 @@ describe("parseLockfile", () => {
     expect(parseLockfile("42")).toBeNull();
   });
 
+  /**
+   * Security: reject pid values that would make `process.kill(pid, 0)`
+   * misbehave in isPidAlive (issue #5).
+   *
+   * process.kill semantics on macOS / Linux:
+   *   - pid  >  0  → signal that process (ESRCH if dead)
+   *   - pid === 0  → signal EVERY process in the CALLER's group (always alive!)
+   *   - pid <   0  → signal EVERY process in group |pid| (likely alive)
+   *
+   * A lockfile with pid=0 or pid=-1 (garbage or malicious) would therefore
+   * be reported as "alive" even when the backing IDE is long gone. That
+   * keeps stale lockfiles visible in the IdePicker, and worse, a bind
+   * against them still dispatches mcp_set_servers to a dead port.
+   *
+   * Contract: parseLockfile returns null for pid <= 0.
+   */
+  it("returns null when pid is <= 0 (defends isPidAlive against process.kill(0) group-signal)", () => {
+    const withZero = JSON.stringify({
+      pid: 0,
+      workspaceFolders: ["/tmp"],
+      ideName: "Ghost",
+      transport: "ws",
+    });
+    const withNegative = JSON.stringify({
+      pid: -1,
+      workspaceFolders: ["/tmp"],
+      ideName: "Ghost",
+      transport: "ws",
+    });
+    expect(parseLockfile(withZero)).toBeNull();
+    expect(parseLockfile(withNegative)).toBeNull();
+  });
+
+  it("returns null when pid is not an integer (e.g. 1.5, NaN)", () => {
+    // parseLockfile already rejects NaN via Number.isFinite, but a
+    // non-integer float could still slip past. Tighten to integer-only.
+    const withFloat = JSON.stringify({
+      pid: 1.5,
+      workspaceFolders: ["/tmp"],
+      ideName: "Weird",
+      transport: "ws",
+    });
+    expect(parseLockfile(withFloat)).toBeNull();
+  });
+
   it("tolerates unknown fields without throwing", () => {
     // Forward-compat: future CLI versions may add fields. The parser
     // should ignore them and surface the known ones.

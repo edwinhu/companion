@@ -71,6 +71,18 @@ export function IdePicker({
   const [bindError, setBindError] = useState<string | null>(null);
   const [lastPickedPort, setLastPickedPort] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  // Issue #8 refinement (codex adversarial review): `busy` in useState is a
+  // stale closure across same-tick dispatches (Enter+D before rerender).
+  // A ref flipped BEFORE the async await is the only guard that prevents a
+  // second concurrent op from slipping past the React render cycle.
+  const busyRef = useRef(false);
+  // Issue #9: bind and disconnect both surface via the same "Retry" affordance.
+  // Without tracking which op failed, Retry would always retry bind — the
+  // opposite of what the user asked for when a disconnect fails. Track the
+  // last failed operation so Retry dispatches to the correct handler.
+  const [lastFailedOp, setLastFailedOp] = useState<"bind" | "disconnect" | null>(
+    null,
+  );
 
   const panelRef = useRef<HTMLDivElement>(null);
   const titleId = useRef(
@@ -171,6 +183,10 @@ export function IdePicker({
   // ── Pick handler (shared between Enter and click) ──────────────────────
   const pick = useCallback(
     async (port: number) => {
+      // Ref-first guard (Issue #8): set BEFORE any await so same-tick
+      // concurrent dispatches see the flipped ref and early-return.
+      if (busyRef.current) return;
+      busyRef.current = true;
       setBusy(true);
       setBindError(null);
       setLastPickedPort(port);
@@ -180,10 +196,13 @@ export function IdePicker({
           onClose();
         } else {
           setBindError(res.error || "Bind failed");
+          setLastFailedOp("bind");
         }
       } catch (e) {
         setBindError(e instanceof Error ? e.message : "Bind failed");
+        setLastFailedOp("bind");
       } finally {
+        busyRef.current = false;
         setBusy(false);
       }
     },
@@ -192,14 +211,21 @@ export function IdePicker({
 
   const disconnect = useCallback(async () => {
     if (!currentBinding) return;
+    // Same ref-first guard as pick() — prevents a same-tick Enter+D from
+    // shipping both bind AND disconnect concurrently.
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
+    setBindError(null);
     try {
       await unbindIde(sessionId);
       onClose();
-    } catch {
-      // Surface as a bind-style error; disconnect failures are rare.
-      setBindError("Disconnect failed");
+    } catch (e) {
+      // Surface as an inline error + Retry (same UX as bind failure).
+      setBindError(e instanceof Error ? e.message : "Disconnect failed");
+      setLastFailedOp("disconnect");
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }, [currentBinding, sessionId, onClose]);
@@ -224,6 +250,33 @@ export function IdePicker({
 
       if (isTextInput) return;
 
+      // Issue #7 (widened per codex adversarial review): ANY interactive
+      // element inside the dialog panel (not just <button>) should receive
+      // its native activation on Enter/Space. Previously the guard matched
+      // only HTMLButtonElement, so an <a>/<input>/[role=button] inside the
+      // panel would both fire its own activation AND dispatch the global
+      // pick/disconnect handler (split-brain).
+      //
+      // We now check whether the event TARGET (not just activeElement) is
+      // contained by the dialog panel. If it is AND the target is
+      // interactive (button/link/input/select/[role=button]), we defer to
+      // native behavior and early-return from our global handler.
+      // The focus trap + aria-modal guarantee that targets are practically
+      // always inside the panel while the dialog is open; the check is
+      // defensive against portal-mounted dialogs where that invariant can
+      // break under Tab/shift-Tab across boundaries.
+      const targetInsideDialog =
+        !!target && !!panelRef.current && panelRef.current.contains(target);
+      const interactiveFocusedInDialog =
+        targetInsideDialog &&
+        (target instanceof HTMLButtonElement ||
+          target instanceof HTMLAnchorElement ||
+          target instanceof HTMLInputElement ||
+          target instanceof HTMLTextAreaElement ||
+          target instanceof HTMLSelectElement ||
+          (target instanceof HTMLElement &&
+            target.getAttribute("role") === "button"));
+
       if (e.key === "ArrowDown") {
         if (ides.length === 0) return;
         e.preventDefault();
@@ -233,25 +286,35 @@ export function IdePicker({
         e.preventDefault();
         setSelectedIndex((i) => (i <= 0 ? ides.length - 1 : i - 1));
       } else if (e.key === "Enter") {
+        if (interactiveFocusedInDialog) return; // Issue #7
+        if (busy) return; // Issue #8: guard against Enter-spam during in-flight bind.
         if (ides.length === 0 || selectedIndex < 0) return;
         e.preventDefault();
         const entry = ides[selectedIndex];
         if (entry) void pick(entry.port);
       } else if (e.key === "d" || e.key === "D") {
         if (!currentBinding) return;
+        if (interactiveFocusedInDialog) return; // Issue #7 (same reasoning as Enter)
+        if (busy) return; // Issue #8 — keyboard path must honor busy too.
         e.preventDefault();
         void disconnect();
       }
     }
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [ides, selectedIndex, currentBinding, pick, disconnect, onClose]);
+  }, [ides, selectedIndex, currentBinding, pick, disconnect, onClose, busy]);
 
-  // ── Retry the last failed pick ─────────────────────────────────────────
+  // ── Retry the last failed operation (bind OR disconnect) ───────────────
+  // Issue #9: when disconnect fails, Retry must re-attempt disconnect — not
+  // silently switch to bind. Dispatch based on which op failed.
   const retry = useCallback(() => {
+    if (lastFailedOp === "disconnect") {
+      void disconnect();
+      return;
+    }
     if (lastPickedPort == null) return;
     void pick(lastPickedPort);
-  }, [lastPickedPort, pick]);
+  }, [lastFailedOp, lastPickedPort, pick, disconnect]);
 
   const items = useMemo(
     () =>

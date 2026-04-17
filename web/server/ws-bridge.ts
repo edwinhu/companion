@@ -56,6 +56,35 @@ import type { IdeBinding } from "./session-types.js";
 
 // ─── Bridge ───────────────────────────────────────────────────────────────────
 
+/**
+ * Strip `authToken` from an IdeBinding before it crosses ANY browser-visible
+ * surface (WS broadcast, REST response). BIND-03: authToken is runtime-only,
+ * server-internal — same rule as session-store.sanitizeForDisk.
+ *
+ * Shallow-cloned so the caller's in-memory binding (ws-bridge keeps it for
+ * MCP re-injection) is not mutated.
+ */
+export function stripAuthToken(binding: IdeBinding): IdeBinding {
+  // biome-ignore lint/correctness/noUnusedVariables: explicit destructure-drop
+  const { authToken: _authToken, ...safe } = binding;
+  return safe as IdeBinding;
+}
+
+/**
+ * Return a browser-safe projection of a SessionState: same shape, but any
+ * nested `ideBinding.authToken` is stripped. BIND-03. Used by session_init
+ * and any other broadcast that sends the full SessionState to browsers.
+ *
+ * Shallow copy at the top level plus a fresh ideBinding object — the
+ * in-memory session retains the authToken for MCP re-injection.
+ */
+export function sanitizeSessionStateForBrowser<T extends { ideBinding?: IdeBinding | null }>(
+  state: T,
+): T {
+  if (!state.ideBinding) return state;
+  return { ...state, ideBinding: stripAuthToken(state.ideBinding) };
+}
+
 const RETRYABLE_BACKEND_MESSAGE_TYPES = new Set<BrowserOutgoingMessage["type"]>([
   "user_message",
   "mcp_get_status",
@@ -193,7 +222,12 @@ export class WsBridge {
       changed = true;
     }
     if (changed && session.browserSockets.size > 0) {
-      this.broadcastToBrowsers(session, { type: "session_init", session: session.state });
+      // BIND-03: sanitize session state before broadcast — ideBinding.authToken
+      // is runtime-only and must not cross the browser WS boundary.
+      this.broadcastToBrowsers(session, {
+        type: "session_init",
+        session: sanitizeSessionStateForBrowser(session.state),
+      });
     }
   }
 
@@ -239,6 +273,7 @@ export class WsBridge {
         ),
         lastCliActivityTs: Date.now(),
         stateMachine: new SessionStateMachine(p.id, "terminated"),
+        dynamicMcpServers: {},
       };
       session.state.backend_type = session.backendType;
       // Resolve git info for restored sessions (may have been persisted without it)
@@ -328,6 +363,7 @@ export class WsBridge {
         processedClientMessageIdSet: new Set(),
         lastCliActivityTs: Date.now(),
         stateMachine: new SessionStateMachine(sessionId),
+        dynamicMcpServers: {},
       };
       this.sessions.set(sessionId, session);
       this.wireStateMachineListeners(session);
@@ -490,7 +526,11 @@ export class WsBridge {
           backend_type: session.backendType,
         };
         this.refreshGitInfo(session, { notifyPoller: true });
-        this.broadcastToBrowsers(session, { type: "session_init", session: session.state });
+        // BIND-03: sanitize session state before broadcast (strip ideBinding.authToken).
+        this.broadcastToBrowsers(session, {
+          type: "session_init",
+          session: sanitizeSessionStateForBrowser(session.state),
+        });
         session.stateMachine.transition("ready", "system_init");
         this.persistSession(session);
         return;
@@ -944,10 +984,11 @@ export class WsBridge {
     // Refresh git state on browser connect so branch changes made mid-session are reflected.
     this.refreshGitInfo(session, { notifyPoller: true });
 
-    // Send current session state as snapshot
+    // Send current session state as snapshot.
+    // BIND-03: sanitize — strip ideBinding.authToken before it crosses the WS.
     const snapshot: BrowserIncomingMessage = {
       type: "session_init",
-      session: session.state,
+      session: sanitizeSessionStateForBrowser(session.state),
     };
     this.sendToBrowser(ws, snapshot);
 
@@ -1019,16 +1060,53 @@ export class WsBridge {
 
   // ── IDE binding (Task 6: BIND-01/02/04/06, STATE-01) ─────────────────────
   //
-  // MCP-merge decision: ws-bridge does NOT currently track the session's
-  // full MCP servers map (grep for `session.servers` / `dynamicMcpConfig`
-  // returns nothing in ws-bridge.ts — Session in ws-bridge-types.ts has no
-  // such field). The probe (scripts/probe-ide.ts, .planning/PLAN.md line 10)
-  // confirmed the CLI merges dynamic entries sent via mcp_set_servers with
-  // the user's existing MCP config rather than replacing them wholesale.
-  // Therefore we send only `{ ide: entry }` as the `servers` payload and
-  // rely on the CLI-side merge. If Companion ever starts tracking the full
-  // map (e.g. for an MCP manager UI), this code must be updated to merge
-  // server-side instead of relying on the CLI.
+  // MCP-merge contract (round-4 Codex review, Issue 1):
+  //
+  // The Claude CLI's `mcp_set_servers` control_request is a full replace of
+  // the session's DYNAMIC MCP server set (entries submitted via
+  // mcp_set_servers at runtime — distinct from the user's persistent
+  // ~/.claude.json config, which the CLI continues to merge on top). Keys
+  // omitted from `servers` are dropped. Earlier versions of `bindIde` /
+  // `unbindIde` sent `{ [ideKey]: entry }` / `{}` alone, silently wiping
+  // every other dynamic server the user had configured (via McpPanel →
+  // sendMcpSetServers).
+  //
+  // Fix: ws-bridge tracks `session.dynamicMcpServers` — a per-session
+  // in-memory mirror of the dynamic set, updated every time a
+  // `mcp_set_servers` flows through `routeBrowserMessage`. bindIde/unbindIde
+  // derive their outbound payload from that mirror:
+  //
+  //   - Claude (full-replace wire protocol):
+  //       bind: servers = { ...others, [ideKey]: entry }
+  //       unbind: servers = { ...others } (IDE key omitted), no deleteKeys
+  //   - Codex (per-key upsert/delete via config/batchWrite):
+  //       bind: servers = { [ideKey]: entry } (upsert — doesn't touch others)
+  //       unbind: servers = {}, deleteKeys = [ideKey] (per-key delete)
+  //
+  // Both variants preserve user-added dynamic MCP servers across a bind
+  // cycle. Regression tests live under the "MCP-merge preservation" heading
+  // in ws-bridge.test.ts.
+
+  /**
+   * Apply a `mcp_set_servers` payload (with optional `deleteKeys`) to the
+   * session's in-memory dynamic MCP mirror. Deletes are applied first,
+   * then upserts — same ordering as codex-adapter.handleOutgoingMcpSetServers
+   * so a combined message is well-defined.
+   */
+  private updateDynamicMcpServers(
+    session: Session,
+    servers: Record<string, McpServerConfig>,
+    deleteKeys?: string[],
+  ): void {
+    if (deleteKeys && deleteKeys.length > 0) {
+      for (const k of deleteKeys) {
+        delete session.dynamicMcpServers[k];
+      }
+    }
+    for (const [k, v] of Object.entries(servers)) {
+      session.dynamicMcpServers[k] = v;
+    }
+  }
 
   /**
    * Bind a Companion session to a running IDE discovered via ~/.claude/ide/.
@@ -1076,18 +1154,84 @@ export class WsBridge {
     // Regression test: BIND-07 in ws-bridge.test.ts.
     const serverKey = ide.ideName.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-    // Send ONLY the ide entry — CLI merges with user's persistent MCP config.
+    // Round-4 Codex review, Issue 2: reject empty-sanitized keys. A lockfile
+    // whose ideName is all punctuation (e.g. "!?", "---") would sanitize to
+    // "" and cause the CLI to register an `mcp_servers.""` orphan that
+    // `unbindIde`'s empty-key guard then refuses to delete. Short-circuit
+    // BEFORE any adapter write — same error shape as the other bind errors
+    // so routes/ide-session-routes maps to 400 and nothing is sent on wire.
+    if (serverKey.length === 0) {
+      return { ok: false, error: "invalid IDE name" };
+    }
+
+    // CORRECTNESS: require a live, connected backend adapter. Without it,
+    // the CLI will never learn about the IDE and any binding we record is
+    // split-brain (UI says bound; CLI has no MCP entry). Three-layer guard
+    // per codex adversarial review issue #2:
+    //   (1) adapter must be attached,
+    //   (2) adapter.isConnected() must be true (transport-level),
+    //   (3) adapter.send() must return true (write accepted by transport).
+    // Any failure short-circuits BEFORE mutating session state or
+    // broadcasting — same error string so the picker surfaces the existing
+    // "backend not connected" banner + Retry.
+    const adapter = session.backendAdapter;
+    if (!adapter || !adapter.isConnected()) {
+      return { ok: false, error: "backend not connected" };
+    }
+
+    // Round-5 Codex review, BLOCK: drain pending browser messages first so a
+    // stale `mcp_set_servers` in the queue (enqueued while `adapter.send()`
+    // transiently returned false) cannot replay AFTER us and clobber the IDE
+    // entry. On Claude this matters most: `mcp_set_servers` is full-replace
+    // semantics on the wire, so a later-arriving stale payload missing the
+    // IDE key silently drops the IDE MCP entry and produces a split-brain
+    // (UI shows bound, CLI lost the IDE server). Draining first also means
+    // the `session.dynamicMcpServers` mirror we read on the next line is
+    // already up to date with the queue's effects (the mirror mutates at
+    // route time in `updateDynamicMcpServers`).
+    //
+    // If the drain fails to fully clear (send() returned false mid-flush and
+    // a retryable message was re-queued), treat this as not-connected — it's
+    // safer than proceeding with a half-flushed queue that would race us.
+    if (session.pendingMessages.length > 0) {
+      this.flushQueuedBrowserMessages(session, adapter, "ide_bind_predrain");
+      if (session.pendingMessages.length > 0) {
+        return { ok: false, error: "backend not connected" };
+      }
+    }
+
+    // Build the outbound `servers` payload — backend-specific shape.
+    //
+    // Claude (full-replace): we MUST include every dynamic server the user
+    //   has previously configured or it will be dropped. We merge on top of
+    //   the bridge's in-memory mirror (session.dynamicMcpServers). The IDE
+    //   entry overrides any prior entry at the same key (same-ideName rebind).
+    //
+    // Codex (per-key upsert): `config/batchWrite` processes each key
+    //   independently. Sending the full mirror here would spuriously re-upsert
+    //   every other server on every bind. Send only the IDE entry.
+    //
     // `servers` is typed as Record<string, McpServerConfig> in session-types,
     // but the real wire shape for ws-ide/sse-ide carries extra fields
     // (ideName, authToken, ideRunningInWindows, scope). Cast through unknown
     // to bypass the narrow type — the adapter's handleOutgoingMcpSetServers
     // accepts Record<string, unknown>.
-    if (session.backendAdapter) {
-      session.backendAdapter.send({
-        type: "mcp_set_servers",
-        servers: { [serverKey]: ideServerEntry } as unknown as Record<string, import("./session-types.js").McpServerConfig>,
-      });
+    const outboundServers: Record<string, unknown> =
+      session.backendType === "claude"
+        ? { ...session.dynamicMcpServers, [serverKey]: ideServerEntry }
+        : { [serverKey]: ideServerEntry };
+    const accepted = adapter.send({
+      type: "mcp_set_servers",
+      servers: outboundServers as Record<string, import("./session-types.js").McpServerConfig>,
+    });
+    if (!accepted) {
+      return { ok: false, error: "backend not connected" };
     }
+
+    // Mirror the mutation we just sent to the backend so subsequent
+    // bind/unbind cycles (and any later user mcp_set_servers) see a
+    // consistent view.
+    session.dynamicMcpServers[serverKey] = ideServerEntry as unknown as McpServerConfig;
 
     const binding: IdeBinding = {
       port: ide.port,
@@ -1107,9 +1251,14 @@ export class WsBridge {
 
     // Browser sync via the existing session_update message (not a new
     // variant — the plan explicitly forbids inventing one).
+    //
+    // BIND-03 SECURITY: `authToken` is runtime-only and must NEVER cross the
+    // browser WS boundary. Strip it from the broadcast payload. The server's
+    // in-memory `session.state.ideBinding` still carries it (required for
+    // MCP injection on re-bind); the wire shape does not.
     this.broadcastToBrowsers(session, {
       type: "session_update",
-      session: { ideBinding: binding },
+      session: { ideBinding: stripAuthToken(binding) },
     });
 
     return { ok: true };
@@ -1121,24 +1270,87 @@ export class WsBridge {
    * explicit `null` (not undefined) so the FE can distinguish
    * "never bound" from "was bound, now disconnected" (BIND-04 / BIND-05).
    */
-  async unbindIde(sessionId: string): Promise<{ ok: true }> {
+  async unbindIde(
+    sessionId: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
     const session = this.sessions.get(sessionId);
     if (!session) return { ok: true };
 
-    // If already null/undefined, no-op. Treat both as "nothing to do" —
-    // but do NOT short-circuit if the existing value is a real binding,
-    // so we always dispatch the mcp_set_servers tear-down.
+    // If already null/undefined, no-op. Idempotent: DELETE /api/sessions/:id/ide
+    // and the auto-unbind path both call this without first checking state.
     const hadBinding = session.state.ideBinding != null;
+    if (!hadBinding) return { ok: true };
 
-    if (hadBinding && session.backendAdapter) {
-      // Send empty `servers` map — ide-merge decision above: the CLI
-      // treats a missing `ide` key as unbind; we don't track the user's
-      // other MCP servers so we can't include them here. Documented above.
-      session.backendAdapter.send({
-        type: "mcp_set_servers",
-        servers: {} as Record<string, import("./session-types.js").McpServerConfig>,
-      });
+    // Codex round-2 issue #1: mirror bindIde's three-layer adapter guard so
+    // the UI "unbound" state and the CLI MCP registry cannot diverge.
+    //   (1) adapter attached, (2) isConnected() true, (3) send() accepted.
+    // Without all three, the CLI never sees the tear-down mcp_set_servers
+    // and keeps the stale IDE MCP entry — a split-brain where UI shows
+    // "unbound" but MCP tools are still registered. Return the same error
+    // string as bindIde so the picker surfaces the existing
+    // "backend not connected" banner + Retry.
+    const adapter = session.backendAdapter;
+    if (!adapter || !adapter.isConnected()) {
+      return { ok: false, error: "backend not connected" };
     }
+
+    // Round-5 Codex review, BLOCK: same rationale as `bindIde` — drain any
+    // queued browser `mcp_set_servers` BEFORE we emit our own mutation, so
+    // a stale payload cannot replay after us and clobber the unbind (Claude
+    // full-replace) or re-upsert the IDE key (Codex per-key upsert) once
+    // we've torn it down. If the drain doesn't fully clear the queue, refuse
+    // to proceed: better to surface "backend not connected" and let the
+    // picker retry than to half-apply an unbind with a racing queue behind us.
+    if (session.pendingMessages.length > 0) {
+      this.flushQueuedBrowserMessages(session, adapter, "ide_unbind_predrain");
+      if (session.pendingMessages.length > 0) {
+        return { ok: false, error: "backend not connected" };
+      }
+    }
+    // Recompute `serverKey` with the same BIND-07 sanitization that
+    // `bindIde` used (`ideName.toLowerCase().replace(/[^a-z0-9]/g, "")`).
+    // `ideBinding.ideName` is always the canonical source — the CLI was
+    // taught that key and will only delete it if we target it exactly.
+    const boundIdeName = session.state.ideBinding?.ideName ?? "";
+    const serverKey = boundIdeName.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+    // Round-4 Codex review, Issue 1: the outbound payload is backend-specific
+    // so other user-configured dynamic MCP servers are preserved.
+    //
+    // Claude (full-replace wire protocol): send the in-memory mirror WITH
+    //   the IDE key omitted. Claude will then drop the IDE entry (it's not
+    //   in the payload) while keeping every other key we include. We do NOT
+    //   set `deleteKeys` because the Claude adapter ignores it anyway —
+    //   Claude expresses deletion via omission.
+    //
+    // Codex (per-key upsert/delete): keep the surgical shape. `servers: {}`
+    //   is an empty upsert set; `deleteKeys: [serverKey]` drops the single
+    //   IDE entry without touching any other mcp_servers.<key>. Sending the
+    //   full mirror here would re-upsert every other dynamic server on every
+    //   unbind — wasteful and racy with concurrent edits.
+    let outboundServers: Record<string, import("./session-types.js").McpServerConfig>;
+    let outboundDeleteKeys: string[];
+    if (session.backendType === "claude") {
+      const merged: Record<string, McpServerConfig> = { ...session.dynamicMcpServers };
+      if (serverKey) delete merged[serverKey];
+      outboundServers = merged as Record<string, import("./session-types.js").McpServerConfig>;
+      outboundDeleteKeys = [];
+    } else {
+      outboundServers = {} as Record<string, import("./session-types.js").McpServerConfig>;
+      outboundDeleteKeys = serverKey ? [serverKey] : [];
+    }
+    const accepted = adapter.send({
+      type: "mcp_set_servers",
+      servers: outboundServers,
+      deleteKeys: outboundDeleteKeys,
+    });
+    if (!accepted) {
+      return { ok: false, error: "backend not connected" };
+    }
+
+    // Drop the IDE entry from the bridge's mirror so subsequent reads are
+    // consistent with what we just told the backend.
+    if (serverKey) delete session.dynamicMcpServers[serverKey];
 
     // Explicit null (not undefined) — FE key to detect the transition.
     session.state.ideBinding = null;
@@ -1325,6 +1537,16 @@ export class WsBridge {
       this.broadcastToBrowsers(session, userMessage);
     }
 
+    // -- mcp_set_servers: mirror the dynamic MCP state the bridge has sent to
+    // the backend. This is the authoritative in-memory record of what the
+    // CLI / Codex should know about. `bindIde` / `unbindIde` later read this
+    // to construct merge-safe payloads (Claude full-replace; Codex surgical).
+    // Apply deleteKeys BEFORE upserts so a single message with both fields is
+    // well-defined (matches codex-adapter's phase-1-delete / phase-2-upsert).
+    if (msg.type === "mcp_set_servers") {
+      this.updateDynamicMcpServers(session, msg.servers, msg.deleteKeys);
+    }
+
     // -- permission_response: populate updatedInput fallback from pending, then remove -------
     if (msg.type === "permission_response") {
       metricsCollector.recordPermissionResolved(msg.request_id, msg.behavior as "allow" | "deny", false);
@@ -1442,6 +1664,25 @@ export class WsBridge {
           rawPreview: raw.substring(0, 100),
         });
         continue;
+      }
+
+      // Round-6 Codex review, BLOCK: keep the `dynamicMcpServers` mirror in
+      // sync with queued `mcp_set_servers` payloads whose in-process mirror
+      // update was lost across a server restart. `pendingMessages` is
+      // persisted to disk (session-store) but `dynamicMcpServers` is not —
+      // after a cold restore the mirror is `{}` even though the queued
+      // payload still remembers user-configured servers. Without this
+      // catch-up, a subsequent `bindIde` reads an empty mirror, sends
+      // `{ide}` alone, and the full-replace semantics on Claude's wire
+      // silently drop every other dynamic server.
+      //
+      // `updateDynamicMcpServers` is idempotent (merge + delete), so the
+      // in-process path (where `routeBrowserMessage` already mirrored
+      // before enqueue) just reapplies the same mutation. Must run BEFORE
+      // `adapter.send()` so bindIde's pre-drain → mirror-read sequence
+      // sees the mirror up to date even if send() fails and we re-queue.
+      if (queuedMsg.type === "mcp_set_servers") {
+        this.updateDynamicMcpServers(session, queuedMsg.servers, queuedMsg.deleteKeys);
       }
 
       const sent = adapter.send(queuedMsg);

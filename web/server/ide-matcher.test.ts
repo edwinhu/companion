@@ -104,9 +104,16 @@ describe("matchIdesForCwd", () => {
    * Path-boundary correctness (REQUIRED BONUS): naive string startsWith would
    * claim "/Users/x/rep" matches "/Users/x/repo/anything" because the raw
    * string is a prefix. The matcher must operate on path-segment boundaries
-   * so the "rep" folder does not cross-match the "repo" folder. We assert the
-   * wrong-candidate ends up ranked AFTER the right one and with zero prefix
-   * credit.
+   * so the "rep" folder does not cross-match the "repo" folder.
+   *
+   * Strengthened assertions (defect-guard against a broken matcher that
+   * credits `wrong` with PARTIAL match depth):
+   *   (1) `right` sorts first even though `wrong` has the newer mtime.
+   *   (2) `wrong` has ZERO matched depth — proven by introducing an unrelated
+   *       candidate with the SAME mtime as `wrong`: if `wrong` were credited
+   *       with any match depth > 0, it would beat the unrelated candidate.
+   *       A correct matcher treats both as unmatched and sorts them by mtime
+   *       (stable ordering → preserves input order on a tie).
    */
   it("does not cross-match on partial folder names (path-boundary check)", () => {
     const wrong = makeCandidate({
@@ -122,10 +129,67 @@ describe("matchIdesForCwd", () => {
       lockfileMtime: 1,
     });
     const result = matchIdesForCwd("/Users/x/repo/anything", [wrong, right]);
-    // "right" must be first because "wrong" must not be counted as a match.
+    // (1) "right" must be first because "wrong" must not be counted as a match.
     expect(result[0]?.port).toBe(5002);
     // Both are still returned (zero-match candidates come after matched ones).
     expect(result.map((c) => c.port)).toEqual([5002, 5001]);
+
+    // (2) Prove `wrong` has ZERO matched credit: an unrelated candidate with
+    //     strictly NEWER mtime must outrank `wrong`. If the matcher mistakenly
+    //     gave `wrong` any positive matched-depth, it would bubble up above
+    //     the unmatched candidate regardless of mtime.
+    const unrelatedNewer = makeCandidate({
+      port: 5003,
+      ideName: "UnrelatedNewer",
+      workspaceFolders: ["/totally/different"],
+      lockfileMtime: 10_000, // strictly > wrong's mtime of 9999
+    });
+    const ranked = matchIdesForCwd(
+      "/Users/x/repo/anything",
+      [wrong, right, unrelatedNewer],
+    );
+    // Matched first ("right"), then unmatched by mtime desc:
+    // unrelatedNewer (10_000) before wrong (9999).
+    expect(ranked.map((c) => c.port)).toEqual([5002, 5003, 5001]);
+  });
+
+  /**
+   * Defect class: a naive `rel.startsWith("..")` rejection wrongly eliminates
+   * legitimate sibling paths whose basename happens to start with `..`
+   * (e.g. `..cache`, `..config`, any dotfile-ish name).
+   *
+   * Here the candidate's workspace folder is `/a` and the cwd is `/a/..cache`
+   * (a real directory literally named "..cache"). `path.relative("/a", "/a/..cache")`
+   * returns the string `"..cache"`, which starts with ".." — so a naive
+   * `startsWith("..")` check throws the match out even though `/a/..cache`
+   * IS legitimately under `/a`.
+   *
+   * Fix (ide-matcher.ts:isPathPrefix): reject only when `rel === ".."` OR
+   * when it starts with `".." + path.sep`. This test fails on the naive
+   * implementation and passes on the strict-boundary implementation.
+   */
+  it("does not reject a child path whose basename starts with '..' (e.g. '..cache')", () => {
+    const candidate = makeCandidate({
+      port: 7001,
+      workspaceFolders: ["/a"],
+      lockfileMtime: 1000,
+    });
+    const result = matchIdesForCwd("/a/..cache", [candidate]);
+    // The one candidate must be a match — rank 0, and the test file's
+    // matcher contract: matched candidates come first with non-zero depth.
+    expect(result).toHaveLength(1);
+    expect(result[0]?.port).toBe(7001);
+    // Sanity: if we add an UNRELATED candidate with a newer mtime, the matcher
+    // must still put the real match FIRST, proving it was credited as matched
+    // (zero-match candidates are ordered by mtime only; a non-match would not
+    // beat a newer unrelated candidate).
+    const unrelatedNewer = makeCandidate({
+      port: 7002,
+      workspaceFolders: ["/totally/unrelated"],
+      lockfileMtime: 9999,
+    });
+    const withUnrelated = matchIdesForCwd("/a/..cache", [candidate, unrelatedNewer]);
+    expect(withUnrelated.map((c) => c.port)).toEqual([7001, 7002]);
   });
 
   /**

@@ -53,6 +53,15 @@ let currentWatcher: FSWatcher | null = null;
 let currentRescanTimer: ReturnType<typeof setInterval> | null = null;
 let currentIdeDir: string | null = null;
 let stopped = false;
+/**
+ * Monotonic generation counter bumped at the start of every scan. Each scan
+ * captures its generation at entry; after each `await` and before any mutation
+ * of `known` or emit, it checks whether it is still the latest. A scan whose
+ * generation is stale (a newer scan has started or completed) aborts without
+ * mutating state — this prevents a retry-delayed scan from evicting lockfiles
+ * that a fresher scan already added. Codex adversarial review, issue #4.
+ */
+let scanGeneration = 0;
 /** Map keyed by lockfile path. */
 const known = new Map<string, DiscoveredIde>();
 /** Count of malformed/skipped lockfile reads — diagnostic only. */
@@ -94,10 +103,14 @@ function derivePortAndTransport(
  * 2–3 times on parse failure to smooth over that race.
  *
  * Returns null if the file is missing or genuinely malformed after retries.
+ *
+ * Async so the backoff yields to the Node event loop (timers, microtasks,
+ * incoming WS frames all stay responsive). The previous sync busy-wait
+ * blocked the loop for up to 120ms — see issue #4.
  */
-function readLockfileWithRetry(
+async function readLockfileWithRetry(
   lockfilePath: string,
-): { parsed: NonNullable<ReturnType<typeof parseLockfile>>; mtime: number } | null {
+): Promise<{ parsed: NonNullable<ReturnType<typeof parseLockfile>>; mtime: number } | null> {
   for (let attempt = 0; attempt <= READ_RETRY_BACKOFF_MS.length; attempt++) {
     let raw: string;
     let mtime: number;
@@ -111,13 +124,11 @@ function readLockfileWithRetry(
     }
     const parsed = parseLockfile(raw);
     if (parsed) return { parsed, mtime };
-    // Parse failed — might be partial write. Retry synchronously-ish.
+    // Parse failed — might be partial write. Retry via async sleep so the
+    // event loop stays responsive.
     if (attempt < READ_RETRY_BACKOFF_MS.length) {
       const waitMs = READ_RETRY_BACKOFF_MS[attempt]!;
-      const end = Date.now() + waitMs;
-      while (Date.now() < end) {
-        // busy-wait microsleep; this path is rare and tiny.
-      }
+      await new Promise<void>((r) => setTimeout(r, waitMs));
       continue;
     }
     return null;
@@ -154,8 +165,24 @@ function shallowArrayEqual(a: string[], b: string[]): boolean {
 /**
  * Scan the ideDir; add/update/remove entries in `known` and emit events
  * for every change. Tolerates a missing directory.
+ *
+ * Async because readLockfileWithRetry yields to the event loop during
+ * partial-write backoff (issue #4). Callers that cannot await (fs.watch
+ * listener, setInterval rescan timer) fire-and-forget — the function is
+ * idempotent and logs/tolerates internal errors.
+ *
+ * Concurrency model (codex adversarial review, issue #4):
+ * - Every scan captures its own `gen` at entry. A newer scan bumps
+ *   `scanGeneration`, staling every scan that's still in progress.
+ * - Builds a LOCAL snapshot (`nextKnown`) during the pass; only mutates
+ *   the shared `known` map at the end, AFTER rechecking generation.
+ * - Also rechecks `stopped` before mutations so an in-flight scan whose
+ *   watcher was cancelled (resetIdeDiscoveryForTests, stop()) does not
+ *   leak events or re-populate state post-reset.
  */
-function scanDir(dir: string): void {
+async function scanDir(dir: string): Promise<void> {
+  const gen = ++scanGeneration;
+
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -166,29 +193,42 @@ function scanDir(dir: string): void {
     return;
   }
 
-  const seen = new Set<string>();
+  // Build a local snapshot of everything this scan observes. We only
+  // reconcile against the shared `known` map at the end, after confirming
+  // this scan is still the latest.
+  const nextKnown = new Map<string, DiscoveredIde>();
   for (const name of entries) {
     if (!name.endsWith(".lock")) continue;
     const path = join(dir, name);
-    const read = readLockfileWithRetry(path);
+    const read = await readLockfileWithRetry(path);
+    // Post-await checkpoint: a newer scan or a stop() may have landed
+    // while we were in the retry backoff. Bail before any mutation.
+    if (stopped || gen !== scanGeneration) return;
     if (!read) {
       skippedCount++;
       continue;
     }
-    if (!isPidAlive(read.parsed.pid)) {
-      // Dead pid — never add. (Pruning of previously-alive entries happens
-      // below by virtue of `seen` not including this path... actually
-      // we DO mark it seen so we don't evict on the next line. Instead,
-      // treat dead-pid as absent: don't mark seen, so if it was previously
-      // known it'll be removed below.)
-      continue;
-    }
+    if (!isPidAlive(read.parsed.pid)) continue;
     const next = toDiscovered(path, read.parsed, read.mtime);
     if (!next) {
       skippedCount++;
       continue;
     }
-    seen.add(path);
+    nextKnown.set(path, next);
+  }
+
+  // Final generation / stopped guard before touching shared state.
+  if (stopped || gen !== scanGeneration) return;
+  reconcileKnown(nextKnown);
+}
+
+/**
+ * Reconcile the shared `known` map with a scan's local snapshot. Emits
+ * ide:added / ide:changed / ide:removed as deltas. Runs synchronously —
+ * the caller is responsible for the generation/stopped guards.
+ */
+function reconcileKnown(nextKnown: Map<string, DiscoveredIde>): void {
+  for (const [path, next] of nextKnown) {
     const prev = known.get(path);
     if (!prev) {
       known.set(path, next);
@@ -214,10 +254,9 @@ function scanDir(dir: string): void {
       }
     }
   }
-
   // Evict anything no longer present (or whose pid went dead).
   for (const [path, entry] of known) {
-    if (!seen.has(path)) {
+    if (!nextKnown.has(path)) {
       known.delete(path);
       companionBus.emit("ide:removed", {
         port: entry.port,
@@ -228,16 +267,75 @@ function scanDir(dir: string): void {
 }
 
 /**
+ * Synchronous initial scan — used only by startIdeDiscovery to guarantee
+ * that lockfiles present on disk before startup are observable via
+ * listAvailableIdes() the moment startIdeDiscovery() returns.
+ *
+ * Rationale: the async scanDir path uses setTimeout-based backoff for
+ * partial writes, which defers state population by one or more ticks.
+ * REST callers that hit /api/ide/available immediately after server
+ * startup would otherwise see an empty list. We accept a one-shot
+ * synchronous readFileSync here because it runs exactly once at startup
+ * and sees only complete files (partial writes are an fs.watch concern,
+ * not a startup one).
+ *
+ * No retry — a malformed file at startup is either truly malformed or
+ * mid-write from a concurrent IDE startup. The fs.watch listener will
+ * re-scan on any subsequent modification, so nothing is permanently lost.
+ */
+function scanDirSync(dir: string): void {
+  const gen = ++scanGeneration;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const nextKnown = new Map<string, DiscoveredIde>();
+  for (const name of entries) {
+    if (!name.endsWith(".lock")) continue;
+    const path = join(dir, name);
+    let raw: string;
+    let mtime: number;
+    try {
+      const st = statSync(path);
+      if (!st.isFile()) continue;
+      mtime = st.mtimeMs;
+      raw = readFileSync(path, "utf8");
+    } catch {
+      continue;
+    }
+    const parsed = parseLockfile(raw);
+    if (!parsed) {
+      skippedCount++;
+      continue;
+    }
+    if (!isPidAlive(parsed.pid)) continue;
+    const next = toDiscovered(path, parsed, mtime);
+    if (!next) {
+      skippedCount++;
+      continue;
+    }
+    nextKnown.set(path, next);
+  }
+  if (stopped || gen !== scanGeneration) return;
+  reconcileKnown(nextKnown);
+}
+
+/**
  * Handle a single fs.watch event. Path may be relative to `dir` or, on
  * some platforms, absent — in that case we fall back to a full scan.
+ *
+ * scanDir is async; we fire-and-forget. The watcher callback must not
+ * block, and errors inside scanDir are already swallowed internally.
  */
 function handleWatchEvent(dir: string, filename: string | null): void {
   if (!filename) {
-    scanDir(dir);
+    void scanDir(dir);
     return;
   }
   if (!filename.endsWith(".lock")) return;
-  scanDir(dir); // simplest correct path — always reconcile the whole dir.
+  void scanDir(dir); // simplest correct path — always reconcile the whole dir.
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -262,8 +360,10 @@ export function startIdeDiscovery(
   currentIdeDir = ideDir;
   stopped = false;
 
-  // Initial scan — emits :added for each live lockfile currently present.
-  scanDir(ideDir);
+  // Initial scan — synchronous so listAvailableIdes() reflects pre-existing
+  // lockfiles the moment startIdeDiscovery returns. See scanDirSync for the
+  // rationale (GET /api/ide/available must not race against startup).
+  scanDirSync(ideDir);
 
   // fs.watch on a missing dir throws — try, tolerate ENOENT.
   try {
@@ -278,6 +378,14 @@ export function startIdeDiscovery(
     currentWatcher.on("error", () => {
       // Swallow — watcher errors must not crash the server.
     });
+    // Codex round-2 issue #3: catch-up scan. Between scanDirSync() and the
+    // watch() call above there is a brief window where an IDE could finish
+    // writing its lockfile. fs.watch only reports events that happen AFTER
+    // it attaches, so such a file would be invisible until the next 10s
+    // periodic rescan. Schedule an immediate async scanDir() — the existing
+    // generation counter guarantees correctness if a watch-triggered scan
+    // races with it.
+    void scanDir(ideDir);
   } catch {
     currentWatcher = null;
     // Directory likely doesn't exist. Rescan timer below will pick up
@@ -286,7 +394,7 @@ export function startIdeDiscovery(
 
   currentRescanTimer = setInterval(() => {
     if (stopped || currentIdeDir === null) return;
-    scanDir(currentIdeDir);
+    void scanDir(currentIdeDir);
   }, RESCAN_INTERVAL_MS);
   // Do not keep the Node event loop alive for this timer.
   (currentRescanTimer as { unref?: () => void }).unref?.();
@@ -296,6 +404,10 @@ export function startIdeDiscovery(
 
 function stopCurrent(): void {
   stopped = true;
+  // Bump generation so any in-flight scanDir that is currently awaiting
+  // readLockfileWithRetry will see a stale generation on resume and bail
+  // before touching `known` or emitting events.
+  scanGeneration++;
   if (currentWatcher) {
     try {
       currentWatcher.close();
@@ -309,6 +421,12 @@ function stopCurrent(): void {
     currentRescanTimer = null;
   }
   currentIdeDir = null;
+  // Codex round-2 issue #2: clear `known` here. A subsequent
+  // startIdeDiscovery() may point at a missing or permission-denied
+  // directory, in which case scanDirSync returns early without reconciling.
+  // Without this clear, listAvailableIdes() would keep returning stale
+  // entries from the previous dir forever.
+  known.clear();
 }
 
 /** Snapshot of currently-known IDEs. */
@@ -321,6 +439,9 @@ export function resetIdeDiscoveryForTests(): void {
   stopCurrent();
   known.clear();
   skippedCount = 0;
+  // Bump generation so any async scan still in-flight from a previous test
+  // will see a stale generation on its post-await recheck and bail out.
+  scanGeneration++;
 }
 
 /** Diagnostic accessor (not part of the public contract). */

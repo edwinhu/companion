@@ -25,7 +25,14 @@ export interface IdeCandidate {
  * Returns true iff `child` is equal to `parent` or sits inside it on a path
  * segment boundary. Uses path.relative so partial-folder-name false matches
  * (e.g. "/a/rep" vs "/a/repo/x") are correctly rejected: the relative path
- * from "/a/rep" to "/a/repo/x" is "../repo/x", which starts with "..".
+ * from "/a/rep" to "/a/repo/x" is "../repo/x", which begins with the
+ * ".." segment proper (".." followed by the path separator).
+ *
+ * DEFECT-GUARD: we must NOT reject on `rel.startsWith("..")` alone, because a
+ * legitimate descendant whose basename starts with ".." (e.g. "..cache") also
+ * yields a rel that starts with ".." — but it is a single SEGMENT, not the
+ * parent-directory token. Check for ".." strictly: equal to ".." or followed
+ * by the platform path separator.
  */
 function isPathPrefix(parent: string, child: string): boolean {
   const p = path.resolve(parent);
@@ -33,7 +40,8 @@ function isPathPrefix(parent: string, child: string): boolean {
   if (p === c) return true;
   const rel = path.relative(p, c);
   if (rel === "") return true;
-  if (rel.startsWith("..")) return false;
+  if (rel === "..") return false;
+  if (rel.startsWith(".." + path.sep)) return false;
   if (path.isAbsolute(rel)) return false;
   return true;
 }

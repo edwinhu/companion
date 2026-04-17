@@ -74,7 +74,12 @@ export function parseLockfile(raw: string): ParsedLockfile | null {
     : [];
 
   // Require the fields we actually use downstream.
-  if (!Number.isFinite(pid) || !ideName) {
+  //
+  // SECURITY (issue #5): pid must be a positive integer. `process.kill(0, 0)`
+  // signals the caller's entire process group (always "alive"), and negative
+  // pids signal the group |pid|. Treating either as a live IDE would surface
+  // stale lockfiles in the picker and wire mcp_set_servers to dead ports.
+  if (!Number.isFinite(pid) || !Number.isInteger(pid) || pid <= 0 || !ideName) {
     return null;
   }
 

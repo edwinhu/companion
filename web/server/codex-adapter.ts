@@ -904,7 +904,7 @@ export class CodexAdapter implements IBackendAdapter {
         this.handleOutgoingMcpReconnect();
         return true;
       case "mcp_set_servers":
-        this.handleOutgoingMcpSetServers(msg.servers);
+        this.handleOutgoingMcpSetServers(msg.servers, msg.deleteKeys);
         return true;
       default:
         return false;
@@ -1500,8 +1500,36 @@ export class CodexAdapter implements IBackendAdapter {
     }
   }
 
-  private async handleOutgoingMcpSetServers(servers: Record<string, McpServerConfig>): Promise<void> {
+  private async handleOutgoingMcpSetServers(
+    servers: Record<string, McpServerConfig>,
+    deleteKeys?: string[],
+  ): Promise<void> {
     try {
+      // Phase 1 — removals. Codex's `config/batchWrite` edits support
+      // `upsert`/`replace` semantics; to drop a `mcp_servers.<name>` entry
+      // entirely we write `value: null` with `mergeStrategy: "replace"` on
+      // each key. The invalid-transport fallback in `handleOutgoingMcpToggle`
+      // uses the same three-field shape; we deliberately reuse it here so
+      // there is exactly one pattern for "delete an MCP entry" in Codex.
+      //
+      // Each delete is a separate `config/value/write` call rather than one
+      // batched replace — matches the existing toggle-fallback pattern and
+      // keeps per-key failures isolated. Deletes run BEFORE upserts so a
+      // combined message is well-defined: remove, then add.
+      if (deleteKeys && deleteKeys.length > 0) {
+        for (const name of deleteKeys) {
+          if (name.includes(".")) {
+            throw new Error(`Server names containing '.' are not supported: ${name}`);
+          }
+          await this.transport.call("config/value/write", {
+            keyPath: `mcp_servers.${name}`,
+            value: null,
+            mergeStrategy: "replace",
+          });
+        }
+      }
+
+      // Phase 2 — upserts.
       const edits: Array<{ keyPath: string; value: Record<string, unknown>; mergeStrategy: "upsert" }> = [];
       for (const [name, config] of Object.entries(servers)) {
         if (name.includes(".")) {

@@ -36,6 +36,27 @@ vi.mock("../api.js", () => {
   };
 });
 
+// Issue #11 (codex adversarial review): mock `../store.js` so that ANY call
+// to `useStore` OR `useStore.setState` from IdePicker registers on a spy.
+// The prior "tautology" test never mocked the store, so a component that
+// mutated it via setState still passed the assertion. This mock surfaces
+// every store interaction as a counted call; tests assert the count is 0.
+const setStateSpy = vi.fn();
+const getStateSpy = vi.fn(() => ({}));
+const subscribeSpy = vi.fn(() => () => {});
+const useStoreMock = vi.fn(() => ({}));
+// zustand exposes setState/getState/subscribe as static methods on the hook
+// function. We expose the same shape so an import of `useStore` in IdePicker
+// would see the spy regardless of access pattern.
+const useStoreWithStatics = Object.assign(useStoreMock, {
+  setState: setStateSpy,
+  getState: getStateSpy,
+  subscribe: subscribeSpy,
+});
+vi.mock("../store.js", () => ({
+  useStore: useStoreWithStatics,
+}));
+
 import * as apiModule from "../api.js";
 import { IdePicker } from "./IdePicker.js";
 import type { IdeBinding } from "../types.js";
@@ -320,17 +341,193 @@ describe("IdePicker — interactions", () => {
     });
   });
 
-  it("does not touch the store directly (no setState exports used)", async () => {
-    // Guardrail: IdePicker must not import from the store. This is enforced
-    // by absence — we verify by rendering without store mocks and confirm
-    // nothing throws. If a future refactor imports the store, the test file
-    // will need to mock it (which will make this regression visible).
+  // Issue #11 (codex adversarial review): the prior test never mocked
+  // `../store.js`, so a component that called bindIde AND ALSO mutated the
+  // store via useStore.setState still passed. This version genuinely pins
+  // the "IdePicker is store-free" contract by asserting on the mocked
+  // store's setState / getState / subscribe / hook-call spies.
+  it("does NOT touch the zustand store during a bind (store state flows only via session_update)", async () => {
+    mockBindIde.mockResolvedValue({ ok: true, binding: sampleBinding });
+    // Reset all store spies to make the assertion scoped to this test.
+    setStateSpy.mockClear();
+    getStateSpy.mockClear();
+    subscribeSpy.mockClear();
+    useStoreMock.mockClear();
+
     setup();
     await waitFor(() => {
       expect(screen.getByText("Neovim")).toBeInTheDocument();
     });
-    // Just reaching here without module-resolve errors is sufficient signal.
-    expect(true).toBe(true);
+
+    // Trigger a bind via keyboard.
+    fireEvent.keyDown(document, { key: "Enter" });
+    await waitFor(() => {
+      expect(mockBindIde).toHaveBeenCalledTimes(1);
+    });
+
+    // CRITICAL: none of the store surfaces should have been touched. If a
+    // future refactor imports `useStore` in IdePicker and mutates via
+    // setState (or even reads via a selector), one of these spies fires
+    // and this test fails loudly. This is the real regression guard the
+    // prior version lacked.
+    expect(setStateSpy).not.toHaveBeenCalled();
+    expect(getStateSpy).not.toHaveBeenCalled();
+    expect(subscribeSpy).not.toHaveBeenCalled();
+    expect(useStoreMock).not.toHaveBeenCalled();
+  });
+
+  // Issue #7 — the global Enter handler fires bindIde even when the user's
+  // focus is on a button inside the dialog. Native button activation would
+  // fire the button's onClick for Enter; the global handler should NOT
+  // double-fire bindIde on top. Otherwise clicking Disconnect with keyboard
+  // also triggers a bind against the currently-selected IDE — split-brain.
+  //
+  // We dispatch a real KeyboardEvent on `document` because that's where the
+  // global listener in IdePicker is attached. The event.target is the
+  // currently-focused element, which we simulate by setting
+  // document.activeElement to the Disconnect button. On a correct guard the
+  // handler early-returns; without the guard it calls pick() → bindIde.
+  it("Enter while a <button> inside the dialog has focus does not trigger bindIde", async () => {
+    mockBindIde.mockResolvedValue({ ok: true, binding: sampleBinding });
+    mockUnbindIde.mockResolvedValue({ ok: true });
+    setup({ currentBinding: sampleBinding });
+
+    await waitFor(() => {
+      expect(screen.getByText("Neovim")).toBeInTheDocument();
+    });
+    // Give effect-registered listeners and dep-re-registration a chance to
+    // settle. Without this wait the test accidentally passes because the
+    // global handler's latest ref hasn't re-attached.
+    await new Promise((r) => setTimeout(r, 50));
+
+    const disconnectBtn = screen.getByRole("button", {
+      name: /disconnect/i,
+    }) as HTMLButtonElement;
+    disconnectBtn.focus();
+    // Sanity check: jsdom actually moved focus (otherwise the test is moot).
+    expect(document.activeElement).toBe(disconnectBtn);
+
+    // Dispatch a native bubbling Enter at the focused button — in a real
+    // browser this would (a) invoke the button's intrinsic click, AND
+    // (b) hit the document-level keyhandler that IdePicker installs. The
+    // BUG is that the document handler calls pick() → bindIde even though
+    // the user's intent was to activate the button. The guard must
+    // early-return when the focused target is a <button> inside the dialog.
+    const ev = new KeyboardEvent("keydown", { key: "Enter", bubbles: true });
+    disconnectBtn.dispatchEvent(ev);
+
+    // Give async microtasks a chance to run.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(mockBindIde).not.toHaveBeenCalled();
+  });
+
+  // Issue #8 (codex adversarial review refinement) — `busy` in setState is
+  // a stale closure across same-tick dispatches. If the user taps Enter+D
+  // within the same render tick, both callbacks observe busy=false because
+  // React hasn't flushed the pending setBusy(true). Concurrent bind + disconnect
+  // ship simultaneously. A useRef that flips BEFORE the async await is the
+  // only reliable guard.
+  it("Issue #8 (same-tick): Enter + D in the same tick do not fire both bindIde and unbindIde", async () => {
+    // Hang both APIs so the first-in-tick op stays in-flight; if the guard
+    // is stale-closure (setBusy only), the second dispatch will slip past.
+    let _resolveBind: (v: unknown) => void = () => {};
+    let _resolveUnbind: (v: unknown) => void = () => {};
+    mockBindIde.mockImplementationOnce(() => new Promise((r) => { _resolveBind = r; }));
+    mockUnbindIde.mockImplementationOnce(() => new Promise((r) => { _resolveUnbind = r; }));
+
+    setup({ currentBinding: sampleBinding });
+
+    await waitFor(() => {
+      expect(screen.getByText("Neovim")).toBeInTheDocument();
+    });
+
+    // Fire Enter and D synchronously in the same tick — no await between.
+    // In a stale-closure implementation, both handlers see busy=false.
+    fireEvent.keyDown(document, { key: "Enter" });
+    fireEvent.keyDown(document, { key: "d" });
+
+    // Give microtasks a tick so the first-in-tick op has issued.
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Exactly one of bindIde / unbindIde should have been called, NOT both.
+    const totalCalls = mockBindIde.mock.calls.length + mockUnbindIde.mock.calls.length;
+    expect(totalCalls, `expected exactly one of bind/unbind in the same tick, got ${totalCalls}`).toBe(1);
+
+    // Clean up.
+    _resolveBind({ ok: true, binding: sampleBinding });
+    _resolveUnbind({ ok: true });
+  });
+
+  // Issue #8 — `busy` state is only checked on button onClick; the keyboard
+  // handler bypasses it. If the user spams Enter while a bind is in-flight,
+  // we issue multiple concurrent binds. Guard: keyboard Enter must early
+  // return when `busy` is true.
+  it("Enter is a no-op while a bind is in flight (busy-state guard applies to keyboard too)", async () => {
+    // Make the first bindIde hang so `busy` stays true for the duration of
+    // the test (we resolve it manually at the end).
+    let resolveFirst: (v: unknown) => void = () => {};
+    mockBindIde.mockImplementationOnce(
+      () => new Promise((r) => { resolveFirst = r; }),
+    );
+    setup();
+
+    await waitFor(() => {
+      expect(screen.getByText("Neovim")).toBeInTheDocument();
+    });
+
+    // First Enter starts the bind (busy → true).
+    fireEvent.keyDown(document, { key: "Enter" });
+    await waitFor(() => {
+      expect(mockBindIde).toHaveBeenCalledTimes(1);
+    });
+
+    // Second and third Enters while busy must be ignored.
+    fireEvent.keyDown(document, { key: "Enter" });
+    fireEvent.keyDown(document, { key: "Enter" });
+    await new Promise((r) => setTimeout(r, 10));
+    // Still only ONE bind in flight.
+    expect(mockBindIde).toHaveBeenCalledTimes(1);
+
+    // Clean up — resolve the pending bind so unmount doesn't leak.
+    resolveFirst({ ok: true, binding: sampleBinding });
+  });
+
+  // Issue #9 — bind error and disconnect error share a single "Retry"
+  // affordance whose onClick always calls the bind retry path. If a
+  // disconnect fails and the user clicks Retry, the picker retries BIND
+  // (not disconnect), which is the opposite of what the user asked for.
+  // Fix: Retry must re-invoke the operation that failed.
+  it("Retry after a failed disconnect re-calls unbindIde (not bindIde)", async () => {
+    // First disconnect fails, second succeeds.
+    mockUnbindIde
+      .mockRejectedValueOnce(new Error("network error"))
+      .mockResolvedValueOnce({ ok: true });
+    const { onClose } = setup({ currentBinding: sampleBinding });
+
+    await waitFor(() => {
+      expect(screen.getByText("Neovim")).toBeInTheDocument();
+    });
+
+    // Trigger disconnect via D shortcut.
+    fireEvent.keyDown(document, { key: "d" });
+
+    // Wait for the failure to surface as an error/retry affordance.
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    });
+
+    // Clicking Retry must re-attempt the DISCONNECT, not a bind.
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /retry/i }));
+
+    await waitFor(() => {
+      expect(mockUnbindIde).toHaveBeenCalledTimes(2);
+    });
+    // Critically: bindIde must NOT have been called.
+    expect(mockBindIde).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
   });
 
   it("close button (×) triggers onClose without calling bindIde", async () => {

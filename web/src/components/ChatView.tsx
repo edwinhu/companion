@@ -1,4 +1,4 @@
-import { useMemo, useState, useCallback, useRef, useEffect } from "react";
+import { useMemo, useState, useCallback, useRef, useEffect, useLayoutEffect } from "react";
 import { useStore } from "../store.js";
 import { api } from "../api.js";
 import { captureException } from "../analytics.js";
@@ -77,10 +77,20 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   // Switching sessions must reset the banner state — the ref belongs to
   // *this* session only, and we don't want stale banners leaking across tabs.
-  useEffect(() => {
+  // Issue #6: also close any open IdePicker — leaving the modal open across
+  // a session switch re-targets its bind at the wrong session.
+  //
+  // Issue #6 refinement (codex adversarial review): use useLayoutEffect so
+  // the idePickerOpen reset happens BEFORE the new session's first render
+  // paint. Plain useEffect fires post-commit, which on slow rerenders can
+  // briefly render the IdePicker with the NEW sessionId while idePickerOpen
+  // is still true from the OLD session — creating a single-frame window
+  // where a bind dispatched via Enter targets the wrong session.
+  useLayoutEffect(() => {
     previousIdeBindingRef.current = null;
     setDisconnectedBindingId(null);
     setDismissedForBinding(null);
+    setIdePickerOpen(false);
     // Seed the ref with the current binding (if any) so a later disconnect
     // within this session still triggers the banner.
     if (ideBinding) previousIdeBindingRef.current = ideBinding;

@@ -10,7 +10,7 @@
 // subdirectory files (fs-routes, env-routes, etc.).
 
 import type { Hono } from "hono";
-import type { WsBridge } from "../ws-bridge.js";
+import { stripAuthToken, type WsBridge } from "../ws-bridge.js";
 
 interface IdeSessionRoutesDeps {
   wsBridge: WsBridge;
@@ -57,6 +57,11 @@ export function registerIdeSessionRoutes(api: Hono, deps: IdeSessionRoutesDeps):
       if (result.error === "unknown port") {
         return c.json({ error: "unknown port" }, 400);
       }
+      if (result.error === "backend not connected") {
+        // 409 Conflict — the session exists but is not in a state where
+        // binding is possible (CLI/adapter not attached yet).
+        return c.json({ error: "backend not connected" }, 409);
+      }
       // Defensive: any future error string from bindIde surfaces as 500
       // rather than being silently mapped to one of the known codes.
       return c.json({ error: result.error }, 500);
@@ -64,7 +69,13 @@ export function registerIdeSessionRoutes(api: Hono, deps: IdeSessionRoutesDeps):
 
     // Re-read binding from session state so the response reflects exactly
     // what was persisted, not a locally-constructed shape.
-    return c.json({ ok: true, binding: session.state.ideBinding ?? null });
+    //
+    // BIND-03 SECURITY: strip `authToken` before shipping the binding to the
+    // browser — the token is runtime-only / server-internal.
+    const binding = session.state.ideBinding
+      ? stripAuthToken(session.state.ideBinding)
+      : null;
+    return c.json({ ok: true, binding });
   });
 
   // DELETE /sessions/:id/ide — clear any IDE binding on the session.
@@ -73,13 +84,26 @@ export function registerIdeSessionRoutes(api: Hono, deps: IdeSessionRoutesDeps):
   // binding still returns 200 {ok:true}. Nonexistent sessions return 404
   // (distinct from "already cleared") so the FE can differentiate bad
   // session ids from successful cleanups.
+  //
+  // Codex round-2 issue #1: unbindIde now fails with
+  // {ok:false, error:"backend not connected"} when a real binding exists
+  // but the adapter is detached/disconnected/rejects the send. We surface
+  // that as 409 Conflict (same as POST's bind-without-connected-backend
+  // branch) so the UI can show the Retry affordance instead of pretending
+  // the tear-down succeeded.
   api.delete("/sessions/:id/ide", async (c) => {
     const id = c.req.param("id");
     const session = wsBridge.getSession(id);
     if (!session) {
       return c.json({ error: "session not found" }, 404);
     }
-    await wsBridge.unbindIde(id);
+    const result = await wsBridge.unbindIde(id);
+    if (!result.ok) {
+      if (result.error === "backend not connected") {
+        return c.json({ error: "backend not connected" }, 409);
+      }
+      return c.json({ error: result.error }, 500);
+    }
     return c.json({ ok: true });
   });
 }

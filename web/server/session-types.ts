@@ -317,7 +317,30 @@ export type BrowserOutgoingMessage =
   | { type: "mcp_get_status"; client_msg_id?: string }
   | { type: "mcp_toggle"; serverName: string; enabled: boolean; client_msg_id?: string }
   | { type: "mcp_reconnect"; serverName: string; client_msg_id?: string }
-  | { type: "mcp_set_servers"; servers: Record<string, McpServerConfig>; client_msg_id?: string }
+  | {
+      type: "mcp_set_servers";
+      servers: Record<string, McpServerConfig>;
+      /**
+       * Explicit per-key removal signal. Used by `unbindIde` to delete a
+       * previously-upserted MCP server entry. Needed because Codex's
+       * `config/batchWrite` treats `servers: {}` as zero upserts with NO
+       * deletions — an empty record can never express "remove this key".
+       *
+       * Semantics:
+       *   - Codex adapter: for each name in `deleteKeys`, issues a
+       *     `config/value/write` with `value: null, mergeStrategy: "replace"`
+       *     (reusing the pattern at codex-adapter.ts:1478 for invalid-transport
+       *     cleanup). Executes BEFORE `servers` upserts so a single
+       *     `mcp_set_servers` with both fields is well-defined.
+       *   - Claude adapter: IGNORED at the adapter layer. Claude's upstream
+       *     `mcp_set_servers` control_request already clears dynamic entries
+       *     that aren't present in `servers`, so an empty `servers: {}` is a
+       *     full replacement. Stripping `deleteKeys` keeps the wire payload
+       *     compliant with the Claude SDK schema.
+       */
+      deleteKeys?: string[];
+      client_msg_id?: string;
+    }
   | { type: "set_ai_validation"; aiValidationEnabled?: boolean | null; aiValidationAutoApprove?: boolean | null; aiValidationAutoDeny?: boolean | null; client_msg_id?: string }
   | { type: "end_session"; reason?: string; client_msg_id?: string }
   | { type: "stop_task"; task_id: string; client_msg_id?: string }

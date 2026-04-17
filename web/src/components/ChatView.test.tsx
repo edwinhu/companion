@@ -362,6 +362,47 @@ describe("ChatView", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  // Issue #6: switching sessions while the IdePicker is open must CLOSE the
+  // picker. Otherwise the modal state leaks across sessions: user opens /ide
+  // on session A, clicks session B in the sidebar, and sees the picker still
+  // open — but it's now bound to session B (wrong cwd, wrong binding, wrong
+  // bind target). Reset idePickerOpen whenever sessionId changes.
+  it("resets idePickerOpen when sessionId prop changes", () => {
+    // Two sessions in the store so ChatView can render either.
+    const connMap = new Map<string, string>();
+    connMap.set("s1", "connected");
+    connMap.set("s2", "connected");
+    const cliMap = new Map<string, boolean>();
+    cliMap.set("s1", true);
+    cliMap.set("s2", true);
+    const sessions = new Map<string, SessionStub>();
+    sessions.set("s1", { session_id: "s1", cwd: "/Users/me/proj-a", ideBinding: null });
+    sessions.set("s2", { session_id: "s2", cwd: "/Users/me/proj-b", ideBinding: null });
+    mockStoreState = {
+      connectionStatus: connMap,
+      cliConnected: cliMap,
+      cliReconnecting: new Map(),
+      pendingPermissions: new Map(),
+      aiResolvedPermissions: new Map(),
+      sessions,
+      clearAiResolvedPermissions: vi.fn(),
+      setCliReconnecting: mockSetCliReconnecting,
+    };
+
+    const { rerender } = render(<ChatView sessionId="s1" />);
+    // Open picker on session s1.
+    fireEvent.click(screen.getByTestId("composer-open-ide"));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByTestId("ide-picker-session").textContent).toBe("s1");
+
+    // Switch sessions — real app fires this when the user clicks another
+    // session in the sidebar. The picker must NOT remain open with the new
+    // sessionId; if it did, binds against s2 would use whatever port was
+    // selected under s1 and the picker would show the wrong cwd/binding.
+    rerender(<ChatView sessionId="s2" />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
   // UI-03: currentBinding is forwarded to IdePicker so the picker can render
   // the "currently bound" affordance (Disconnect button, highlight, etc.).
   it("UI-03: forwards currentBinding to IdePicker when session has one", () => {

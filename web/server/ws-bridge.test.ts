@@ -5291,6 +5291,147 @@ describe("IDE binding (bindIde / unbindIde)", () => {
     ).toBe(true);
   });
 
+  // BIND-10 (Round-4 robustness): when the IDE lockfile goes away AND the
+  // backend adapter is disconnected, unbindIde's wire send fails. Without
+  // a force path, `session.state.ideBinding` would stay pointing at the
+  // dead IDE — UI shows it bound, MCP mirror keeps the stale entry, and
+  // the disconnect banner never fires. The auto-unbind listener must
+  // detect unbindIde's failure and force-clear local state so reality
+  // matches the on-disk truth (IDE is gone).
+  it("BIND-10a: ide:removed while backend disconnected force-clears local ideBinding and broadcasts", async () => {
+    await seedIde({ port: 67001, ideName: "Neovim" });
+
+    // Build an adapter that is "connected" for the initial bind (so the
+    // bind succeeds), then flip to disconnected before the ide:removed
+    // event so unbindIde's wire send fails.
+    const sendCalls: any[] = [];
+    let connected = true;
+    const adapter = {
+      isConnected: () => connected,
+      send: (msg: any) => {
+        sendCalls.push(msg);
+        return connected;
+      },
+      disconnect: async () => {},
+      onBrowserMessage: () => {},
+      onSessionMeta: () => {},
+      onDisconnect: () => {},
+      onInitError: () => {},
+    };
+
+    bridge.getOrCreateSession("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+
+    // Bind with backend connected.
+    await bridge.bindIde("s1", 67001);
+    const session = bridge.getSession("s1")!;
+    expect(session.state.ideBinding?.port).toBe(67001);
+    // Sanity: the bridge's MCP mirror now has the companion-ide-neovim key.
+    expect(session.dynamicMcpServers["companion-ide-neovim"]).toBeDefined();
+    browser.send.mockClear();
+    sendCalls.length = 0;
+
+    // Backend goes away (e.g. CLI process died). Now simulate the
+    // lockfile being removed by discovery.
+    connected = false;
+    companionBus.emit("ide:removed", {
+      port: 67001,
+      lockfilePath: join(ideTmpDir, "67001.lock"),
+      generation: 2,
+    });
+    // Auto-unbind is fire-and-forget — wait a tick for the promise chain.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Even though unbindIde's wire send failed (backend disconnected),
+    // the force-clear path must still set ideBinding to null and purge
+    // the MCP mirror. Otherwise the UI stays stuck "bound" to a dead IDE.
+    expect(
+      bridge.getSession("s1")!.state.ideBinding,
+      "BIND-10a: dead-IDE ideBinding must be force-cleared to null",
+    ).toBeNull();
+    expect(
+      bridge.getSession("s1")!.dynamicMcpServers["companion-ide-neovim"],
+      "BIND-10a: stale MCP mirror entry must be purged",
+    ).toBeUndefined();
+
+    // The disconnect banner relies on receiving a session_update with
+    // ideBinding === null. Force-clear must broadcast this to the browser.
+    const broadcasts = browser.send.mock.calls
+      .map(([arg]: [string]) => JSON.parse(arg))
+      .filter((m: any) => m.type === "session_update");
+    expect(
+      broadcasts.some(
+        (m: any) =>
+          m.session &&
+          Object.prototype.hasOwnProperty.call(m.session, "ideBinding") &&
+          m.session.ideBinding === null,
+      ),
+      "BIND-10a: force-clear must broadcast session_update with ideBinding:null so BIND-05 fires",
+    ).toBe(true);
+
+    // unbindIde short-circuits before adapter.send when isConnected() is
+    // false, so NO mcp_set_servers should have been sent — the force path
+    // intentionally skips the adapter entirely (backend is dead).
+    expect(
+      sendCalls.filter((m) => m.type === "mcp_set_servers"),
+      "BIND-10a: force-clear path must not attempt adapter.send",
+    ).toEqual([]);
+  });
+
+  // BIND-10b regression guard: when backend IS connected, ide:removed must
+  // still flow through the normal unbindIde path — wire send succeeds,
+  // local state cleared by the regular flow. The force path must NOT run
+  // (and in particular, must not double-broadcast or double-persist).
+  it("BIND-10b: ide:removed with backend connected runs normal unbindIde (no force path)", async () => {
+    await seedIde({ port: 67002, ideName: "Neovim" });
+
+    const { adapter, sendCalls } = makeFakeAdapter();
+    bridge.getOrCreateSession("s1");
+    const browser = makeBrowserSocket("s1");
+    bridge.handleBrowserOpen(browser, "s1");
+    bridge.attachBackendAdapter("s1", adapter, "claude");
+
+    await bridge.bindIde("s1", 67002);
+    const session = bridge.getSession("s1")!;
+    expect(session.state.ideBinding?.port).toBe(67002);
+    browser.send.mockClear();
+    sendCalls.length = 0;
+
+    companionBus.emit("ide:removed", {
+      port: 67002,
+      lockfilePath: join(ideTmpDir, "67002.lock"),
+      generation: 3,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Local state cleared by the normal unbindIde path.
+    expect(bridge.getSession("s1")!.state.ideBinding).toBeNull();
+
+    // mcp_set_servers was sent over the wire (regular unbind). The IDE
+    // key is gone from `servers` (Claude full-replace semantics).
+    const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
+    expect(mcpCalls).toHaveLength(1);
+    expect(mcpCalls[0].servers["companion-ide-neovim"]).toBeUndefined();
+
+    // Exactly ONE session_update with ideBinding:null — if the force path
+    // erroneously also ran, we'd see two. This guards against double-fire.
+    const nullBindingBroadcasts = browser.send.mock.calls
+      .map(([arg]: [string]) => JSON.parse(arg))
+      .filter(
+        (m: any) =>
+          m.type === "session_update" &&
+          m.session &&
+          Object.prototype.hasOwnProperty.call(m.session, "ideBinding") &&
+          m.session.ideBinding === null,
+      );
+    expect(
+      nullBindingBroadcasts,
+      "BIND-10b: normal path must broadcast ideBinding:null exactly once",
+    ).toHaveLength(1);
+  });
+
   // BIND-06 safety (positive form): prePopulateCommands must never be invoked
   // with "ide" or "/ide" during binding. The /ide slash is a CLIENT-ONLY
   // affordance — the CLI never sees it.

@@ -220,7 +220,17 @@ export class WsBridge {
       for (const [sessionId, session] of this.sessions) {
         if (session.state.ideBinding?.port === port) {
           // Fire-and-forget: unbindIde is idempotent and never throws.
-          void this.unbindIde(sessionId);
+          // Round-4 robustness (BIND-10): if the wire send fails because
+          // the backend adapter is disconnected, the IDE is STILL gone
+          // (discovery removed the lockfile). Force-clear local state so
+          // the UI reflects reality and the BIND-05 disconnect banner
+          // fires — otherwise the session stays stuck "bound" to a dead
+          // IDE with a stale MCP mirror entry forever.
+          void this.unbindIde(sessionId).then((result) => {
+            if (!result.ok) {
+              this.forceClearDeadIdeBinding(sessionId);
+            }
+          });
         }
       }
     });
@@ -1478,6 +1488,48 @@ export class WsBridge {
     });
 
     return { ok: true };
+  }
+
+  /**
+   * BIND-10 (Round-4): force-clear a dead IDE binding when the auto-unbind
+   * wire send failed because the backend was disconnected. The lockfile is
+   * definitively gone (discovery emitted `ide:removed`), so the binding is
+   * dead regardless of backend reachability. This path diverges from
+   * `unbindIde` in that it does NOT attempt adapter.send — it simply
+   * reconciles local state with the on-disk truth so:
+   *
+   *   - `session.state.ideBinding === null` (UI transitions out of "bound")
+   *   - `dynamicMcpServers["companion-ide-*"]` is purged (no stale entry
+   *     gets replayed next time the backend reconnects via restoreMcpState)
+   *   - a session_update broadcast fires so the BIND-05 disconnect banner
+   *     renders in every open browser tab for this session.
+   *
+   * Only called from the `ide:removed` bus listener after unbindIde has
+   * already returned {ok: false}. Safe to call when ideBinding is already
+   * null — no-ops cleanly.
+   */
+  private forceClearDeadIdeBinding(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    if (session.state.ideBinding == null) return;
+
+    // Purge any companion-ide-* entries from the MCP mirror. There should
+    // only be one, but we sweep by prefix so the cleanup is robust even if
+    // a past bug ever stashed multiples.
+    for (const key of Object.keys(session.dynamicMcpServers)) {
+      if (key.startsWith(IDE_SERVER_KEY_PREFIX)) {
+        delete session.dynamicMcpServers[key];
+      }
+    }
+
+    session.state.ideBinding = null;
+    this.persistSession(session);
+    companionBus.emit("ide:binding-changed", { sessionId, binding: null });
+
+    this.broadcastToBrowsers(session, {
+      type: "session_update",
+      session: { ideBinding: null },
+    });
   }
 
   /** Send an initialize control request with context appended to the system prompt.

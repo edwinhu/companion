@@ -67,10 +67,58 @@ const known = new Map<string, DiscoveredIde>();
 /** Count of malformed/skipped lockfile reads — diagnostic only. */
 let skippedCount = 0;
 
+/**
+ * Consecutive `readdirSync` failures for the current ideDir (DISC-06 /
+ * FIX 2). A single transient failure (EBUSY, momentary EACCES) preserves
+ * `known`; after `READDIR_FAILURE_THRESHOLD` consecutive failures we
+ * assume the directory is persistently unreachable and evict stale
+ * entries via `reconcileKnown(new Map())`. Resets to 0 on any successful
+ * readdirSync.
+ */
+let readdirFailureStreak = 0;
+const READDIR_FAILURE_THRESHOLD = 3;
+
+/**
+ * Per-path counter of consecutive `transient` reads while the path is in
+ * `known`. Bounds the carry-forward introduced by FIX 1 (DISC-05) so an
+ * IDE that silently rewrote its lockfile with new credentials (authToken,
+ * port) cannot have stale credentials served forever if every subsequent
+ * read transiently fails.
+ *
+ * Semantics:
+ *   - Incremented on each `transient` read for a path that is currently in
+ *     `known`. When the count reaches `MAX_CONSECUTIVE_TRANSIENT_READS`, the
+ *     path is NOT carried forward; reconcile will emit `ide:removed` as if
+ *     the file had gone missing.
+ *   - Cleared on any `ok` read OR on a `missing` classification for the
+ *     same path.
+ *   - Cleared when reconcile evicts the path.
+ */
+const transientCounts = new Map<string, number>();
+const MAX_CONSECUTIVE_TRANSIENT_READS = 5;
+
 /** Rescan period for dead-PID pruning. */
 const RESCAN_INTERVAL_MS = 10_000;
 /** How long to retry a partial file read (fs.watch may fire mid-write). */
 const READ_RETRY_BACKOFF_MS = [10, 30, 80];
+
+/**
+ * Outcome of attempting to read + parse a lockfile (DISC-05 / FIX 1).
+ *
+ * - `ok`: read + parse succeeded. Use the payload as the source of truth.
+ * - `missing`: the file is gone (statSync threw ENOENT). The caller
+ *   should let reconcileKnown emit `ide:removed` for any prior entry.
+ * - `transient`: the file EXISTS on disk but we couldn't read or parse it
+ *   (EBUSY from a concurrent writer, partial write that never resolved
+ *   within the retry budget). Callers must NOT evict a previously-known
+ *   entry for this path — carry it forward and let the next clean scan
+ *   refresh it. Evicting on transient failure caused spurious ide:removed
+ *   events → auto-unbind churn (see Round-4 PR #652 review).
+ */
+type ReadResult =
+  | { kind: "ok"; parsed: NonNullable<ReturnType<typeof parseLockfile>>; mtime: number }
+  | { kind: "missing" }
+  | { kind: "transient" };
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
@@ -110,20 +158,34 @@ function derivePortAndTransport(
  */
 async function readLockfileWithRetry(
   lockfilePath: string,
-): Promise<{ parsed: NonNullable<ReturnType<typeof parseLockfile>>; mtime: number } | null> {
+): Promise<ReadResult> {
   for (let attempt = 0; attempt <= READ_RETRY_BACKOFF_MS.length; attempt++) {
     let raw: string;
     let mtime: number;
     try {
       const st = statSync(lockfilePath);
-      if (!st.isFile()) return null;
+      if (!st.isFile()) return { kind: "missing" };
       mtime = st.mtimeMs;
+    } catch (err) {
+      // ENOENT = genuinely gone; any other code = transient.
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") return { kind: "missing" };
+      // statSync failed for another reason (EACCES, EBUSY): treat as
+      // transient so callers carry forward any prior known entry.
+      return { kind: "transient" };
+    }
+    try {
       raw = readFileSync(lockfilePath, "utf8");
-    } catch {
-      return null; // file vanished between readdir and read
+    } catch (err) {
+      // Vanished between stat and read → missing.
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") return { kind: "missing" };
+      // Locked / busy / permission denied → transient. File still exists
+      // on disk but we can't read it right now; preserve any prior entry.
+      return { kind: "transient" };
     }
     const parsed = parseLockfile(raw);
-    if (parsed) return { parsed, mtime };
+    if (parsed) return { kind: "ok", parsed, mtime };
     // Parse failed — might be partial write. Retry via async sleep so the
     // event loop stays responsive.
     if (attempt < READ_RETRY_BACKOFF_MS.length) {
@@ -131,9 +193,12 @@ async function readLockfileWithRetry(
       await new Promise<void>((r) => setTimeout(r, waitMs));
       continue;
     }
-    return null;
+    // Parse failed every retry AND the file is still on disk — treat as
+    // transient (likely corrupted mid-write or truly malformed). Preserve
+    // prior entries rather than evicting on what might be a brief glitch.
+    return { kind: "transient" };
   }
-  return null;
+  return { kind: "transient" };
 }
 
 function toDiscovered(
@@ -186,10 +251,20 @@ async function scanDir(dir: string): Promise<void> {
   let entries: string[];
   try {
     entries = readdirSync(dir);
+    readdirFailureStreak = 0;
   } catch {
-    // Missing dir or permission error — treat as empty, no crash.
-    // (Any previously-known entries elsewhere stay intact; we do not
-    // evict on a transient read error.)
+    // Missing dir or permission error. A single glitch should not evict
+    // entries (DISC-06a), but a persistently unreachable dir should be
+    // cleared so we don't keep reporting stale IDEs forever.
+    readdirFailureStreak++;
+    if (
+      readdirFailureStreak >= READDIR_FAILURE_THRESHOLD &&
+      known.size > 0 &&
+      !stopped &&
+      gen === scanGeneration
+    ) {
+      reconcileKnown(new Map(), gen);
+    }
     return;
   }
 
@@ -204,10 +279,49 @@ async function scanDir(dir: string): Promise<void> {
     // Post-await checkpoint: a newer scan or a stop() may have landed
     // while we were in the retry backoff. Bail before any mutation.
     if (stopped || gen !== scanGeneration) return;
-    if (!read) {
-      skippedCount++;
+    if (read.kind === "missing") {
+      // File truly gone between readdir and read. Let reconcile drop it.
+      // Also reset any pending transient streak — the file is just gone,
+      // not brittle.
+      transientCounts.delete(path);
       continue;
     }
+    if (read.kind === "transient") {
+      skippedCount++;
+      // FIX 1 (DISC-05): the file still exists on disk but we couldn't
+      // read/parse it. If we already have a healthy snapshot for this
+      // path, carry it forward so reconcile does NOT emit `ide:removed`
+      // for a live IDE. New (never-known) paths stay skipped — we can't
+      // fabricate a DiscoveredIde without valid content.
+      //
+      // DISC-05e/f: bound the carry-forward. After
+      // MAX_CONSECUTIVE_TRANSIENT_READS consecutive transient reads for
+      // the same known path, give up and let reconcile evict it — the
+      // file may have been rewritten with new credentials that we can
+      // never recover, and serving stale credentials forever is worse
+      // than a clean re-add on recovery.
+      const prior = known.get(path);
+      if (prior) {
+        const nextCount = (transientCounts.get(path) ?? 0) + 1;
+        transientCounts.set(path, nextCount);
+        if (nextCount < MAX_CONSECUTIVE_TRANSIENT_READS) {
+          nextKnown.set(path, prior);
+        }
+        // else: skip carry-forward. reconcile will emit ide:removed.
+      }
+      continue;
+    }
+    // Codex adversarial review (DISC-05g): a clean read is what resets the
+    // transient streak, regardless of downstream validation. Previously this
+    // delete sat AFTER the isPidAlive() and toDiscovered() checks, so a file
+    // that read cleanly but failed either downstream gate would skip the
+    // reset — a non-increment bug (counter neither resets nor increments).
+    // Reconcile's own removal branch masks the observable effect in the
+    // common case (path was in known → removed + counter cleared), but
+    // moving the delete here makes the semantics explicit and defends
+    // against future refactors that might change the reconcile branch's
+    // cleanup behavior.
+    transientCounts.delete(path);
     if (!isPidAlive(read.parsed.pid)) continue;
     const next = toDiscovered(path, read.parsed, read.mtime);
     if (!next) {
@@ -268,6 +382,9 @@ function reconcileKnown(
   for (const [path, entry] of known) {
     if (!nextKnown.has(path)) {
       known.delete(path);
+      // Fully drop tracking state — if the path ever comes back we want a
+      // clean slate (re-add path, fresh transient counter).
+      transientCounts.delete(path);
       companionBus.emit("ide:removed", {
         port: entry.port,
         lockfilePath: entry.lockfilePath,
@@ -438,6 +555,7 @@ function stopCurrent(): void {
   // Without this clear, listAvailableIdes() would keep returning stale
   // entries from the previous dir forever.
   known.clear();
+  transientCounts.clear();
 }
 
 /** Snapshot of currently-known IDEs. */
@@ -449,7 +567,9 @@ export function listAvailableIdes(): DiscoveredIde[] {
 export function resetIdeDiscoveryForTests(): void {
   stopCurrent();
   known.clear();
+  transientCounts.clear();
   skippedCount = 0;
+  readdirFailureStreak = 0;
   // Bump generation so any async scan still in-flight from a previous test
   // will see a stale generation on its post-await recheck and bail out.
   scanGeneration++;
@@ -458,4 +578,41 @@ export function resetIdeDiscoveryForTests(): void {
 /** Diagnostic accessor (not part of the public contract). */
 export function _getSkippedCountForTests(): number {
   return skippedCount;
+}
+
+/**
+ * Test-only: reset the DISC-06 readdir failure streak counter without
+ * clearing `known`. Lets DISC-06 tests stage failure sequences without
+ * tearing down the seeded IDE state.
+ */
+export function _resetReaddirFailureStreakForTests(): void {
+  readdirFailureStreak = 0;
+}
+
+/**
+ * Test-only: reset the per-path consecutive-transient-read counters
+ * (DISC-05e/f) without clearing `known`. Lets tests stage a clean streak
+ * starting at 0 on top of seeded IDE state.
+ */
+export function _resetTransientCountsForTests(): void {
+  transientCounts.clear();
+}
+
+/**
+ * Test-only: inspect the per-path transient-read counter. Used by
+ * DISC-05g/DISC-05h to assert the counter is cleared on clean reads and
+ * on missing-file reconciliation, regardless of downstream validation
+ * outcome.
+ */
+export function _getTransientCountForTests(path: string): number | undefined {
+  return transientCounts.get(path);
+}
+
+/**
+ * Test-only: invoke scanDir deterministically. Production callers use
+ * fs.watch / setInterval fan-out; tests need a direct await point so
+ * they can stage mocked readdirSync / readFileSync behavior per scan.
+ */
+export async function _scanDirForTests(dir: string): Promise<void> {
+  await scanDir(dir);
 }

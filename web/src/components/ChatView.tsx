@@ -61,11 +61,21 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   // Detect transitions. Non-null → null surfaces the banner (unless the user
   // has already dismissed *this exact* disconnect); a new non-null updates
-  // the ref so the next disconnect can be detected.
+  // the ref AND clears any in-flight banner state so a rebind removes the
+  // "IDE disconnected" message even if the user never dismissed it.
+  //
+  // BIND-09 (cubic PR #652 round-3 P2): without clearing
+  // `disconnectedBindingId` on the null → non-null transition, the banner
+  // persists across a rebind — stale state drives `showIdeDisconnectBanner`
+  // to true even though the session is bound again. Clear both that and
+  // `dismissedForBinding` so the state machine resets cleanly.
   useEffect(() => {
     const prev = previousIdeBindingRef.current;
     if (ideBinding) {
       previousIdeBindingRef.current = ideBinding;
+      // Rebind resets the banner state — user has a working binding again.
+      setDisconnectedBindingId(null);
+      setDismissedForBinding(null);
     } else if (prev) {
       const id = bindingId(prev);
       setDisconnectedBindingId(id);

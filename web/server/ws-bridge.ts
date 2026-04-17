@@ -93,6 +93,83 @@ const RETRYABLE_BACKEND_MESSAGE_TYPES = new Set<BrowserOutgoingMessage["type"]>(
   "mcp_set_servers",
 ]);
 
+/**
+ * Reserved MCP-server key prefix for Companion-managed IDE entries.
+ *
+ * Codex round-5 BLOCK 1: two-layer protection against namespace collisions
+ * with user-supplied `mcp_set_servers` payloads.
+ *
+ *   Layer 1 — producer side (bindIde / unbindIde): always construct their
+ *     server key as `${IDE_SERVER_KEY_PREFIX}<sanitizedIdeName>` so bridge-
+ *     authored IDE entries live in a dedicated namespace, separate from
+ *     anything a sanitized user ideName could produce (sanitizer emits
+ *     `[a-z0-9]+`; hyphens in the prefix are structurally distinguishing).
+ *
+ *   Layer 2 — consumer side (routeBrowserMessage): when a user (or any
+ *     caller routing through `routeBrowserMessage`) sends `mcp_set_servers`,
+ *     strip any keys that start with this prefix from both the `servers`
+ *     map and the `deleteKeys` array BEFORE mirror update AND before
+ *     adapter.send. A malicious or accidental `servers: { "companion-ide-
+ *     neovim": {...} }` would otherwise occupy our reserved namespace and
+ *     collide with bindIde/unbindIde (e.g., delete our IDE entry via
+ *     `deleteKeys: ["companion-ide-neovim"]`, or clobber our entry with
+ *     user-controlled contents).
+ *
+ * Any change to this literal must be reflected in BOTH bindIde/unbindIde
+ * (producers) and the stripper applied in routeBrowserMessage (consumer).
+ */
+const IDE_SERVER_KEY_PREFIX = "companion-ide-";
+
+/**
+ * Return `true` if `key` is in the reserved IDE-server namespace (has the
+ * `companion-ide-` prefix). Prefix-match only — substring matches (e.g.
+ * `"mycompanion-ide-helper"`) are NOT reserved and pass through unchanged.
+ */
+function isReservedIdeServerKey(key: string): boolean {
+  return key.startsWith(IDE_SERVER_KEY_PREFIX);
+}
+
+/**
+ * Sanitize a user-originated `mcp_set_servers` payload by removing any keys
+ * in the reserved `companion-ide-*` namespace. Returns a fresh `servers`
+ * map and a fresh `deleteKeys` array (or `undefined` if `deleteKeys` was
+ * not provided and no stripping happened) plus a list of the keys that
+ * were stripped (empty if none) so the caller can emit a single warning.
+ *
+ * The input objects are never mutated.
+ */
+export function stripReservedIdeKeys(
+  servers: Record<string, McpServerConfig>,
+  deleteKeys: string[] | undefined,
+): {
+  servers: Record<string, McpServerConfig>;
+  deleteKeys: string[] | undefined;
+  stripped: string[];
+} {
+  const stripped: string[] = [];
+  const cleanServers: Record<string, McpServerConfig> = {};
+  for (const [k, v] of Object.entries(servers)) {
+    if (isReservedIdeServerKey(k)) {
+      stripped.push(k);
+    } else {
+      cleanServers[k] = v;
+    }
+  }
+  let cleanDeleteKeys: string[] | undefined = deleteKeys;
+  if (deleteKeys && deleteKeys.length > 0) {
+    const filtered: string[] = [];
+    for (const k of deleteKeys) {
+      if (isReservedIdeServerKey(k)) {
+        stripped.push(k);
+      } else {
+        filtered.push(k);
+      }
+    }
+    cleanDeleteKeys = filtered;
+  }
+  return { servers: cleanServers, deleteKeys: cleanDeleteKeys, stripped };
+}
+
 export class WsBridge {
   private static readonly PROCESSED_CLIENT_MSG_ID_LIMIT = 1000;
   /** Maximum number of queued browser→backend messages per session to prevent unbounded memory growth. */
@@ -1150,30 +1227,55 @@ export class WsBridge {
       scope: "dynamic",
     };
 
-    // Use the sanitized ideName (lowercase, alphanumeric only) as the MCP server
-    // key instead of the literal "ide". This is critical for tool exposure:
+    // Build the MCP server key from the sanitized ideName, prefixed with
+    // `"companion-ide-"` to namespace it away from any user-configured dynamic
+    // MCP server. Three reasons the prefix matters:
     //
-    // The Claude Code CLI binary contains a hardcoded filter (`_35`) that blocks
-    // all MCP tools prefixed `mcp__ide__*` EXCEPT `getDiagnostics` and
-    // `executeCode`. When the server is named "ide", the CLI prefixes every tool
-    // as `mcp__ide__<name>` — the filter then silently drops 8 of 10 tools.
+    // (1) TOOL EXPOSURE (original BIND-07): the Claude Code CLI binary contains
+    //     a hardcoded filter (`_35`) that blocks all MCP tools prefixed
+    //     `mcp__ide__*` EXCEPT `getDiagnostics` and `executeCode`. When the
+    //     server is named "ide", the CLI prefixes every tool as
+    //     `mcp__ide__<name>` and the filter silently drops 8 of 10 tools.
+    //     Using `mcp__companion-ide-<name>__*` bypasses the filter entirely —
+    //     any non-empty character between `mcp__` and the next `__` breaks
+    //     the exact-match filter, and hyphens are legal in MCP tool names.
     //
-    // Using a name like "neovim" causes the CLI to prefix tools as
-    // `mcp__neovim__*` — no match against the filter, all 10 tools pass through.
+    // (2) NAMESPACE COLLISION (cubic P1, prior fix): the bare sanitized name
+    //     (e.g. `"neovim"`) shared a namespace with user MCP servers. If a
+    //     user registered a dynamic MCP server literally named `"neovim"`,
+    //     bindIde would overwrite it and unbindIde would delete it. Adding
+    //     any prefix reduces the likelihood, but an attacker/user could still
+    //     pick the prefixed form (e.g. `"companionideneovim"`).
     //
-    // Reference: HYPOTHESES.md H4 (confirmed) + Option 3 (confirmed fix).
-    // Regression test: BIND-07 in ws-bridge.test.ts.
-    const serverKey = ide.ideName.toLowerCase().replace(/[^a-z0-9]/g, "");
+    // (3) STRUCTURAL SEPARATOR (codex round-4 review, this fix): the prefix
+    //     must share NO characters with the post-sanitization output of user
+    //     ideNames. Our sanitizer is `ideName.toLowerCase().replace(/[^a-z0-9]/g, "")`
+    //     which emits `[a-z0-9]+`. The hyphens in `"companion-ide-"` are
+    //     stripped from any user ideName, so the keyspace of IDE entries
+    //     (`companion-ide-[a-z0-9]+`) is DISJOINT from anything a user-sanitized
+    //     key can look like. No collision is reachable via the public
+    //     `mcp_set_servers` path — users can literally name their MCP server
+    //     `"companion-ide-neovim"`, but that still collides with *themselves*,
+    //     not with us, because the user key goes through a different write
+    //     path that doesn't re-sanitize.
+    //
+    // Reference: HYPOTHESES.md H4 (confirmed) + Option 3 (confirmed fix) +
+    // cubic-ai PR #652 round-3 Issue 1 + codex round-4 BLOCK 1.
+    // Regression tests: BIND-07, BIND-08, BIND-08d in ws-bridge.test.ts.
+    const sanitizedIdeName = ide.ideName.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-    // Round-4 Codex review, Issue 2: reject empty-sanitized keys. A lockfile
-    // whose ideName is all punctuation (e.g. "!?", "---") would sanitize to
-    // "" and cause the CLI to register an `mcp_servers.""` orphan that
-    // `unbindIde`'s empty-key guard then refuses to delete. Short-circuit
-    // BEFORE any adapter write — same error shape as the other bind errors
-    // so routes/ide-session-routes maps to 400 and nothing is sent on wire.
-    if (serverKey.length === 0) {
+    // Round-4 Codex review, Issue 2 + cubic round-3: reject empty-sanitized
+    // tails. A lockfile whose ideName is all punctuation (e.g. "!?", "---")
+    // would sanitize to "" — even with the `companion-ide-` prefix we must
+    // reject, otherwise every such lockfile would register under the same
+    // literal key `"companion-ide-"` and collide across different IDE processes.
+    // Short-circuit BEFORE any adapter write — same error shape as the other
+    // bind errors so routes/ide-session-routes maps to 400 and nothing is
+    // sent on the wire.
+    if (sanitizedIdeName.length === 0) {
       return { ok: false, error: "invalid IDE name" };
     }
+    const serverKey = `${IDE_SERVER_KEY_PREFIX}${sanitizedIdeName}`;
 
     // CORRECTNESS: require a live, connected backend adapter. Without it,
     // the CLI will never learn about the IDE and any binding we record is
@@ -1318,12 +1420,14 @@ export class WsBridge {
         return { ok: false, error: "backend not connected" };
       }
     }
-    // Recompute `serverKey` with the same BIND-07 sanitization that
-    // `bindIde` used (`ideName.toLowerCase().replace(/[^a-z0-9]/g, "")`).
+    // Recompute `serverKey` with the same BIND-07/BIND-08 sanitization +
+    // `companion-ide-` structural-separator prefix that `bindIde` used.
     // `ideBinding.ideName` is always the canonical source — the CLI was
-    // taught that key and will only delete it if we target it exactly.
+    // taught that prefixed key at bind time and will only delete it if we
+    // target it exactly.
     const boundIdeName = session.state.ideBinding?.ideName ?? "";
-    const serverKey = boundIdeName.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const sanitizedIdeName = boundIdeName.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const serverKey = sanitizedIdeName ? `${IDE_SERVER_KEY_PREFIX}${sanitizedIdeName}` : "";
 
     // Round-4 Codex review, Issue 1: the outbound payload is backend-specific
     // so other user-configured dynamic MCP servers are preserved.
@@ -1564,10 +1668,47 @@ export class WsBridge {
     // the user explicitly deletes the IDE key via `deleteKeys`. Codex is
     // per-key upsert (not full-replace), so no injection needed there.
     if (msg.type === "mcp_set_servers") {
+      // Codex round-5 BLOCK 1: reserved-namespace stripping. Any caller going
+      // through `routeBrowserMessage` is USER-ORIGINATED (browser payload via
+      // handleBrowserMessage, or programmatic `injectMcpSetServers`). Neither
+      // is allowed to occupy the `companion-ide-*` namespace — only
+      // bindIde/unbindIde (which write directly via adapter.send, bypassing
+      // this path) may touch those keys. Strip any reserved keys from BOTH
+      // `servers` and `deleteKeys` BEFORE the merge injection, mirror update,
+      // and adapter.send. Without this, a user payload of
+      // `{servers: {"companion-ide-neovim": {...}}}` would overwrite our
+      // bridge-authored IDE entry (or `{deleteKeys: ["companion-ide-neovim"]}`
+      // would delete it) and produce a split-brain between UI and CLI.
+      const { servers: cleanServers, deleteKeys: cleanDeleteKeys, stripped } =
+        stripReservedIdeKeys(msg.servers, msg.deleteKeys);
+      if (stripped.length > 0) {
+        log.warn(
+          "ws-bridge",
+          "Stripped reserved companion-ide-* keys from user mcp_set_servers payload",
+          {
+            sessionId: session.id,
+            strippedKeys: stripped,
+          },
+        );
+        msg = { ...msg, servers: cleanServers, deleteKeys: cleanDeleteKeys };
+      }
+
       if (session.backendType === "claude" && session.state.ideBinding) {
-        const ideKey = session.state.ideBinding.ideName
+        // Must match the `companion-ide-`-prefixed structural-separator key
+        // that bindIde/unbindIde use (BIND-08 / BIND-08d). Using the bare
+        // sanitized name here would fail to detect the IDE entry in
+        // session.dynamicMcpServers.
+        const sanitizedIdeName = session.state.ideBinding.ideName
           .toLowerCase()
           .replace(/[^a-z0-9]/g, "");
+        const ideKey = sanitizedIdeName ? `${IDE_SERVER_KEY_PREFIX}${sanitizedIdeName}` : "";
+        // Post-strip invariant: the reserved-key stripper above has already
+        // removed any user-supplied entry for `ideKey` from msg.servers and
+        // msg.deleteKeys. `explicitlyDeleted` / `alreadyPresent` can therefore
+        // only be true if a prior adapter-level caller (which bypasses the
+        // stripper) set them — and that never happens on this path. We still
+        // evaluate them defensively to keep the merge-injection semantics
+        // idempotent if the stripping contract ever shifts.
         const explicitlyDeleted = !!msg.deleteKeys?.includes(ideKey);
         const alreadyPresent = Object.prototype.hasOwnProperty.call(
           msg.servers,
@@ -1726,7 +1867,37 @@ export class WsBridge {
       // before enqueue) just reapplies the same mutation. Must run BEFORE
       // `adapter.send()` so bindIde's pre-drain → mirror-read sequence
       // sees the mirror up to date even if send() fails and we re-queue.
+      //
+      // BIND-08h (Codex CONDITIONAL-GO → blocking defensive invariant):
+      // re-run `stripReservedIdeKeys` at the replay site. Today
+      // `routeBrowserMessage` is the only enqueue path and it already
+      // strips before enqueue, so this is a no-op in practice. But by
+      // making the strip a STRUCTURAL INVARIANT at every mirror write
+      // site (not a caller contract), we defend against any future code
+      // path that might enqueue an unsanitized `mcp_set_servers` — a
+      // deserialized-from-disk payload, a new adapter hook, a direct
+      // `session.pendingMessages.push` from another module. Without
+      // this, such a bug would silently pollute the `companion-ide-*`
+      // namespace on replay.
       if (queuedMsg.type === "mcp_set_servers") {
+        const { servers: cleanServers, deleteKeys: cleanDeleteKeys, stripped } =
+          stripReservedIdeKeys(queuedMsg.servers, queuedMsg.deleteKeys);
+        if (stripped.length > 0) {
+          log.warn(
+            "ws-bridge",
+            "Stripped reserved companion-ide-* keys from queued mcp_set_servers during flush replay",
+            {
+              sessionId: session.id,
+              strippedKeys: stripped,
+              reason,
+            },
+          );
+          // Rebuild the sanitized message so the mirror update AND the
+          // outbound send both see the cleaned shape. Replace the local
+          // `queuedMsg` so the subsequent `adapter.send(queuedMsg)` below
+          // forwards the sanitized payload to the backend.
+          queuedMsg = { ...queuedMsg, servers: cleanServers, deleteKeys: cleanDeleteKeys };
+        }
         this.updateDynamicMcpServers(session, queuedMsg.servers, queuedMsg.deleteKeys);
       }
 

@@ -2158,6 +2158,96 @@ describe("getAvailableIdes (Task 9)", () => {
     const [, opts] = mockFetch.mock.calls[0];
     expect(opts?.signal).toBe(controller.signal);
   });
+
+  // ─── cubic PR #652 round-3 (P2): AbortError must not be tracked as a failure ─
+  //
+  // Context: after we added abortable GETs (BRITTLE 1), IdePicker cleanup
+  // cancels in-flight `/api/ide/available` requests. fetch() rejects with
+  // an AbortError (a DOMException in browsers, a plain Error in jsdom), which
+  // the outer catch forwarded to `trackApiFailure` → analytics. Those events
+  // are noise: the cancellation is expected UX, not a server / transport
+  // fault. `trackApiFailure` also calls `captureException`, so the noise
+  // surfaces in Sentry too.
+  //
+  // Fix: in every `catch (error)` path that reports to `trackApiFailure`,
+  // skip tracking when the error name is "AbortError". Still rethrow so
+  // callers can distinguish the cancellation from a real failure.
+  //
+  // Abort-01 / Abort-02 pin the contract on BOTH sides of the branch.
+  it("Abort-01: rethrows AbortError but does NOT report a failure to analytics", async () => {
+    // Build an AbortError shaped like the one jsdom / node-fetch produces.
+    // Using a plain Error with name=AbortError matches the node path; the
+    // production browser path produces a DOMException with the same .name.
+    // Both must be treated identically.
+    const abortError = new Error("The operation was aborted.");
+    abortError.name = "AbortError";
+    mockFetch.mockRejectedValueOnce(abortError);
+
+    const controller = new AbortController();
+    // Abort immediately — we don't actually need the signal to fire for
+    // fetch to reject; the mock simulates the post-abort rejection itself.
+    controller.abort();
+
+    await expect(
+      getAvailableIdes(undefined, controller.signal),
+    ).rejects.toThrow("The operation was aborted.");
+
+    // Critical regression guard: neither tracking path must fire for a
+    // cancellation. `api_request_failed` is the analytics event;
+    // captureException feeds Sentry.
+    expect(captureEventMock).not.toHaveBeenCalledWith(
+      "api_request_failed",
+      expect.anything(),
+    );
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+  });
+
+  it("Abort-02: a non-abort network error STILL reports a failure (regression guard)", async () => {
+    // Make sure the AbortError branch didn't accidentally short-circuit the
+    // normal failure-tracking path for real transport errors.
+    mockFetch.mockRejectedValueOnce(new Error("Network down"));
+
+    await expect(getAvailableIdes()).rejects.toThrow("Network down");
+
+    expect(captureEventMock).toHaveBeenCalledWith(
+      "api_request_failed",
+      expect.objectContaining({ method: "GET", path: "/ide/available" }),
+    );
+    expect(captureExceptionMock).toHaveBeenCalled();
+  });
+
+  // ─── Abort-03: explicit DOMException branch (codex round-4 NIT) ────────────
+  //
+  // Context: `isAbortError` has two branches — a `DOMException` check (the
+  // production browser shape) and a plain-Error fallback (jsdom / node-fetch).
+  // Abort-01 covers the plain-Error path; the NIT asks for explicit coverage
+  // of the DOMException path too so a future edit cannot regress one branch
+  // in isolation. jsdom's `DOMException` constructor accepts `(message, name)`
+  // and sets `.name` correctly, which is exactly what production browsers do.
+  it("Abort-03: DOMException with name=AbortError is also treated as a cancellation (DOMException branch)", async () => {
+    // In jsdom, `DOMException` is a real constructor. Using it here exercises
+    // the `error instanceof DOMException` branch of `isAbortError`, which
+    // Abort-01 (plain Error) does NOT reach.
+    const domAbort = new DOMException("The operation was aborted.", "AbortError");
+    expect(domAbort).toBeInstanceOf(DOMException);
+    expect(domAbort.name).toBe("AbortError");
+
+    mockFetch.mockRejectedValueOnce(domAbort);
+
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      getAvailableIdes(undefined, controller.signal),
+    ).rejects.toThrow("The operation was aborted.");
+
+    // Same contract as Abort-01: no analytics noise, no Sentry capture.
+    expect(captureEventMock).not.toHaveBeenCalledWith(
+      "api_request_failed",
+      expect.anything(),
+    );
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("bindIde (Task 9)", () => {

@@ -450,14 +450,20 @@ describe("POST /api/sessions/:id/ide", () => {
     });
     expect(res.status).toBe(200);
 
-    // Exactly one mcp_set_servers call; it carries the sanitized ideName as key
-    // (not the literal "ide"). BIND-07: using "ide" triggers the CLI's _35 filter
-    // that silently drops 8 of 10 tools. The fix uses ideName.toLowerCase()
-    // stripped to alphanumeric — "Neovim" → "neovim" — so tools are prefixed
-    // mcp__neovim__* and bypass the filter entirely.
+    // Exactly one mcp_set_servers call; it carries the sanitized ideName as
+    // key, prefixed with "companion-ide-" (BIND-08 / BIND-08d). Using the
+    // literal "ide" triggers the CLI's _35 filter (BIND-07 — silently drops
+    // 8 of 10 tools); using the bare "neovim" would collide with a user's
+    // own MCP server of the same name (BIND-08 namespace); using
+    // "companionide" without a structural separator would still share the
+    // sanitization namespace with user keys (BIND-08d). The hyphenated
+    // prefix avoids all three failure modes — "Neovim" → "companion-ide-neovim".
     const mcpCalls = sendCalls.filter((m) => m.type === "mcp_set_servers");
     expect(mcpCalls).toHaveLength(1);
-    expect(mcpCalls[0].servers).toHaveProperty("neovim"); // "Neovim" → sanitized key
+    expect(mcpCalls[0].servers).toHaveProperty("companion-ide-neovim");
+    // Must NOT use the bare sanitized name or the literal "ide".
+    expect(mcpCalls[0].servers).not.toHaveProperty("neovim");
+    expect(mcpCalls[0].servers).not.toHaveProperty("ide");
 
     // Zero user_message calls containing "/ide" text. We check permissively
     // because user_message payloads vary in shape across Claude vs. Codex.

@@ -547,6 +547,58 @@ describe("ChatView", () => {
     expect(mockRelaunchSession).not.toHaveBeenCalled();
   });
 
+  // ─── BIND-09 (cubic PR #652 round-3 P2): rebind clears the disconnect banner ─
+  //
+  // Context: the transition effect handles non-null → null (show banner) and
+  // seeds `previousIdeBindingRef` on non-null. But it previously did NOT clear
+  // `disconnectedBindingId` / `dismissedForBinding` when the user rebound an
+  // IDE after a disconnect. Sequence that broke:
+  //   1. User bound an IDE, it disconnected → banner shown.
+  //   2. User rebound via /ide → session record now has a non-null binding.
+  //   3. Banner STILL visible (stale disconnectedBindingId was never cleared).
+  //
+  // Fix: when `ideBinding` transitions to non-null, clear both
+  // `disconnectedBindingId` and `dismissedForBinding` so the banner unmounts.
+  //
+  // This test pins: bind → disconnect → banner → rebind → banner GONE.
+  it("BIND-09: rebinding after a disconnect clears the disconnect banner", () => {
+    // Start bound — seeds the ref on mount via useLayoutEffect.
+    setupStore({
+      session: {
+        session_id: "s1",
+        cwd: "/Users/me/proj",
+        ideBinding: NVIM_BINDING,
+      },
+    });
+    const { rerender } = render(<ChatView sessionId="s1" />);
+    // No banner while bound.
+    expect(screen.queryByTestId("ide-disconnect-banner")).toBeNull();
+
+    // Simulate the server broadcasting ideBinding: null — banner must show.
+    updateSessionInStore({
+      session_id: "s1",
+      cwd: "/Users/me/proj",
+      ideBinding: null,
+    });
+    rerender(<ChatView sessionId="s1" />);
+    expect(screen.getByTestId("ide-disconnect-banner")).toBeTruthy();
+
+    // Rebind via /ide — new non-null binding. Without the fix, the banner
+    // lingers because disconnectedBindingId is still set to the prior
+    // bindingId, and dismissedForBinding is null, so showIdeDisconnectBanner
+    // remains true.
+    updateSessionInStore({
+      session_id: "s1",
+      cwd: "/Users/me/proj",
+      ideBinding: NVIM_BINDING_2,
+    });
+    rerender(<ChatView sessionId="s1" />);
+
+    // Banner is gone — the transition effect must have cleared
+    // disconnectedBindingId on the null → non-null transition.
+    expect(screen.queryByTestId("ide-disconnect-banner")).toBeNull();
+  });
+
   // Defensive: a session that was NEVER bound must not render the banner
   // on an undefined/null ideBinding — banners only fire on a transition.
   it("BIND-05: never-bound sessions do not show the banner", () => {

@@ -55,6 +55,24 @@ function trackApiFailure(
   captureException(error, { method, path, status });
 }
 
+/**
+ * Expected-cancellation errors that must NOT be reported to analytics /
+ * Sentry. Abortable GETs (IdePicker cleanup, superseded requests) reject
+ * with an AbortError — that is normal UX, not a failure.
+ *
+ * Browsers produce a DOMException with `.name === "AbortError"`; node /
+ * jsdom produces a plain Error with the same `.name`. Both paths are
+ * covered by the name check.
+ *
+ * cubic PR #652 round-3 (P2). Regression tests: Abort-01 / Abort-02 in api.test.ts.
+ */
+function isAbortError(error: unknown): boolean {
+  if (typeof DOMException !== "undefined" && error instanceof DOMException) {
+    return error.name === "AbortError";
+  }
+  return error instanceof Error && error.name === "AbortError";
+}
+
 async function post<T = unknown>(path: string, body?: object): Promise<T> {
   const startedAt = nowMs();
   let failureTracked = false;
@@ -75,7 +93,7 @@ async function post<T = unknown>(path: string, body?: object): Promise<T> {
     trackApiSuccess("POST", path, nowMs() - startedAt, res.status);
     return res.json();
   } catch (error) {
-    if (!failureTracked) {
+    if (!failureTracked && !isAbortError(error)) {
       trackApiFailure("POST", path, nowMs() - startedAt, error);
     }
     throw error;
@@ -101,7 +119,7 @@ async function get<T = unknown>(path: string, signal?: AbortSignal): Promise<T> 
     trackApiSuccess("GET", path, nowMs() - startedAt, res.status);
     return res.json();
   } catch (error) {
-    if (!failureTracked) {
+    if (!failureTracked && !isAbortError(error)) {
       trackApiFailure("GET", path, nowMs() - startedAt, error);
     }
     throw error;
@@ -128,7 +146,7 @@ async function put<T = unknown>(path: string, body?: object): Promise<T> {
     trackApiSuccess("PUT", path, nowMs() - startedAt, res.status);
     return res.json();
   } catch (error) {
-    if (!failureTracked) {
+    if (!failureTracked && !isAbortError(error)) {
       trackApiFailure("PUT", path, nowMs() - startedAt, error);
     }
     throw error;
@@ -155,7 +173,7 @@ async function patch<T = unknown>(path: string, body?: object): Promise<T> {
     trackApiSuccess("PATCH", path, nowMs() - startedAt, res.status);
     return res.json();
   } catch (error) {
-    if (!failureTracked) {
+    if (!failureTracked && !isAbortError(error)) {
       trackApiFailure("PATCH", path, nowMs() - startedAt, error);
     }
     throw error;
@@ -182,7 +200,7 @@ async function del<T = unknown>(path: string, body?: object): Promise<T> {
     trackApiSuccess("DELETE", path, nowMs() - startedAt, res.status);
     return res.json();
   } catch (error) {
-    if (!failureTracked) {
+    if (!failureTracked && !isAbortError(error)) {
       trackApiFailure("DELETE", path, nowMs() - startedAt, error);
     }
     throw error;
@@ -902,7 +920,10 @@ export async function bindIde(
     return { ok: false, error: message };
   } catch (error) {
     // Transport-level failure (network, JSON parse on success path, etc.).
-    trackApiFailure("POST", path, nowMs() - startedAt, error);
+    // Skip AbortError — cancellations are expected UX, not failures.
+    if (!isAbortError(error)) {
+      trackApiFailure("POST", path, nowMs() - startedAt, error);
+    }
     throw error;
   }
 }

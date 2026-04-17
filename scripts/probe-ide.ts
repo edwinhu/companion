@@ -118,18 +118,42 @@ export function isPidAlive(pid: number): boolean {
 
 /**
  * Derive the transport type and URL Companion would use when binding.
- * VSCode-style lockfiles use `useWebSocket: true` and their filename is
- * `{port}.lock`. Neovim-style lockfiles use `transport: "ws" | "sse"`.
+ *
+ * Port resolution order (cubic-ai round 3, P2):
+ *   1. JSON body's `port` field — authoritative for Neovim-style lockfiles
+ *      where the filename is the editor's PID, not the port.
+ *   2. Filename stem — VSCode-style lockfiles name the file `{port}.lock`
+ *      and omit `port` from the JSON body.
+ *
+ * Before this change, the probe always took the port from the filename
+ * stem. Neovim's claudecode.nvim plugin names lockfiles by PID (e.g.
+ * `234567.lock`), so the stem was an out-of-range port and the validator
+ * silently dropped every Neovim IDE — matching bug reports of `/ide`
+ * showing zero IDEs on Neovim hosts.
  */
 export function deriveBindShape(
   lockPath: string,
   parsed: ParsedLockfile,
 ): { port: number; transport: "ws-ide" | "sse-ide"; url: string } {
-  // Lockfile names are `<port>.lock` for VSCode-style and `<pid>.lock` for
-  // Neovim (where the port is negotiated separately inside the JSON, but
-  // we fall back to the filename stem as a best-effort default).
   const stem = basename(lockPath).replace(/\.lock$/, "");
-  const port = Number(stem);
+  const stemPort = Number(stem);
+  const jsonPortRaw = (parsed.raw as Record<string, unknown>).port;
+  const jsonPort = typeof jsonPortRaw === "number" ? jsonPortRaw : NaN;
+
+  // Prefer the JSON-embedded port when it is in the valid TCP range.
+  // Otherwise fall back to the filename stem. Validation happens in
+  // `isValidBindShape` so callers can distinguish "valid bind" from
+  // "we have a port but it's unusable".
+  let port: number;
+  if (Number.isInteger(jsonPort) && jsonPort > 0 && jsonPort < 65536) {
+    port = jsonPort;
+  } else {
+    // If JSON had a port field that was *invalid* (e.g. 0 or 99999),
+    // surface THAT invalid value so `isValidBindShape` can reject it
+    // rather than masking it by falling through to a bogus stem. If
+    // JSON had no port field at all, fall back to the stem.
+    port = Number.isFinite(jsonPort) ? jsonPort : stemPort;
+  }
 
   let transport: "ws-ide" | "sse-ide";
   if (parsed.useWebSocket === true || parsed.transport === "ws") {
@@ -144,10 +168,15 @@ export function deriveBindShape(
 }
 
 /**
- * cubic-ai review (PR #652): validate a port derived from a lockfile
- * filename stem. `Number(stem)` returns NaN for non-numeric stems (e.g.
- * `foo.lock`) and out-of-range values for weird stems. `probe()` skips
- * entries whose shape fails this check; tests cover each failure mode.
+ * Validate the final derived port. The port must be an integer in the
+ * valid TCP range [1, 65535]. This gate applies to whichever source the
+ * port came from (JSON body OR filename stem) — Neovim-style PID-named
+ * lockfiles pass iff their JSON body carries a valid port.
+ *
+ * cubic-ai review (PR #652, round 3, P2): before this change the gate
+ * treated the filename stem as the canonical port and rejected Neovim
+ * lockfiles whose PID-shaped stems exceeded 65535. The contract is now
+ * "final port in range", not "filename stem in range".
  */
 export function isValidBindShape(
   shape: ReturnType<typeof deriveBindShape>,

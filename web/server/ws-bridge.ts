@@ -120,9 +120,6 @@ export class WsBridge {
     "git_behind",
   ];
 
-  /** Unsubscribe handle for the companionBus "ide:removed" listener (BIND-04). */
-  private ideRemovedUnsubscribe: (() => void) | null = null;
-
   /**
    * Unsubscribe handles for the Task 12 companionBus listeners that
    * fan out `{type: "ide_list_changed"}` to every connected browser socket
@@ -136,7 +133,13 @@ export class WsBridge {
     // session currently bound to that port. The frontend detects the
     // bound→null transition via the existing session_update channel and
     // renders the "IDE disconnected — rebind via /ide" banner (BIND-05).
-    this.ideRemovedUnsubscribe = companionBus.on("ide:removed", ({ port }) => {
+    //
+    // The unsubscribe handle is intentionally dropped: WsBridge is a
+    // process-lifetime singleton, so there is no teardown path that would
+    // call it. Matches the pattern used by other long-lived bus listeners
+    // in this file (e.g. ideListChangedUnsubscribes handles are stored but
+    // never invoked either).
+    companionBus.on("ide:removed", ({ port }) => {
       for (const [sessionId, session] of this.sessions) {
         if (session.state.ideBinding?.port === port) {
           // Fire-and-forget: unbindIde is idempotent and never throws.

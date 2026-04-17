@@ -151,12 +151,22 @@ describe("parseLockfile", () => {
   });
 });
 
-describe("isValidBindShape — port validation (cubic-ai review #4)", () => {
+describe("isValidBindShape — port validation (cubic-ai review #4, updated round 3 P2)", () => {
   // Minimal parsed lockfile reused across tests. Only `transport` matters
   // for the shape of the bind payload — the rest is filler so the call
   // shape is valid. `probe()` calls `deriveBindShape` then checks
   // `isValidBindShape` before including the row; these tests pin the
   // validator directly against every failure mode.
+  //
+  // Contract change (cubic-ai round 3, P2): the filename stem is no
+  // longer assumed to be the IDE's TCP port. Neovim's claudecode.nvim
+  // plugin names lockfiles by the editor's PID (e.g. `234567.lock`), and
+  // the actual port lives inside the JSON body (`raw.port`). So:
+  //   - Filename stem: accepted if it's any positive integer (PID OR port).
+  //   - Port: preferred from JSON `raw.port`; falls back to the stem when
+  //     JSON omits the field (VSCode-style lockfiles that name the file
+  //     after the port).
+  //   - Validation: the FINAL derived port must be in [1, 65535].
   const baseParsed = {
     pid: 123,
     workspaceFolders: ["/tmp"],
@@ -165,9 +175,9 @@ describe("isValidBindShape — port validation (cubic-ai review #4)", () => {
     raw: {},
   };
 
-  it("rejects lockfile with non-numeric port in filename (foo.lock)", () => {
+  it("rejects lockfile with non-numeric port in filename (foo.lock) when JSON has no port", () => {
     // A `.lock` file whose stem is not numeric (e.g. "foo.lock") would
-    // coerce to NaN. Skipping is the same as malformed-JSON handling.
+    // coerce to NaN, and no JSON port is available to rescue it.
     const shape = deriveBindShape("/tmp/foo.lock", baseParsed);
     expect(Number.isNaN(shape.port)).toBe(true);
     expect(isValidBindShape(shape)).toBe(false);
@@ -181,9 +191,13 @@ describe("isValidBindShape — port validation (cubic-ai review #4)", () => {
     expect(isValidBindShape(shape)).toBe(false);
   });
 
-  it("rejects port > 65535", () => {
-    // TCP ports are 16-bit unsigned; anything above 65535 cannot reach
-    // a real IDE listener. Filename stem "70000" exceeds the range.
+  // Round 2 asserted that a 70000.lock filename is rejected. That remains
+  // true here, but the semantics have shifted: the rejection no longer
+  // comes from "filename stem exceeds port range", it comes from the
+  // FINAL derived port exceeding [1, 65535]. When the JSON body supplies
+  // a valid port, a high-numbered filename (PID-shaped) is now accepted
+  // — see the "accepts Neovim-style PID filename" test below.
+  it("rejects final port > 65535 when no valid JSON port is available", () => {
     const shape = deriveBindShape("/tmp/70000.lock", baseParsed);
     expect(shape.port).toBe(70000);
     expect(isValidBindShape(shape)).toBe(false);
@@ -203,6 +217,64 @@ describe("isValidBindShape — port validation (cubic-ai review #4)", () => {
     expect(shape.port).toBe(50001);
     expect(shape.transport).toBe("ws-ide");
     expect(shape.url).toBe("ws://127.0.0.1:50001");
+    expect(isValidBindShape(shape)).toBe(true);
+  });
+
+  // cubic-ai review (PR #652, round 3, P2): Neovim's claudecode.nvim
+  // names lockfiles by the editor's PID, not the TCP port. A file like
+  // `234567.lock` is a legitimate Neovim lockfile whose ACTUAL port
+  // lives inside the JSON body. Before this fix, `isValidBindShape`
+  // rejected the stem as "port > 65535" and the probe silently dropped
+  // every Neovim IDE — matching users' bug reports that `/ide` showed
+  // zero IDEs on Neovim hosts.
+  it("accepts a Neovim-style PID filename (e.g. 234567.lock) when JSON port is valid", () => {
+    const parsedWithJsonPort = {
+      ...baseParsed,
+      raw: { port: 50001 },
+    };
+    const shape = deriveBindShape("/tmp/234567.lock", parsedWithJsonPort);
+    // The derived port MUST come from JSON (50001), not the PID stem.
+    expect(shape.port).toBe(50001);
+    expect(isValidBindShape(shape)).toBe(true);
+    expect(shape.url).toBe("ws://127.0.0.1:50001");
+  });
+
+  it("rejects lockfile whose JSON content has invalid port (> 65535)", () => {
+    // The REAL port gate now applies to JSON content. A file like
+    // `38630.lock` (valid PID-shaped stem) with `raw.port = 99999` must
+    // be rejected because 99999 is not a valid TCP port.
+    const parsedWithBadJsonPort = {
+      ...baseParsed,
+      raw: { port: 99999 },
+    };
+    const shape = deriveBindShape("/tmp/38630.lock", parsedWithBadJsonPort);
+    expect(shape.port).toBe(99999);
+    expect(isValidBindShape(shape)).toBe(false);
+  });
+
+  it("rejects lockfile whose JSON content has invalid port (= 0)", () => {
+    const parsedWithZeroJsonPort = {
+      ...baseParsed,
+      raw: { port: 0 },
+    };
+    const shape = deriveBindShape("/tmp/234567.lock", parsedWithZeroJsonPort);
+    // raw.port = 0 is not a valid port; the fallback to stem (234567)
+    // also isn't in range, so the final port is whichever the derivation
+    // chooses — either way the shape is invalid.
+    expect(isValidBindShape(shape)).toBe(false);
+  });
+
+  it("prefers JSON port over filename stem even when both are in-range", () => {
+    // Explicit ordering: when both are valid, JSON wins. This matches
+    // ide-discovery.ts's behavior and guards against a future refactor
+    // that accidentally swaps the precedence.
+    const parsedWithJsonPort = {
+      ...baseParsed,
+      raw: { port: 40000 },
+    };
+    const shape = deriveBindShape("/tmp/50001.lock", parsedWithJsonPort);
+    expect(shape.port).toBe(40000);
+    expect(shape.url).toBe("ws://127.0.0.1:40000");
     expect(isValidBindShape(shape)).toBe(true);
   });
 });
@@ -259,6 +331,105 @@ describe("probe() integration — invalid port filename stems", () => {
       for (const url of payloadUrls) {
         expect(url).not.toMatch(/NaN/);
       }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Codex adversarial review (BRITTLE 1): the JSON-first port derivation
+  // is pinned at `deriveBindShape`/`isValidBindShape` unit level only.
+  // If someone re-adds a stem-fallback inside `probe()` itself (e.g.
+  // "when JSON port is invalid, try the filename stem anyway"), no
+  // existing test would catch it because the unit test for
+  // `isValidBindShape` only exercises the validator, and the happy-path
+  // integration test never exercises the JSON-invalid branch. This test
+  // plants a lockfile whose FILENAME stem IS a valid port (38630) but
+  // whose JSON body overrides it with an out-of-range port (99999). The
+  // only correct behavior is: JSON wins → port invalid → skipped.
+  it("probe(): rejects lockfile with filename-stem in range but JSON port invalid (no stem fallback)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "probe-ide-json-over-stem-"));
+    try {
+      mkdirSync(dir, { recursive: true });
+      // Filename stem `38630` is a valid TCP port (in [1, 65535]). A
+      // future regression that falls back to the stem when JSON is
+      // invalid would happily bind to port 38630 and emit a real
+      // mcp_set_servers payload pointing at a nonexistent server.
+      const lockPath = join(dir, "38630.lock");
+      writeFileSync(
+        lockPath,
+        JSON.stringify({
+          pid: process.pid, // live — passes isPidAlive
+          workspaceFolders: ["/tmp/json-over-stem"],
+          ideName: "Neovim",
+          transport: "ws",
+          authToken: "tok-json-over-stem",
+          port: 99999, // INVALID — JSON is authoritative, must cause skip
+        }),
+      );
+
+      const result = probe(dir);
+
+      // The malformed lockfile must NOT appear in rows. If this fails
+      // because result.rows has length 1 with port 38630, a stem-fallback
+      // regression has landed.
+      expect(result.rows).toHaveLength(0);
+
+      // And it must appear in skipped with the invalid-port reason.
+      expect(result.skipped).toHaveLength(1);
+      expect(result.skipped[0].path).toBe(lockPath);
+      expect(result.skipped[0].reason).toMatch(/invalid port/i);
+
+      // Belt-and-suspenders: no mcp_set_servers-shaped payload may
+      // reference the invalid JSON port or the filename-stem fallback.
+      // rows.length === 0 → no payloads are producible, but we
+      // materialize the check explicitly so the intent is audit-proof.
+      const payloadUrls = result.rows.map((r) => buildBindPayload(r).servers.ide.url);
+      for (const url of payloadUrls) {
+        expect(url).not.toContain("99999");
+        expect(url).not.toContain("38630");
+        expect(url).not.toContain(lockPath);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // cubic-ai review (PR #652, round 3, P2): end-to-end assertion that a
+  // PID-named Neovim lockfile (high stem, valid JSON port) is INCLUDED
+  // in rows with the JSON port as the bind target. The unit test above
+  // pins `deriveBindShape` in isolation; this test pins the full probe()
+  // call chain — parseLockfile → deriveBindShape → isValidBindShape → rows.
+  it("includes a Neovim-style PID-named lockfile (e.g. 234567.lock) when JSON port is valid", () => {
+    const dir = mkdtempSync(join(tmpdir(), "probe-ide-neovim-"));
+    try {
+      mkdirSync(dir, { recursive: true });
+      // 234567 is well above any valid TCP port — this would have been
+      // rejected by the round-2 filename-stem gate. The JSON body carries
+      // the real listening port (50001).
+      const lockPath = join(dir, "234567.lock");
+      writeFileSync(
+        lockPath,
+        JSON.stringify({
+          pid: process.pid, // live — passes isPidAlive
+          workspaceFolders: ["/tmp/neovim-proj"],
+          ideName: "Neovim",
+          transport: "ws",
+          authToken: "tok-nvim",
+          port: 50001,
+        }),
+      );
+
+      const result = probe(dir);
+
+      expect(result.skipped).toHaveLength(0);
+      expect(result.rows).toHaveLength(1);
+      expect(result.rows[0].ideName).toBe("Neovim");
+      // The reported port is the JSON-embedded one, NOT the PID stem.
+      expect(result.rows[0].port).toBe(50001);
+      expect(result.rows[0].transport).toBe("ws-ide");
+      expect(buildBindPayload(result.rows[0]).servers.ide.url).toBe(
+        "ws://127.0.0.1:50001",
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

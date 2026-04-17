@@ -2145,4 +2145,85 @@ describe("handleMessage: ide_list_changed dispatches companion:ide-list-changed 
       window.removeEventListener("companion:ide-list-changed", listener);
     }
   });
+
+  // cubic-ai review (PR #652, round 3, P2): after a full Hono server restart
+  // the server's `scanGeneration` resets to 0/1. Previously the client's
+  // module-scope `lastIdeListChangedGeneration` survived across the WS
+  // reconnect, so generations from the NEW server lifetime (e.g. gen=1)
+  // would be suppressed until they climbed past whatever the old lifetime
+  // reached (e.g. gen=42). Users would see "IDE list never updates" for
+  // many minutes after a server restart, until enough discovery events
+  // accumulated on the new server to cross the stale high-water mark.
+  //
+  // Fix: reset the client-side generation counter whenever a session
+  // WebSocket (re-)opens. Server-restart ALWAYS drops the underlying WS,
+  // so every cross-lifetime case is covered. The false-positive case —
+  // reset on a transient WS bounce while the server is fine — is benign:
+  // the server would still send the same generation, which post-reset is
+  // accepted once, triggering at most one redundant REST refetch.
+  it("ide_list_changed: after WS reconnect, an older generation is accepted once (server restart scenario)", () => {
+    wsModule.connectSession("s1");
+    const wsBefore = lastWs;
+    fireMessage({ type: "session_init", session: makeSession("s1") });
+
+    const listener = vi.fn();
+    window.addEventListener("companion:ide-list-changed", listener);
+    try {
+      // Old server lifetime reached generation 42.
+      wsBefore.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 42 }) });
+      expect(listener).toHaveBeenCalledTimes(1);
+
+      // Server restarts: existing socket closes, a fresh one is created.
+      // MockWebSocket starts in OPEN readyState so mark this one CLOSED
+      // before reconnecting so connectSession treats it as stale.
+      wsBefore.readyState = MockWebSocket.CLOSED;
+      if (wsBefore.onclose) wsBefore.onclose();
+      wsModule.connectSession("s1");
+      const wsAfter = lastWs;
+      expect(wsAfter).not.toBe(wsBefore);
+      // Fire the open handler so the reset logic runs.
+      if (wsAfter.onopen) wsAfter.onopen(new Event("open"));
+
+      // New server lifetime starts at gen=1. Without the reset, this would
+      // be suppressed (1 <= 42). With the reset, it fires.
+      wsAfter.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 1 }) });
+      expect(listener).toHaveBeenCalledTimes(2);
+    } finally {
+      window.removeEventListener("companion:ide-list-changed", listener);
+    }
+  });
+
+  // Regression: after the reset-on-reconnect fix, the within-connection
+  // monotonic dedupe must still work. Otherwise every duplicate broadcast
+  // in a stable connection would refire and defeat the primary dedupe.
+  it("ide_list_changed: monotonic dedupe still works between reconnects", () => {
+    wsModule.connectSession("s1");
+    const wsBefore = lastWs;
+    fireMessage({ type: "session_init", session: makeSession("s1") });
+
+    const listener = vi.fn();
+    window.addEventListener("companion:ide-list-changed", listener);
+    try {
+      // Establish high-water on old connection.
+      wsBefore.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 42 }) });
+      expect(listener).toHaveBeenCalledTimes(1);
+
+      // Reconnect (server restart).
+      wsBefore.readyState = MockWebSocket.CLOSED;
+      if (wsBefore.onclose) wsBefore.onclose();
+      wsModule.connectSession("s1");
+      const wsAfter = lastWs;
+      if (wsAfter.onopen) wsAfter.onopen(new Event("open"));
+
+      // First post-reconnect event — accepted regardless of value (reset).
+      wsAfter.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 1 }) });
+      expect(listener).toHaveBeenCalledTimes(2);
+
+      // Same generation on same connection — dedupe still active.
+      wsAfter.onmessage!({ data: JSON.stringify({ type: "ide_list_changed", generation: 1 }) });
+      expect(listener).toHaveBeenCalledTimes(2);
+    } finally {
+      window.removeEventListener("companion:ide-list-changed", listener);
+    }
+  });
 });

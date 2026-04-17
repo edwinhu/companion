@@ -34,6 +34,25 @@ function dispatchIdeListChangedByGeneration(generation: number | undefined): voi
   window.dispatchEvent(new CustomEvent("companion:ide-list-changed"));
 }
 
+/**
+ * Reset the ide_list_changed dedupe counter. Called whenever a session
+ * WebSocket (re-)opens so we survive a full server restart.
+ *
+ * cubic-ai review (PR #652, round 3, P2): the server's monotonic
+ * `scanGeneration` resets to 0/1 on a full Hono process restart. If the
+ * client's counter carried a high-water mark (e.g. 42) from the prior
+ * lifetime, every generation from the new lifetime would be suppressed
+ * until it climbed past 42 — the IDE picker would appear frozen for
+ * minutes after a restart. Resetting on WS open ties the client state
+ * to the connection lifetime, which is the tightest observable signal
+ * we have for "new server process". Transient bounces where the server
+ * is fine are benign: the server re-sends the same generation, which
+ * post-reset is accepted exactly once (one harmless refetch).
+ */
+function resetIdeListChangedDedupe(): void {
+  lastIdeListChangedGeneration = -1;
+}
+
 const sockets = new Map<string, WebSocket>();
 const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const lastSeqBySession = new Map<string, number>();
@@ -1320,6 +1339,11 @@ export function connectSession(sessionId: string) {
     const lastSeq = getLastSeq(sessionId);
     ws.send(JSON.stringify({ type: "session_subscribe", last_seq: lastSeq }));
     flushQueuedOutgoing(sessionId, ws);
+    // cubic-ai review (PR #652, round 3, P2): reset the ide_list_changed
+    // generation dedupe whenever a WS opens so a server restart (which
+    // resets scanGeneration to 0/1 on the server) does not cause every
+    // new-lifetime event to be suppressed by a stale high-water mark.
+    resetIdeListChangedDedupe();
     // Clear any reconnect timer
     const timer = reconnectTimers.get(sessionId);
     if (timer) {

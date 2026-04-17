@@ -556,4 +556,154 @@ describe("DELETE /api/sessions/:id/ide", () => {
     });
     expect(res.status).toBe(404);
   });
+
+  // API-04 error mapping: a live binding exists, but by the time DELETE is
+  // called the backend adapter is gone (CLI exited, WS severed, etc.).
+  // `unbindIde` returns `{ok:false, error:"backend not connected"}` rather
+  // than silently clearing state — the REST layer must translate that to a
+  // 409 Conflict so the UI surfaces the Retry affordance (see code comment
+  // in ide-session-routes.ts for the "pretending the tear-down succeeded"
+  // rationale).
+  it("DELETE returns 409 when the backend adapter is disconnected", async () => {
+    await seedIde(tmpDir, { port: 44444, ideName: "Neovim" }, restart);
+
+    // Bind with a live adapter so the session has an ideBinding to tear down.
+    bridge.getOrCreateSession("sess-G");
+    const { adapter: liveAdapter } = makeRecordingAdapter();
+    bridge.attachBackendAdapter("sess-G", liveAdapter, "claude");
+
+    const app = buildSessionIdeApp(bridge);
+    const bindRes = await app.request("/api/sessions/sess-G/ide", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port: 44444 }),
+    });
+    expect(bindRes.status).toBe(200);
+    expect(bridge.getSession("sess-G")!.state.ideBinding?.port).toBe(44444);
+
+    // Swap in a disconnected adapter. unbindIde's three-layer guard keys off
+    // isConnected() returning false, producing the 409 branch.
+    const disconnectedAdapter = {
+      isConnected: () => false,
+      send: () => true,
+      disconnect: async () => {},
+      onBrowserMessage: () => {},
+      onSessionMeta: () => {},
+      onDisconnect: () => {},
+      onInitError: () => {},
+    };
+    bridge.attachBackendAdapter("sess-G", disconnectedAdapter as any, "claude");
+
+    const delRes = await app.request("/api/sessions/sess-G/ide", {
+      method: "DELETE",
+    });
+    expect(delRes.status).toBe(409);
+    expect(await delRes.json()).toEqual({ error: "backend not connected" });
+    // Binding must still be in place — unbindIde short-circuits BEFORE
+    // mutating state so UI and CLI stay consistent.
+    expect(bridge.getSession("sess-G")!.state.ideBinding?.port).toBe(44444);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Extra error-mapping coverage for POST /api/sessions/:id/ide
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// These tests cover the bindIde error branches that the happy-path tests
+// above do NOT reach: 409 (backend not connected) and 500 (defensive
+// fallback for any future bindIde error string). Without them the route
+// file sits at ~78% line coverage; each test drives one of the unmapped
+// branches in registerIdeSessionRoutes.
+
+describe("POST /api/sessions/:id/ide — error branches", () => {
+  let tmpDir: string;
+  let stop: (() => void) | null = null;
+  let bridge: WsBridge;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "ide-bind-err-routes-"));
+    resetIdeDiscoveryForTests();
+    companionBus.clear();
+    bridge = new WsBridge();
+    stop = startIdeDiscovery({ ideDir: tmpDir });
+  });
+
+  afterEach(() => {
+    if (stop) {
+      try { stop(); } catch { /* ignore */ }
+      stop = null;
+    }
+    resetIdeDiscoveryForTests();
+    companionBus.clear();
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  const restart = () => {
+    if (stop) { try { stop(); } catch { /* ignore */ } }
+    stop = startIdeDiscovery({ ideDir: tmpDir });
+    return stop;
+  };
+
+  // 409 branch: session exists, port is known to discovery, but no backend
+  // adapter is attached (e.g. CLI is still booting, or crashed). bindIde's
+  // three-layer guard returns {ok:false, error:"backend not connected"} and
+  // the route maps that to 409 Conflict.
+  it("POST returns 409 when no backend adapter is attached", async () => {
+    await seedIde(tmpDir, { port: 51515, ideName: "Neovim" }, restart);
+
+    // Create the session but do NOT call attachBackendAdapter. session.backendAdapter
+    // remains null → bindIde hits the first guard layer (`!adapter`) and returns
+    // "backend not connected".
+    bridge.getOrCreateSession("sess-H");
+
+    const app = buildSessionIdeApp(bridge);
+    const res = await app.request("/api/sessions/sess-H/ide", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port: 51515 }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "backend not connected" });
+    // No side-effects: ideBinding must remain unset.
+    expect(bridge.getSession("sess-H")!.state.ideBinding ?? null).toBeNull();
+  });
+
+  // 500 defensive branch: bindIde returns an error string NOT in the
+  // {"session not found","unknown port","backend not connected"} triple.
+  // The only such branch today is "invalid IDE name" — triggered when
+  // ideName sanitizes to an empty MCP key (all-punctuation names). The
+  // route's final fallback `return c.json({ error: result.error }, 500)`
+  // is the safety net for any future bindIde error the FE hasn't been
+  // taught to handle — this test locks it in.
+  it("POST returns 500 for an unmapped bindIde error (invalid IDE name)", async () => {
+    // IdeName of all punctuation → sanitized serverKey is "" → bindIde
+    // returns {ok:false, error:"invalid IDE name"} which hits the catch-all
+    // 500 branch in the route.
+    await seedIde(
+      tmpDir,
+      { port: 52525, ideName: "!!!", workspaceFolders: ["/tmp/x"] },
+      restart,
+    );
+
+    bridge.getOrCreateSession("sess-I");
+    const { adapter } = makeRecordingAdapter();
+    bridge.attachBackendAdapter("sess-I", adapter, "claude");
+
+    const app = buildSessionIdeApp(bridge);
+    const res = await app.request("/api/sessions/sess-I/ide", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port: 52525 }),
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "invalid IDE name" });
+    // Codex BRITTLE 2: the 500 branch must be a pure signaling path — no
+    // session state may be mutated before bindIde throws/errors. Without
+    // this assertion, a buggy future implementation that assigns
+    // ideBinding BEFORE the error bail-out (e.g. setting it and then
+    // throwing from a subsequent MCP dispatch) would still pass the
+    // status+body assertions above. Pin the invariant: on the 500 path,
+    // ideBinding stays null.
+    expect(bridge.getSession("sess-I")!.state.ideBinding ?? null).toBeNull();
+  });
 });

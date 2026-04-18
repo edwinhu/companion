@@ -409,6 +409,42 @@ export class ClaudeAdapter implements IBackendAdapter {
     return true;
   }
 
+  /**
+   * Await-able entry point for `mcp_set_servers` — resolves when the CLI
+   * sends a matching `control_response` (success) or rejects via `{ok: false}`
+   * on explicit error. Parallel to Codex adapter's `applyMcpSetServers`.
+   *
+   * Claude's NDJSON `control_response` protocol is the only acknowledgement
+   * we get; there is no separate backend-apply signal. Callers that must
+   * not commit UI state before the CLI has ack'd the config change should
+   * prefer this over `send({type: "mcp_set_servers"})`.
+   */
+  async applyMcpSetServers(
+    servers: Record<string, import("./session-types.js").McpServerConfig>,
+    _deleteKeys?: string[],
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (!this.isConnected()) return { ok: false, error: "backend not connected" };
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        resolve({ ok: false, error: "mcp_set_servers timeout" });
+      }, 10_000);
+      this.sendControlRequest(
+        { subtype: "mcp_set_servers", servers },
+        {
+          subtype: "mcp_set_servers",
+          resolve: (response: unknown) => {
+            clearTimeout(timer);
+            const r = response as { subtype?: string; error?: string } | undefined;
+            if (r?.error) resolve({ ok: false, error: r.error });
+            else resolve({ ok: true });
+          },
+        },
+      );
+      // Same refresh-after-delay as the fire-and-forget path.
+      setTimeout(() => this.handleOutgoingMcpGetStatus(), 2000);
+    });
+  }
+
   private handleOutgoingEndSession(reason?: string): boolean {
     this.sendControlRequest({ subtype: "end_session", ...(reason ? { reason } : {}) });
     return true;

@@ -1378,13 +1378,28 @@ export class WsBridge {
       outboundServers = { [serverKey]: ideServerEntry };
       outboundDeleteKeys = priorIdeKeys;
     }
-    const accepted = adapter.send({
-      type: "mcp_set_servers",
-      servers: outboundServers as Record<string, import("./session-types.js").McpServerConfig>,
-      deleteKeys: outboundDeleteKeys,
-    });
-    if (!accepted) {
-      return { ok: false, error: "backend not connected" };
+    // Await the backend's actual acknowledgement before committing UI state.
+    // Previously this used fire-and-forget `send()` which returns `true` the
+    // moment the message is enqueued — for Codex that meant UI showed
+    // "bound" before `config/batchWrite` even ran, and a silent backend
+    // failure only surfaced via a later `error` emission. `applyMcpSetServers`
+    // resolves `{ok: false}` on real backend failure so we can bail out
+    // without touching `session.state.ideBinding`.
+    if (adapter.applyMcpSetServers) {
+      const result = await adapter.applyMcpSetServers(
+        outboundServers as Record<string, import("./session-types.js").McpServerConfig>,
+        outboundDeleteKeys,
+      );
+      if (!result.ok) return { ok: false, error: result.error };
+    } else {
+      const accepted = adapter.send({
+        type: "mcp_set_servers",
+        servers: outboundServers as Record<string, import("./session-types.js").McpServerConfig>,
+        deleteKeys: outboundDeleteKeys,
+      });
+      if (!accepted) {
+        return { ok: false, error: "backend not connected" };
+      }
     }
 
     // Mirror the mutation we just sent to the backend so subsequent
@@ -1501,13 +1516,25 @@ export class WsBridge {
       outboundServers = {} as Record<string, import("./session-types.js").McpServerConfig>;
       outboundDeleteKeys = serverKey ? [serverKey] : [];
     }
-    const accepted = adapter.send({
-      type: "mcp_set_servers",
-      servers: outboundServers,
-      deleteKeys: outboundDeleteKeys,
-    });
-    if (!accepted) {
-      return { ok: false, error: "backend not connected" };
+    // Await the backend's ack before committing `ideBinding = null`. See the
+    // rationale on the matching block in `bindIde` — we'd rather surface a
+    // real failure than leave the UI saying "unbound" while the CLI still
+    // has the IDE MCP entry registered.
+    if (adapter.applyMcpSetServers) {
+      const result = await adapter.applyMcpSetServers(
+        outboundServers,
+        outboundDeleteKeys,
+      );
+      if (!result.ok) return { ok: false, error: result.error };
+    } else {
+      const accepted = adapter.send({
+        type: "mcp_set_servers",
+        servers: outboundServers,
+        deleteKeys: outboundDeleteKeys,
+      });
+      if (!accepted) {
+        return { ok: false, error: "backend not connected" };
+      }
     }
 
     // Drop the IDE entry from the bridge's mirror so subsequent reads are

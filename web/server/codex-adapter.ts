@@ -1500,11 +1500,51 @@ export class CodexAdapter implements IBackendAdapter {
     }
   }
 
+  /**
+   * Await-able entry point for `mcp_set_servers` used by callers that must
+   * not commit UI state until the Codex backend has actually applied the
+   * change. Returns `{ok: true}` only after deletes + upserts + reload +
+   * status reconciliation all succeed, `{ok: false, error}` otherwise.
+   *
+   * The fire-and-forget `send({type: "mcp_set_servers"})` path remains for
+   * callers that only care about enqueuing (e.g. browser-initiated edits);
+   * it delegates to this method but does not propagate the result.
+   */
+  async applyMcpSetServers(
+    servers: Record<string, McpServerConfig>,
+    deleteKeys?: string[],
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    if (!this.connected) return { ok: false, error: "backend not connected" };
+    try {
+      await this.runMcpSetServers(servers, deleteKeys);
+      return { ok: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: message };
+    }
+  }
+
   private async handleOutgoingMcpSetServers(
     servers: Record<string, McpServerConfig>,
     deleteKeys?: string[],
   ): Promise<void> {
     try {
+      await this.runMcpSetServers(servers, deleteKeys);
+    } catch (err) {
+      this.emit({ type: "error", message: `Failed to configure MCP servers: ${err}` });
+    }
+  }
+
+  /**
+   * Core MCP-set-servers work — deletes, upserts, reload, status refresh.
+   * Separated from the two entry points above so `applyMcpSetServers` can
+   * surface failures to the caller while `handleOutgoingMcpSetServers`
+   * keeps fire-and-forget semantics for browser-initiated edits.
+   */
+  private async runMcpSetServers(
+    servers: Record<string, McpServerConfig>,
+    deleteKeys?: string[],
+  ): Promise<void> {
       // Phase 1 — removals. Codex's `config/batchWrite` edits support
       // `upsert`/`replace` semantics; to drop a `mcp_servers.<name>` entry
       // entirely we write `value: null` with `mergeStrategy: "replace"` on
@@ -1555,9 +1595,6 @@ export class CodexAdapter implements IBackendAdapter {
       }
       await this.reloadMcpServers();
       await this.handleOutgoingMcpGetStatus();
-    } catch (err) {
-      this.emit({ type: "error", message: `Failed to configure MCP servers: ${err}` });
-    }
   }
 
   // ── Incoming notification handlers ──────────────────────────────────────

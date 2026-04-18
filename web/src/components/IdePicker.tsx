@@ -250,7 +250,12 @@ export function IdePicker({
   );
 
   const disconnect = useCallback(async () => {
-    if (!currentBinding) return;
+    // Issue #4 (cubic-ai PR #652): When a disconnect fails and the IDE
+    // asynchronously disconnects (currentBinding -> null via session_update),
+    // clicking Retry calls disconnect() which would early-return here because
+    // currentBinding is now null. Allow the call through when we are retrying
+    // a previous disconnect failure (lastFailedOp === "disconnect").
+    if (!currentBinding && lastFailedOp !== "disconnect") return;
     // Same ref-first guard as pick() — prevents a same-tick Enter+D from
     // shipping both bind AND disconnect concurrently.
     if (busyRef.current) return;
@@ -268,7 +273,7 @@ export function IdePicker({
       busyRef.current = false;
       setBusy(false);
     }
-  }, [currentBinding, sessionId, onClose]);
+  }, [currentBinding, lastFailedOp, sessionId, onClose]);
 
   // ── Global keyboard: arrows / enter / escape / D ───────────────────────
   useEffect(() => {

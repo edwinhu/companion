@@ -402,6 +402,7 @@ function reconcileKnown(
       const changed =
         prev.ideName !== next.ideName ||
         prev.port !== next.port ||
+        prev.transport !== next.transport ||
         !shallowArrayEqual(prev.workspaceFolders, next.workspaceFolders);
       known.set(path, next);
       if (changed) {
@@ -698,6 +699,17 @@ export function _resetTransientCountsForTests(): void {
 export function _getTransientCountForTests(path: string): number | undefined {
   assertTestOnly("_getTransientCountForTests");
   return transientCounts.get(path);
+}
+
+/**
+ * Test-only: manually set the transient counter for a path. Lets tests
+ * stage a non-zero counter for paths that are NOT in `known`, isolating
+ * the scanDir missing-branch counter cleanup from reconcile's eviction
+ * cleanup (DISC-05h regression guard).
+ */
+export function _setTransientCountForTests(path: string, count: number): void {
+  assertTestOnly("_setTransientCountForTests");
+  transientCounts.set(path, count);
 }
 
 /**

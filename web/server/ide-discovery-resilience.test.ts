@@ -20,7 +20,6 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -454,27 +453,24 @@ describe("ide-discovery resilience (DISC-05 / DISC-06)", () => {
   // The fix moves `transientCounts.delete(path)` to fire IMMEDIATELY on any
   // `ok` read, before the PID-alive check. A clean file read is itself the
   // signal that resets the streak; downstream validation failures drive
-  // reconcile's non-carry-forward path (dead PID ⇒ not added to nextKnown
-  // ⇒ `ide:removed` on reconcile) rather than silently leaving the counter
+  // reconcile's non-carry-forward path (dead PID => not added to nextKnown
+  // => `ide:removed` on reconcile) rather than silently leaving the counter
   // at its prior value.
   //
-  // Note on RED-ability: in the common case where the path is already in
-  // `known`, reconcile's removal branch also deletes the counter, masking
-  // the observable effect of the pre-fix bug. This test therefore passes
-  // against BOTH pre-fix and post-fix code — it is a regression guard for
-  // the invariant "a clean file read leaves the transient counter empty
-  // for that path, regardless of downstream validation outcome," defending
-  // against any future refactor that changes the reconcile branch's
-  // cleanup behavior.
+  // Isolation strategy: use a LIVE PID and valid port so the ok-read adds
+  // the entry to `nextKnown` — reconcile then KEEPS it (update, not
+  // removal) and does NOT touch the transient counter. This ensures the
+  // ONLY code path that can clear the counter is the ok-branch delete
+  // inside scanDir (line ~361). If that delete were removed, the counter
+  // would remain at 2 after the ok-read and this test would fail.
   //
   // Scenario: stage N transient reads to drive the counter up to N, then
-  // on the next scan return a clean payload whose PID is dead. Expect:
-  //   - `ide:removed` fires on the SAME scan (trusted clean read + dead PID
-  //     = drop immediately, no transient delay).
-  //   - Counter is cleared (`undefined`).
-  it("DISC-05g: ok read with dead PID evicts immediately and clears the counter", async () => {
+  // on the next scan return a clean payload with a LIVE PID. Expect:
+  //   - Entry stays in `known` (reconcile keeps it).
+  //   - Counter is cleared (`undefined`) by the ok-branch delete alone.
+  it("DISC-05g: ok read with live PID clears the counter (isolated from reconcile)", async () => {
     const lockPath = join(tmpDir, "60007.lock");
-    // First: seed with THIS process's PID so startIdeDiscovery adds it.
+    // Seed with THIS process's PID so startIdeDiscovery adds it.
     writeFileSync(lockPath, lockfilePayload({ ideName: "Neovim" }));
 
     stop = disco.startIdeDiscovery({ ideDir: tmpDir });
@@ -483,9 +479,6 @@ describe("ide-discovery resilience (DISC-05 / DISC-06)", () => {
     disco._resetTransientCountsForTests?.();
 
     // Stage 2 transient reads so the counter sits at 2 BEFORE the ok-read.
-    // This is the state that exposes the non-increment bug: prior to the
-    // fix, an ok-read that then failed isPidAlive() would leave the counter
-    // at 2 indefinitely.
     readFileSyncImpl.current = (p: string) => {
       if (p === lockPath) {
         const err = new Error("EBUSY");
@@ -501,64 +494,93 @@ describe("ide-discovery resilience (DISC-05 / DISC-06)", () => {
       "DISC-05g precondition: counter must be 2 after staging two transient reads",
     ).toBe(2);
 
-    const removedSpy = vi.fn();
-    bus.on("ide:removed", removedSpy);
-
-    // Derive a guaranteed-dead PID: spawnSync runs to completion, so by the
-    // time it returns the child is reaped. Its PID is almost certainly dead
-    // (barring an immediate OS PID wrap-around, which is vanishingly rare
-    // on a loaded dev machine with default PID_MAX values).
-    const child = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
-    const deadPid = child.pid!;
-    expect(deadPid).toBeGreaterThan(0);
-
-    // Now return a clean payload whose PID is dead. Read classifies as
-    // "ok" (parseLockfile succeeds on valid JSON), then isPidAlive(deadPid)
-    // is false ⇒ scanDir skips adding to nextKnown ⇒ reconcile evicts via
-    // `ide:removed`. The counter MUST be cleared by the ok-branch delete
-    // (the fix).
+    // Return a clean payload with THIS process's PID (alive) so the entry
+    // stays in `nextKnown`. Reconcile will keep it — no eviction, no
+    // reconcile-side counter cleanup.
     readFileSyncImpl.current = (p: string) => {
-      if (p === lockPath) return lockfilePayload({ pid: deadPid, ideName: "Neovim" });
+      if (p === lockPath) return lockfilePayload({ pid: process.pid, ideName: "Neovim" });
       return readFileSyncImpl.real!(p, "utf8");
     };
 
     await disco._scanDirForTests(tmpDir);
 
-    const removedPorts = removedSpy.mock.calls.map((c) => (c[0] as { port: number }).port);
-    expect(
-      removedPorts,
-      "DISC-05g: ok-read + dead-PID must evict on the same scan (no transient delay)",
-    ).toContain(60007);
+    // Entry must still be in known (reconcile kept it).
     expect(
       disco.listAvailableIdes().some((i: { port: number }) => i.port === 60007),
-      "DISC-05g: entry must be gone from known after dead-PID eviction",
-    ).toBe(false);
+      "DISC-05g: entry must remain in known after ok-read with live PID",
+    ).toBe(true);
+    // Counter must be cleared by the ok-branch delete — reconcile did not
+    // evict and therefore did not touch the counter. If the ok-branch
+    // delete is removed, this assertion fails (counter stays at 2).
     expect(
       disco._getTransientCountForTests?.(lockPath),
-      "DISC-05g: counter must be cleared on ok-read even when isPidAlive fails",
+      "DISC-05g: counter must be cleared on ok-read (not masked by reconcile)",
     ).toBeUndefined();
   });
 
-  // DISC-05h: counter must also be cleared on `missing` reads. Stage some
-  // transient reads to drive the counter up, then make the file vanish
-  // (readdirSync no longer lists it). Reconcile evicts the path; the
-  // counter must be cleared (the reconcile-removed branch already deletes
-  // it, so this is a regression guard). Separately, the `missing` branch
-  // inside scanDir also clears the counter — covered here for completeness.
-  it("DISC-05h: transient reads then file vanishes — ide:removed fires and counter is cleared", async () => {
+  // DISC-05h: counter must be cleared on `missing` reads inside scanDir's
+  // missing branch (line ~320), independently of reconcile's eviction
+  // cleanup (line ~424).
+  //
+  // Isolation strategy: mock `readdirSync` to include a ghost lockfile
+  // name ("60009.lock") that does NOT exist on disk. `readLockfileWithRetry`
+  // calls `statSync` on the ghost path, gets ENOENT, and returns
+  // `{kind: "missing"}`. The ghost path was never in `known`, so reconcile
+  // has nothing to evict and does NOT touch the counter — the ONLY code
+  // path that can clear it is scanDir's missing-branch delete (line ~320).
+  // We seed the counter via `_setTransientCountForTests` before the scan.
+  // If the missing-branch delete is removed, this test fails (counter
+  // stays at 3).
+  //
+  // A second part tests the end-to-end behavior: a path that IS in
+  // `known` with staged transient reads, then the file vanishes
+  // (ide:removed fires, entry is dropped).
+  it("DISC-05h: missing read clears counter (isolated from reconcile)", async () => {
+    // Part A: counter cleanup isolated from reconcile.
     const lockPath = join(tmpDir, "60008.lock");
     writeFileSync(lockPath, lockfilePayload({ ideName: "Neovim" }));
 
     stop = disco.startIdeDiscovery({ ideDir: tmpDir });
     expect(disco.listAvailableIdes().some((i: { port: number }) => i.port === 60008)).toBe(true);
 
+    // ghostPath does NOT exist on disk — statSync will throw ENOENT,
+    // causing readLockfileWithRetry to return {kind: "missing"}.
+    const ghostPath = join(tmpDir, "60009.lock");
+
+    // Manually seed a transient counter for ghostPath WITHOUT adding it
+    // to `known`. This simulates a counter that was driven up by prior
+    // transient reads but the entry was never successfully added.
+    disco._setTransientCountForTests?.(ghostPath, 3);
+    expect(disco._getTransientCountForTests?.(ghostPath)).toBe(3);
+
+    // Mock readdirSync to include the ghost lockfile name alongside any
+    // real files. The ghost file doesn't exist on disk, so statSync
+    // inside readLockfileWithRetry will throw ENOENT => {kind: "missing"}.
+    readdirSyncImpl.current = (p: string) => {
+      const real = readdirSyncImpl.real!(p);
+      if (p === tmpDir) return [...real, "60009.lock"];
+      return real;
+    };
+
+    await disco._scanDirForTests(tmpDir);
+
+    // ghostPath was never in `known`, so reconcile did NOT evict it and
+    // did NOT touch its counter. The ONLY code that could have cleared
+    // the counter is scanDir's missing-branch delete.
+    expect(
+      disco._getTransientCountForTests?.(ghostPath),
+      "DISC-05h: counter must be cleared by missing-branch delete (not reconcile)",
+    ).toBeUndefined();
+
+    // Part B: end-to-end — a path that IS in `known` vanishes.
+    readdirSyncImpl.current = null;
+
     const removedSpy = vi.fn();
     bus.on("ide:removed", removedSpy);
 
     disco._resetTransientCountsForTests?.();
 
-    // Stage 3 consecutive transient reads (below the MAX=5 threshold so the
-    // entry survives in `known` and the carry-forward path keeps it alive).
+    // Stage 3 transient reads for the real 60008 entry.
     readFileSyncImpl.current = (p: string) => {
       if (p === lockPath) {
         const err = new Error("EBUSY");
@@ -568,15 +590,10 @@ describe("ide-discovery resilience (DISC-05 / DISC-06)", () => {
       return readFileSyncImpl.real!(p, "utf8");
     };
     for (let i = 0; i < 3; i++) await disco._scanDirForTests(tmpDir);
-    // Sanity: the counter is now at 3.
     expect(disco._getTransientCountForTests?.(lockPath)).toBe(3);
-    // And the entry is still in `known` (carry-forward).
     expect(disco.listAvailableIdes().some((i: { port: number }) => i.port === 60008)).toBe(true);
 
-    // Now the file vanishes from the directory: readdirSync no longer lists
-    // it (the readFileSync mock is irrelevant because scanDir never gets to
-    // read a file it doesn't see). Reconcile should evict the entry and
-    // clear the counter via the reconcile-removed path's delete.
+    // Now the file vanishes.
     readFileSyncImpl.current = null;
     rmSync(lockPath);
     await disco._scanDirForTests(tmpDir);
@@ -592,7 +609,7 @@ describe("ide-discovery resilience (DISC-05 / DISC-06)", () => {
     ).toBe(false);
     expect(
       disco._getTransientCountForTests?.(lockPath),
-      "DISC-05h: counter must be cleared after reconcile evicts the missing path",
+      "DISC-05h: counter must be cleared after file vanishes",
     ).toBeUndefined();
   });
 
@@ -746,7 +763,7 @@ describe("ide-discovery resilience (DISC-05 / DISC-06)", () => {
   // The fix returns structurally cloned entries — spread each record and
   // make a fresh copy of the only nested mutable field
   // (`workspaceFolders: string[]`). Flat scalar fields (`port`, `ideName`,
-  // `transport`, …) are safe under spread alone.
+  // `transport`, ...) are safe under spread alone.
   //
   // This test mutates every relevant field on the returned entry then
   // calls `listAvailableIdes()` a second time and asserts the second
@@ -814,4 +831,3 @@ describe("ide-discovery resilience (DISC-05 / DISC-06)", () => {
     expect(third[0].workspaceFolders).not.toBe(second[0].workspaceFolders);
   });
 });
-

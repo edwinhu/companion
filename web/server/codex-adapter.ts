@@ -1556,6 +1556,7 @@ export class CodexAdapter implements IBackendAdapter {
       // batched replace — matches the existing toggle-fallback pattern and
       // keeps per-key failures isolated. Deletes run BEFORE upserts so a
       // combined message is well-defined: remove, then add.
+      const deleteErrors: string[] = [];
       if (deleteKeys && deleteKeys.length > 0) {
         for (const name of deleteKeys) {
           if (typeof name !== "string" || name.length === 0) continue;
@@ -1571,7 +1572,10 @@ export class CodexAdapter implements IBackendAdapter {
           } catch (delErr) {
             // Cubic round-8 P2: per-key catch so a single delete failure
             // does not abort remaining deletes + upserts + status reconciliation.
-            this.emit({ type: "error", message: `Failed to delete MCP server '${name}': ${delErr}` });
+            // Collect the error so callers (applyMcpSetServers) can surface it.
+            const msg = `Failed to delete MCP server '${name}': ${delErr}`;
+            deleteErrors.push(msg);
+            this.emit({ type: "error", message: msg });
           }
         }
       }
@@ -1595,6 +1599,12 @@ export class CodexAdapter implements IBackendAdapter {
       }
       await this.reloadMcpServers();
       await this.handleOutgoingMcpGetStatus();
+      // Propagate delete failures after upserts + reload + status refresh
+      // are complete, so applyMcpSetServers returns {ok:false} when
+      // deletions fail (cubic PR #652 P2 issue #3).
+      if (deleteErrors.length > 0) {
+        throw new Error(deleteErrors.join("; "));
+      }
   }
 
   // ── Incoming notification handlers ──────────────────────────────────────

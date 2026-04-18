@@ -530,6 +530,62 @@ describe("IdePicker — interactions", () => {
     });
   });
 
+  // Issue #4 (cubic-ai PR #652 review): Retry after a disconnect failure
+  // becomes a no-op when currentBinding turns null asynchronously. The
+  // disconnect handler captures currentBinding in its useCallback closure.
+  // When the IDE disconnects (causing currentBinding to become null via
+  // session_update), the Retry button is still visible but clicking it
+  // calls disconnect() which early-returns at `if (!currentBinding) return;`.
+  // The user sees a persistent error with a non-functional Retry action.
+  //
+  // Fix: the retry handler for a disconnect must work even when
+  // currentBinding has gone null between the failure and the retry click.
+  it("Retry after a failed disconnect still works when currentBinding becomes null", async () => {
+    // First disconnect fails.
+    mockUnbindIde
+      .mockRejectedValueOnce(new Error("network error"))
+      .mockResolvedValueOnce({ ok: true });
+    const { onClose, rerender } = setup({ currentBinding: sampleBinding });
+
+    await waitFor(() => {
+      expect(screen.getByText("Neovim")).toBeInTheDocument();
+    });
+
+    // Trigger disconnect via D shortcut.
+    fireEvent.keyDown(document, { key: "d" });
+
+    // Wait for the failure to surface as an error/retry affordance.
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    });
+
+    // Simulate the IDE disconnecting asynchronously: currentBinding becomes null.
+    // This re-renders the component with currentBinding=null, updating the
+    // disconnect callback's closure.
+    rerender(
+      <IdePicker
+        sessionId="sess-A"
+        cwd="/Users/me/areas/secreg"
+        currentBinding={null}
+        onClose={onClose}
+      />,
+    );
+
+    // Clicking Retry must still re-attempt the DISCONNECT (unbindIde),
+    // not silently no-op because currentBinding is now null.
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /retry/i }));
+
+    await waitFor(() => {
+      expect(mockUnbindIde).toHaveBeenCalledTimes(2);
+    });
+    // bindIde must NOT have been called.
+    expect(mockBindIde).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
+  });
+
   it("close button (×) triggers onClose without calling bindIde", async () => {
     // UX: an explicit close button is available for mouse users.
     const { onClose } = setup();

@@ -819,6 +819,10 @@ export class ClaudeAdapter implements IBackendAdapter {
       console.warn(
         `[claude-adapter] Control request ${pending.subtype} failed: ${msg.response.error}`,
       );
+      // Issue #5 (cubic-ai PR #652): Resolve with the error response so
+      // callers (e.g. applyMcpSetServers) can surface the actual CLI error
+      // instead of falling through to a misleading timeout.
+      pending.resolve(msg.response);
       return;
     }
     pending.resolve(msg.response.response ?? {});

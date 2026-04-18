@@ -4157,7 +4157,9 @@ describe("MCP control messages", () => {
     expect(browserMsg.servers[0].tools).toHaveLength(1);
   });
 
-  it("control_response with error: does not broadcast to browsers", async () => {
+  it("control_response with error: resolves pending callback and broadcasts mcp_status", async () => {
+    // Issue #5 (cubic-ai PR #652): error control_responses now resolve the
+    // pending callback. For mcp_status, this emits mcp_status with servers: [].
     bridge.handleBrowserMessage(browser, JSON.stringify({
       type: "mcp_get_status",
     }));
@@ -4172,8 +4174,12 @@ describe("MCP control messages", () => {
       },
     }));
 
-    // Should not broadcast anything
-    expect(browser.send).not.toHaveBeenCalled();
+    // The pending resolve IS called, which for mcp_status emits
+    // mcp_status with an empty server list to browsers.
+    expect(browser.send).toHaveBeenCalledTimes(1);
+    const sent = JSON.parse(browser.send.mock.calls[0][0]);
+    expect(sent.type).toBe("mcp_status");
+    expect(sent.servers).toEqual([]);
   });
 
   it("control_response for unknown request_id: ignored silently", async () => {

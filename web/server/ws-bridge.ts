@@ -1791,20 +1791,6 @@ export class WsBridge {
       this.broadcastToBrowsers(session, userMessage);
     }
 
-    // H2 race guard: if bindIde/unbindIde is mid-flight (async
-    // applyMcpSetServers awaited), queue this message rather than forwarding
-    // it. On Claude's full-replace semantics, a concurrent user
-    // mcp_set_servers that lands between the drain and the ack would
-    // overwrite the IDE entry. The queued message will be flushed after the
-    // bind/unbind completes and the ideBinding state is consistent.
-    if (msg.type === "mcp_set_servers" && session.ideBindInProgress) {
-      const serialized = JSON.stringify(msg);
-      if (session.pendingMessages.length < WsBridge.PENDING_MESSAGES_LIMIT) {
-        session.pendingMessages.push(serialized);
-      }
-      return;
-    }
-
     // -- mcp_set_servers: mirror the dynamic MCP state the bridge has sent to
     // the backend. This is the authoritative in-memory record of what the
     // CLI / Codex should know about. `bindIde` / `unbindIde` later read this
@@ -1898,6 +1884,16 @@ export class WsBridge {
       session.pendingPermissions.delete(msg.request_id);
       session.stateMachine.transition("streaming", "permission_resolved");
       this.persistSession(session);
+    }
+
+    // H2 race guard: if bindIde/unbindIde is mid-flight, queue this message
+    // instead of sending it. The message has already been through IDE
+    // injection and mirror updates above, so the queued payload is correct.
+    // The postdrain in bind/unbind's `finally` block will flush it.
+    if (msg.type === "mcp_set_servers" && session.ideBindInProgress) {
+      this.enqueuePendingMessage(session, JSON.stringify(msg));
+      this.persistSession(session);
+      return;
     }
 
     // Delegate to the backend adapter if connected; otherwise queue for later flush.

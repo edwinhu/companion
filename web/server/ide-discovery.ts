@@ -626,8 +626,23 @@ export function listAvailableIdes(): DiscoveredIde[] {
   }));
 }
 
+/**
+ * Gate for test-only exports. Vitest sets NODE_ENV=test via vitest.config.ts
+ * and exposes `process.env.VITEST`. We accept either so ad-hoc `bun test`
+ * or a future test runner still works without silently enabling the hooks
+ * in production. Throws a descriptive error when called outside a test
+ * runtime so a misrouted production import fails loudly instead of
+ * wedging internal scan state.
+ */
+function assertTestOnly(fn: string): void {
+  if (process.env.NODE_ENV !== "test" && !process.env.VITEST) {
+    throw new Error(`${fn} is test-only`);
+  }
+}
+
 /** Test-only — wipe internal state between tests. */
 export function resetIdeDiscoveryForTests(): void {
+  assertTestOnly("resetIdeDiscoveryForTests");
   stopCurrent();
   known.clear();
   transientCounts.clear();
@@ -640,6 +655,7 @@ export function resetIdeDiscoveryForTests(): void {
 
 /** Diagnostic accessor (not part of the public contract). */
 export function _getSkippedCountForTests(): number {
+  assertTestOnly("_getSkippedCountForTests");
   return skippedCount;
 }
 
@@ -649,6 +665,7 @@ export function _getSkippedCountForTests(): number {
  * tearing down the seeded IDE state.
  */
 export function _resetReaddirFailureStreakForTests(): void {
+  assertTestOnly("_resetReaddirFailureStreakForTests");
   readdirFailureStreak = 0;
 }
 
@@ -658,6 +675,7 @@ export function _resetReaddirFailureStreakForTests(): void {
  * not leak stale failure history into a fresh session.
  */
 export function _getReaddirFailureStreakForTests(): number {
+  assertTestOnly("_getReaddirFailureStreakForTests");
   return readdirFailureStreak;
 }
 
@@ -667,6 +685,7 @@ export function _getReaddirFailureStreakForTests(): number {
  * starting at 0 on top of seeded IDE state.
  */
 export function _resetTransientCountsForTests(): void {
+  assertTestOnly("_resetTransientCountsForTests");
   transientCounts.clear();
 }
 
@@ -677,6 +696,7 @@ export function _resetTransientCountsForTests(): void {
  * outcome.
  */
 export function _getTransientCountForTests(path: string): number | undefined {
+  assertTestOnly("_getTransientCountForTests");
   return transientCounts.get(path);
 }
 
@@ -686,6 +706,7 @@ export function _getTransientCountForTests(path: string): number | undefined {
  * they can stage mocked readdirSync / readFileSync behavior per scan.
  */
 export async function _scanDirForTests(dir: string): Promise<void> {
+  assertTestOnly("_scanDirForTests");
   await scanDir(dir);
 }
 
@@ -699,9 +720,7 @@ export async function _scanDirForTests(dir: string): Promise<void> {
 export function _setReadRetrySleepHookForTests(
   hook: ((attempt: number, waitMs: number) => Promise<void>) | null,
 ): void {
-  if (process.env.NODE_ENV !== "test") {
-    throw new Error("_setReadRetrySleepHookForTests is test-only");
-  }
+  assertTestOnly("_setReadRetrySleepHookForTests");
   __retrySleepHookForTests = hook;
 }
 
@@ -712,8 +731,6 @@ export function _setReadRetrySleepHookForTests(
  * scans directly via `_scanDirForTests` must call this first.
  */
 export function _clearStoppedForTests(): void {
-  if (process.env.NODE_ENV !== "test") {
-    throw new Error("_clearStoppedForTests is test-only");
-  }
+  assertTestOnly("_clearStoppedForTests");
   stopped = false;
 }

@@ -699,6 +699,9 @@ export async function _scanDirForTests(dir: string): Promise<void> {
 export function _setReadRetrySleepHookForTests(
   hook: ((attempt: number, waitMs: number) => Promise<void>) | null,
 ): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("_setReadRetrySleepHookForTests is test-only");
+  }
   __retrySleepHookForTests = hook;
 }
 
@@ -709,5 +712,8 @@ export function _setReadRetrySleepHookForTests(
  * scans directly via `_scanDirForTests` must call this first.
  */
 export function _clearStoppedForTests(): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("_clearStoppedForTests is test-only");
+  }
   stopped = false;
 }

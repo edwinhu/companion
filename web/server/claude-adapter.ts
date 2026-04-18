@@ -425,10 +425,17 @@ export class ClaudeAdapter implements IBackendAdapter {
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     if (!this.isConnected()) return { ok: false, error: "backend not connected" };
     return new Promise((resolve) => {
+      // Forward-declare so the timeout closure can unregister the pending
+      // entry (otherwise a non-responding CLI leaks `pendingControlRequests`
+      // entries until the map is reset on disconnect — cubic-identified).
+      let requestId: string | undefined;
       const timer = setTimeout(() => {
+        if (requestId !== undefined) {
+          this.pendingControlRequests.delete(requestId);
+        }
         resolve({ ok: false, error: "mcp_set_servers timeout" });
       }, 10_000);
-      this.sendControlRequest(
+      requestId = this.sendControlRequest(
         { subtype: "mcp_set_servers", servers },
         {
           subtype: "mcp_set_servers",
@@ -862,11 +869,13 @@ export class ClaudeAdapter implements IBackendAdapter {
 
   /**
    * Send a control_request to the CLI and optionally track the pending response.
+   * Returns the generated request ID so callers with local timeouts can
+   * unregister the pending entry before the map grows without bound.
    */
   private sendControlRequest(
     request: Record<string, unknown>,
     onResponse?: { subtype: string; resolve: (response: unknown) => void },
-  ): void {
+  ): string {
     const requestId = randomUUID();
     if (onResponse) {
       this.pendingControlRequests.set(requestId, onResponse);
@@ -877,6 +886,7 @@ export class ClaudeAdapter implements IBackendAdapter {
       request,
     });
     this.sendToBackend(ndjson);
+    return requestId;
   }
 
   /**

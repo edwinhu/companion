@@ -1313,6 +1313,12 @@ export class WsBridge {
       return { ok: false, error: "backend not connected" };
     }
 
+    // Guard: prevent concurrent browser `mcp_set_servers` from racing us.
+    // While this flag is set, `routeBrowserMessage` queues `mcp_set_servers`
+    // messages instead of forwarding them immediately. Cleared in `finally`.
+    session.ideBindInProgress = true;
+    try {
+
     // Round-5 Codex review, BLOCK: drain pending browser messages first so a
     // stale `mcp_set_servers` in the queue (enqueued while `adapter.send()`
     // transiently returned false) cannot replay AFTER us and clobber the IDE
@@ -1437,6 +1443,13 @@ export class WsBridge {
     });
 
     return { ok: true };
+
+    } finally {
+      session.ideBindInProgress = false;
+      if (session.pendingMessages.length > 0 && adapter.isConnected()) {
+        this.flushQueuedBrowserMessages(session, adapter, "ide_bind_postdrain");
+      }
+    }
   }
 
   /**
@@ -1468,6 +1481,9 @@ export class WsBridge {
     if (!adapter || !adapter.isConnected()) {
       return { ok: false, error: "backend not connected" };
     }
+
+    session.ideBindInProgress = true;
+    try {
 
     // Round-5 Codex review, BLOCK: same rationale as `bindIde` — drain any
     // queued browser `mcp_set_servers` BEFORE we emit our own mutation, so
@@ -1552,6 +1568,13 @@ export class WsBridge {
     });
 
     return { ok: true };
+
+    } finally {
+      session.ideBindInProgress = false;
+      if (session.pendingMessages.length > 0 && adapter.isConnected()) {
+        this.flushQueuedBrowserMessages(session, adapter, "ide_unbind_postdrain");
+      }
+    }
   }
 
   /**
@@ -1766,6 +1789,20 @@ export class WsBridge {
       }
       this.persistSession(session);
       this.broadcastToBrowsers(session, userMessage);
+    }
+
+    // H2 race guard: if bindIde/unbindIde is mid-flight (async
+    // applyMcpSetServers awaited), queue this message rather than forwarding
+    // it. On Claude's full-replace semantics, a concurrent user
+    // mcp_set_servers that lands between the drain and the ack would
+    // overwrite the IDE entry. The queued message will be flushed after the
+    // bind/unbind completes and the ideBinding state is consistent.
+    if (msg.type === "mcp_set_servers" && session.ideBindInProgress) {
+      const serialized = JSON.stringify(msg);
+      if (session.pendingMessages.length < WsBridge.PENDING_MESSAGES_LIMIT) {
+        session.pendingMessages.push(serialized);
+      }
+      return;
     }
 
     // -- mcp_set_servers: mirror the dynamic MCP state the bridge has sent to

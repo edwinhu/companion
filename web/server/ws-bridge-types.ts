@@ -78,6 +78,14 @@ export interface Session {
    * the full-replace semantics of Claude's `mcp_set_servers` control_request.
    */
   dynamicMcpServers: Record<string, McpServerConfig>;
+  /**
+   * Set true during the async window of `bindIde`/`unbindIde` between the
+   * pre-bind queue drain and the `applyMcpSetServers` acknowledgement.
+   * While set, `routeBrowserMessage` queues incoming `mcp_set_servers`
+   * messages instead of forwarding them, preventing a concurrent user
+   * payload from clobbering the IDE entry on Claude's full-replace wire.
+   */
+  ideBindInProgress?: boolean;
 }
 
 export type GitSessionKey =

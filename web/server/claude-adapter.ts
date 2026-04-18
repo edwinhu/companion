@@ -425,9 +425,6 @@ export class ClaudeAdapter implements IBackendAdapter {
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     if (!this.isConnected()) return { ok: false, error: "backend not connected" };
     return new Promise((resolve) => {
-      // Forward-declare so the timeout closure can unregister the pending
-      // entry (otherwise a non-responding CLI leaks `pendingControlRequests`
-      // entries until the map is reset on disconnect — cubic-identified).
       let requestId: string | undefined;
       const timer = setTimeout(() => {
         if (requestId !== undefined) {
@@ -447,6 +444,11 @@ export class ClaudeAdapter implements IBackendAdapter {
           },
         },
       );
+      if (!requestId) {
+        clearTimeout(timer);
+        resolve({ ok: false, error: "failed to send control request" });
+        return;
+      }
       // Same refresh-after-delay as the fire-and-forget path.
       setTimeout(() => this.handleOutgoingMcpGetStatus(), 2000);
     });

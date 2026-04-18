@@ -476,13 +476,16 @@ export function IdePicker({
               <p className="text-xs text-cc-muted">
                 No IDE detected. Start one and try again.
               </p>
-              <a
-                href="#"
-                className="mt-2 inline-block text-[11px] text-cc-primary hover:text-cc-primary-hover font-medium"
-                onClick={(e) => e.preventDefault()}
-              >
-                How to connect an IDE
-              </a>
+              {/*
+                cubic P2: the previous "How to connect an IDE" anchor was a
+                dead interactive control — focusable and clickable but did
+                nothing (href="#" + preventDefault). Until we have a real
+                docs URL to link, render plain helper text so keyboard users
+                don't land on a button that does nothing.
+              */}
+              <p className="mt-2 text-[11px] text-cc-muted">
+                Open Claude Code or Codex in your IDE to make it discoverable.
+              </p>
             </div>
           ) : (
             <ul role="listbox" aria-label="Available IDEs" className="list-none m-0 p-0">

@@ -1008,17 +1008,17 @@ export class WsBridge {
     // so we must send it as soon as the WebSocket is open — NOT wait for
     // system.init (which would create a deadlock for slow-starting sessions
     // like Docker containers where the user message arrives before CLI connects).
+    //
+    // cubic round-N P1: delegate to `flushQueuedBrowserMessages` instead of
+    // an inline replay loop. The shared helper also re-syncs the dynamic
+    // MCP mirror (`updateDynamicMcpServers`) and re-runs `stripReservedIdeKeys`
+    // for any queued `mcp_set_servers` payloads. Without that, a Claude
+    // reconnect after a server restart (`dynamicMcpServers` reset to `{}` in
+    // `restoreFromDisk`) would replay user-configured MCP servers on the wire
+    // but leave the mirror empty — a later `bindIde` / `unbindIde` full-replace
+    // write would then silently drop every user MCP entry.
     if (session.pendingMessages.length > 0) {
-      console.log(`[ws-bridge] Flushing ${session.pendingMessages.length} queued message(s) on CLI connect for session ${sessionId}`);
-      const queued = session.pendingMessages.splice(0);
-      for (const raw of queued) {
-        try {
-          const queued_msg = JSON.parse(raw) as BrowserOutgoingMessage;
-          adapter.send(queued_msg);
-        } catch {
-          console.warn(`[ws-bridge] Failed to parse queued message: ${raw.substring(0, 100)}`);
-        }
-      }
+      this.flushQueuedBrowserMessages(session, adapter, "cli_reconnect");
     }
   }
 

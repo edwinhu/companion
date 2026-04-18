@@ -103,6 +103,19 @@ const RESCAN_INTERVAL_MS = 10_000;
 const READ_RETRY_BACKOFF_MS = [10, 30, 80];
 
 /**
+ * Test-only hook that, when installed, replaces the per-attempt retry sleep
+ * inside `readLockfileWithRetry`. The hook receives the attempt index (0-based)
+ * and the currently-scheduled wait duration, and must return a Promise that
+ * resolves when the caller should re-attempt. Lets tests deterministically
+ * pause a scan mid-retry and interleave other scans with no wall-clock
+ * dependence (Issue #4 stale-scan race regression test). Null = real
+ * setTimeout sleep.
+ */
+let __retrySleepHookForTests:
+  | ((attempt: number, waitMs: number) => Promise<void>)
+  | null = null;
+
+/**
  * Outcome of attempting to read + parse a lockfile (DISC-05 / FIX 1).
  *
  * - `ok`: read + parse succeeded. Use the payload as the source of truth.
@@ -206,7 +219,11 @@ async function readLockfileWithRetry(
     // event loop stays responsive.
     if (attempt < READ_RETRY_BACKOFF_MS.length) {
       const waitMs = READ_RETRY_BACKOFF_MS[attempt]!;
-      await new Promise<void>((r) => setTimeout(r, waitMs));
+      if (__retrySleepHookForTests) {
+        await __retrySleepHookForTests(attempt, waitMs);
+      } else {
+        await new Promise<void>((r) => setTimeout(r, waitMs));
+      }
       continue;
     }
     // Parse failed every retry AND the file is still on disk — treat as
@@ -670,4 +687,27 @@ export function _getTransientCountForTests(path: string): number | undefined {
  */
 export async function _scanDirForTests(dir: string): Promise<void> {
   await scanDir(dir);
+}
+
+/**
+ * Test-only: install / clear the retry-sleep hook used inside
+ * `readLockfileWithRetry`. Pass `null` to restore real setTimeout-based
+ * backoff. Tests use this to hold a scan at its retry checkpoint while
+ * interleaving a second scan deterministically (no wall-clock fudging
+ * of 2ms sleeps or real fs.watch timing). Always clear in afterEach.
+ */
+export function _setReadRetrySleepHookForTests(
+  hook: ((attempt: number, waitMs: number) => Promise<void>) | null,
+): void {
+  __retrySleepHookForTests = hook;
+}
+
+/**
+ * Test-only: clear the `stopped` flag so `_scanDirForTests` can run
+ * without `startIdeDiscovery`. `resetIdeDiscoveryForTests()` leaves
+ * `stopped = true` to kill in-flight scans; tests that want to drive
+ * scans directly via `_scanDirForTests` must call this first.
+ */
+export function _clearStoppedForTests(): void {
+  stopped = false;
 }

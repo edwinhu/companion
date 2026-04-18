@@ -17,6 +17,9 @@ import {
   startIdeDiscovery,
   listAvailableIdes,
   resetIdeDiscoveryForTests,
+  _scanDirForTests,
+  _setReadRetrySleepHookForTests,
+  _clearStoppedForTests,
 } from "./ide-discovery.js";
 
 /** Build a minimally valid lockfile JSON payload. */
@@ -72,6 +75,9 @@ describe("ide-discovery", () => {
       stop = null;
     }
     resetIdeDiscoveryForTests();
+    // Always clear the retry-sleep test hook so a test that leaves it
+    // installed cannot affect subsequent tests.
+    _setReadRetrySleepHookForTests(null);
     companionBus.clear();
     try {
       rmSync(tmpDir, { recursive: true, force: true });
@@ -243,19 +249,21 @@ describe("ide-discovery", () => {
   //      the healthy lockfile. On the fixed code, Scan A's generation is stale
   //      so it aborts before the eviction step.
   it("Issue #4: stale scan does NOT emit ide:removed for a lockfile added by a newer scan", async () => {
-    // Construct a deterministic race between two scanDir calls.
+    // Deterministic reproduction of the stale-scan race (no wall-clock
+    // fudging, no fs.watch timing dependence).
     //
-    // Scan A: readdirSync snapshot = [M1 malformed]. Enters retry sleep (~120ms).
-    // While Scan A sleeps, we replace M1 with a fast-parsing valid file M2 so
-    // that Scan B (triggered by fs.watch) completes promptly — BEFORE Scan A
-    // wakes — and populates `known` with M2.
+    // Scan A: readdirSync snapshot = [M1 malformed]. Enters retry sleep.
+    //   → We BLOCK the retry via the test hook so Scan A is frozen mid-retry.
     //
-    // When Scan A wakes, its local `seen` excludes M2 (M2 wasn't in A's
-    // readdir snapshot). At the eviction step it sees `known[M2]` ∉ `seen`
-    // and emits a spurious `ide:removed` for the HEALTHY lockfile.
+    // While blocked: write valid file M2 on disk, then trigger Scan B via
+    // the direct `_scanDirForTests` API. Scan B reads [M1 (transient), M2
+    // (ok)], adds M2 to `known`, and emits ide:added. Its generation is
+    // newer than Scan A's.
     //
-    // The fix (generation counter) makes Scan A abort before the eviction
-    // step because a newer generation (Scan B) has completed.
+    // Release the block → Scan A resumes. On the fixed code, the generation
+    // check sees Scan B completed a newer generation → Scan A aborts before
+    // the eviction step. On the buggy code, Scan A would proceed, see
+    // `known[M2]` ∉ its local `seen`, and emit a spurious ide:removed.
     const M1 = join(tmpDir, "11111.lock");
     const M2 = join(tmpDir, "22222.lock");
     writeFileSync(M1, "{ not valid json");
@@ -265,28 +273,43 @@ describe("ide-discovery", () => {
     companionBus.on("ide:added", addedSpy);
     companionBus.on("ide:removed", removedSpy);
 
-    // Kick off Scan A — readdirSync snapshot captures [M1 only].
-    stop = startIdeDiscovery({ ideDir: tmpDir });
+    // Install a retry-sleep hook that blocks only Scan A's FIRST retry
+    // attempt. All subsequent retries (from Scan A's later attempts or
+    // from Scan B's processing of M1) pass immediately.
+    let scanAGateResolve: (() => void) | null = null;
+    const scanAGate = new Promise<void>((r) => { scanAGateResolve = r; });
+    let firstRetry = true;
+    _setReadRetrySleepHookForTests(async () => {
+      if (firstRetry) {
+        firstRetry = false;
+        await scanAGate;
+      }
+    });
 
-    // Let Scan A read M1 (malformed) and enter its first retry sleep (10ms).
-    await new Promise((r) => setTimeout(r, 2));
+    // resetIdeDiscoveryForTests (in beforeEach) sets stopped=true to
+    // kill in-flight scans. Clear it so we can drive scans directly.
+    _clearStoppedForTests();
 
-    // Delete M1 and write M2 so Scan B (triggered by fs.watch) has only a
-    // VALID file to process. Scan B completes fast (no retry backoff),
-    // guaranteeing it finishes before Scan A's 120ms budget elapses.
-    unlinkSync(M1);
+    // Fire Scan A (don't await — it will block inside the retry hook).
+    const scanA = _scanDirForTests(tmpDir);
+
+    // Yield one microtask so Scan A reaches the retry hook and blocks.
+    await Promise.resolve();
+
+    // While Scan A is frozen: write valid M2 and run Scan B to completion.
     writeFileSync(M2, lockfilePayload());
-
-    // Give fs.watch + Scan B + Scan A's retry loop plenty of time to finish.
-    await new Promise((r) => setTimeout(r, 500));
+    await _scanDirForTests(tmpDir);
 
     // Scan B must have emitted ide:added for port 22222.
     const addedPorts = addedSpy.mock.calls.map((c) => (c[0] as { port: number }).port);
     expect(addedPorts, "Scan B should have emitted ide:added for 22222").toContain(22222);
 
-    // CRITICAL: Scan A (stale, snapshot lacks 22222) must NOT emit ide:removed
-    // for 22222. Any such emission evicts a healthy lockfile. This assertion
-    // fails on the buggy code and passes after the generation-counter fix.
+    // Release Scan A and let it complete.
+    scanAGateResolve!();
+    await scanA;
+
+    // CRITICAL: Scan A (stale, snapshot lacks 22222) must NOT emit
+    // ide:removed for 22222. The generation counter makes it abort.
     const removedPorts = removedSpy.mock.calls.map((c) => (c[0] as { port: number }).port);
     expect(removedPorts, "Stale scan must not evict a healthy lockfile added by a newer scan").not.toContain(22222);
 

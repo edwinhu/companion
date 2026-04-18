@@ -2041,11 +2041,27 @@ export class WsBridge {
               reason,
             },
           );
-          // Rebuild the sanitized message so the mirror update AND the
-          // outbound send both see the cleaned shape. Replace the local
-          // `queuedMsg` so the subsequent `adapter.send(queuedMsg)` below
-          // forwards the sanitized payload to the backend.
           queuedMsg = { ...queuedMsg, servers: cleanServers, deleteKeys: cleanDeleteKeys };
+        }
+        // C2 fix: re-inject the active IDE entry after stripping. The strip
+        // above correctly removes user-supplied companion-ide-* keys, but also
+        // removes bridge-injected IDE entries (e.g. from messages queued during
+        // ideBindInProgress). On Claude's full-replace wire, omitting the IDE
+        // entry causes the CLI to drop it. Mirror the injection logic from
+        // routeBrowserMessage so the flushed payload preserves the IDE binding.
+        if (session.backendType === "claude" && session.state.ideBinding) {
+          const sanitizedIdeName = session.state.ideBinding.ideName
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, "");
+          const ideKey = sanitizedIdeName ? `${IDE_SERVER_KEY_PREFIX}${sanitizedIdeName}` : "";
+          const explicitlyDeleted = !!queuedMsg.deleteKeys?.includes(ideKey);
+          const ideEntry = session.dynamicMcpServers[ideKey];
+          if (ideKey.length > 0 && !explicitlyDeleted && ideEntry !== undefined) {
+            queuedMsg = {
+              ...queuedMsg,
+              servers: { ...queuedMsg.servers, [ideKey]: ideEntry },
+            };
+          }
         }
         this.updateDynamicMcpServers(session, queuedMsg.servers, queuedMsg.deleteKeys);
       }

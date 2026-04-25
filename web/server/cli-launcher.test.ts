@@ -29,11 +29,11 @@ vi.mock("./container-manager.js", () => ({
 
 // Mock fs operations for worktree guardrails (CLAUDE.md in .claude dirs)
 const mockMkdirSync = vi.hoisted(() => vi.fn());
-const mockExistsSync = vi.hoisted(() => vi.fn((..._args: any[]) => false));
+const mockExistsSync = vi.hoisted(() => vi.fn((..._args: any[]) => true));
 const mockReadFileSync = vi.hoisted(() => vi.fn((..._args: any[]) => ""));
 const mockWriteFileSync = vi.hoisted(() => vi.fn());
 const isMockedPath = vi.hoisted(() => (path: string): boolean => {
-  return path.includes(".claude") || path.startsWith("/tmp/worktrees/") || path.startsWith("/tmp/main-repo");
+  return path.includes(".claude") || path.startsWith("/tmp/worktrees/") || path.startsWith("/tmp/main-repo") || path === "/tmp/project";
 });
 
 vi.mock("node:fs", async (importOriginal) => {

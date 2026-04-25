@@ -596,17 +596,38 @@ export class CliLauncher {
       spawnCwd = info.cwd;
     }
 
+    if (spawnCwd && !existsSync(spawnCwd)) {
+      console.error(
+        `[cli-launcher] cwd does not exist, aborting spawn | sessionId=${sessionId} cwd=${spawnCwd}`,
+      );
+      info.state = "exited";
+      info.exitCode = 1;
+      this.persistState();
+      return;
+    }
+
     console.log(
       `[cli-launcher] Spawning session ${sessionId}${isContainerized ? " (container)" : ""}: ` +
       sanitizeSpawnArgsForLog(spawnCmd),
     );
 
-    const proc = Bun.spawn(spawnCmd, {
-      cwd: spawnCwd,
-      env: spawnEnv,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    let proc: Subprocess;
+    try {
+      proc = Bun.spawn(spawnCmd, {
+        cwd: spawnCwd,
+        env: spawnEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+    } catch (e) {
+      console.error(
+        `[cli-launcher] Failed to spawn CLI | sessionId=${sessionId} error=${e instanceof Error ? e.message : String(e)}`,
+      );
+      info.state = "exited";
+      info.exitCode = 1;
+      this.persistState();
+      return;
+    }
 
     info.pid = proc.pid;
     this.processes.set(sessionId, proc);

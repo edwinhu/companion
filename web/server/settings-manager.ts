@@ -7,7 +7,7 @@ import {
 import { join, dirname } from "node:path";
 import { COMPANION_HOME } from "./paths.js";
 
-export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6";
+export const DEFAULT_ANTHROPIC_MODEL = "opus";
 
 // Claude Opus 4.7 removed `temperature`/`top_p`/`top_k` — sending any of them
 // returns 400. Callers that hit the Anthropic API directly (auto-namer,
